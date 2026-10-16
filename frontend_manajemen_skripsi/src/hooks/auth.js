@@ -20,20 +20,33 @@ export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
 
     const csrf = () => axios.get('/sanctum/csrf-cookie')
 
+
+
     const register = async ({ setErrors, ...props }) => {
-        await csrf()
+        try {
+            await csrf()
+            setErrors([])
 
-        setErrors([])
+            await axios.post('/register', props)
+            await mutate()
+        } catch (error) {
+            console.error('Registration error:', error)
 
-        axios
-            .post('/register', props)
-            .then(() => mutate())
-            .catch(error => {
-                if (error.response.status !== 422) throw error
-
+            if (error.response?.status === 422) {
                 setErrors(error.response.data.errors)
+                return
+            }
+
+            setErrors({
+                general: [
+                    error.response?.data?.message ||
+                    'Registrasi gagal. Periksa koneksi atau server, lalu coba lagi.',
+                ],
             })
+        }
     }
+
+
 
     const login = async ({ setErrors, setStatus, ...props }) => {
         await csrf()
@@ -100,17 +113,27 @@ export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
     }
 
     useEffect(() => {
-        if (middleware === 'guest' && redirectIfAuthenticated && user)
-            router.push(redirectIfAuthenticated)
+        const getRedirectPath = (user) => {
+            if (user?.role === 'admin') return '/dashboardadmin'
+            if (user?.role === 'dosen') return '/dashboarddosen'
+            if (user?.role === 'mahasiswa') return '/dashboardmahasiswa'
+            return redirectIfAuthenticated
+        }
 
-        if (middleware === 'auth' && (user && !user.email_verified_at))
+        if (middleware === 'guest' && redirectIfAuthenticated && user) {
+            router.push(getRedirectPath(user))
+        }
+
+        if (middleware === 'auth' && (user && !user.email_verified_at)) {
             router.push('/verify-email')
-        
+        }
+
         if (
             window.location.pathname === '/verify-email' &&
             user?.email_verified_at
-        )
-            router.push(redirectIfAuthenticated)
+        ) {
+            router.push(getRedirectPath(user))
+        }
         if (middleware === 'auth' && error) logout()
     }, [user, error])
 

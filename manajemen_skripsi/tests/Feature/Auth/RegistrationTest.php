@@ -16,6 +16,12 @@ class RegistrationTest extends TestCase
             'email' => 'test@example.com',
             'password' => 'password',
             'password_confirmation' => 'password',
+            'role' => 'mahasiswa',
+            'nomor_induk' => '12345678',
+            'no_handphone' => '08123456789',
+            'jenis_kelamin' => 'Laki-laki',
+            'fakultas' => 'Fakultas Sains dan Teknologi',
+            'prodi' => 'Informatika',
         ]);
 
         $this->assertAuthenticated();

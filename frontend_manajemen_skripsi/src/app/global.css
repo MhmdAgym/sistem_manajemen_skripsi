@@ -1,3 +1,132 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+
+  /* WARNA UTAMA: HIJAU EMERALD */
+  --primary: oklch(0.6 0.17 160) !important;
+  --primary-foreground: oklch(0.985 0 0) !important;
+
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.577 0.245 27.325);
+
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.6 0.17 160) !important;
+
+  --radius: 0.625rem;
+
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.6 0.17 160) !important;
+  --sidebar-primary-foreground: oklch(0.985 0 0) !important;
+
+  /* BRAND COLOR DILOCK KE HIJAU EMERALD */
+  --brand: oklch(0.6 0.17 160) !important;
+  --brand-2: color-mix(in oklab, var(--brand) 85%, black 15%) !important;
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+
+  --card: oklch(0.2 0 0);
+  --card-foreground: oklch(0.985 0 0);
+
+  --popover: oklch(0.2 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+
+  --primary: oklch(0.6 0.17 160) !important;
+  --primary-foreground: oklch(0.205 0 0) !important;
+
+  --border: oklch(0.28 0 0);
+  --input: oklch(0.269 0 0);
+  --ring: oklch(0.439 0 0);
+
+  --brand: oklch(0.6 0.17 160) !important;
+  --brand-2: color-mix(in oklab, var(--brand) 80%, black 20%) !important;
+}
+
+/* MENIMPA APAPUN PILIHAN BRAND TEMA LAMA DENGAN HIJAU EMERALD */
+[data-brand] {
+  --brand: oklch(0.6 0.17 160) !important;
+  --brand-2: color-mix(in oklab, oklch(0.6 0.17 160) 85%, black 15%) !important;
+}
+
+/* Base */
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Custom utilities */
+@layer utilities {
+  .bg-brand {
+    background-color: var(--brand) !important;
+  }
+
+  .text-brand {
+    color: var(--brand) !important;
+  }
+
+  .border-brand {
+    border-color: var(--brand) !important;
+  }
+
+  .fill-brand {
+    fill: var(--brand) !important;
+  }
+
+  .bg-sidebar-gradient {
+    background: linear-gradient(
+      to bottom,
+      var(--brand),
+      var(--brand-2)
+    ) !important;
+  }
+
+  .surface {
+    background-color: var(--card);
+  }
+
+  .surface-muted {
+    background-color: var(--muted);
+  }
+
+  .themed-range {
+    appearance: none;
+    width: 100%;
+    height: 10px;
+    border-radius: 9999px;
+    background: var(--muted);
+    accent-color: var(--brand);
+    outline: none;
+  }
+
+  .dark .bg-white {
+    background-color: var(--card);
+  }
+}
