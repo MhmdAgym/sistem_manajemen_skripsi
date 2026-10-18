@@ -17,10 +17,16 @@ use App\Http\Controllers\NilaiSemproController;
 use App\Http\Controllers\UjianSkripsiController;
 use App\Http\Controllers\DosenPengujiSkripsiController;
 use App\Http\Controllers\NilaiSkripsiController;
+use App\Http\Controllers\UserController;
 
 // Route bawaan untuk mendeteksi user yang sedang login (membutuhkan Sanctum token)
 Route::middleware(['auth:sanctum'])->get('/user', function (Request $request) {
     return $request->user();
+});
+
+// --- RUTE KHUSUS MANAJEMEN AKUN (ADMIN ONLY) ---
+Route::middleware(['auth:sanctum', 'admin'])->group(function () {
+    Route::apiResource('users', UserController::class)->only(['index', 'show', 'update']);
 });
 
 // --- RUTE CRUD API SISTEM MANAJEMEN SKRIPSI ---

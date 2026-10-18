@@ -30,4 +30,16 @@ class Mahasiswa extends Model
     {
         return $this->belongsTo(User::class, 'user_id');
     }
+
+    // Relasi ke model Skripsi
+    public function skripsi()
+    {
+        return $this->hasMany(Skripsi::class, 'id_mahasiswa', 'id_mahasiswa');
+    }
+
+    // Relasi ke skripsi terbaru
+    public function latestSkripsi()
+    {
+        return $this->hasOne(Skripsi::class, 'id_mahasiswa', 'id_mahasiswa')->latestOfMany('id_skripsi');
+    }
 }

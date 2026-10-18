@@ -27,4 +27,16 @@ class Skripsi extends Model
     {
         return $this->belongsTo(Mahasiswa::class, 'id_mahasiswa', 'id_mahasiswa');
     }
+
+    // Relasi ke model DosenPA
+    public function dosenPA()
+    {
+        return $this->hasMany(DosenPA::class, 'id_skripsi', 'id_skripsi');
+    }
+
+    // Relasi ke model DosenPembimbing
+    public function dosenPembimbing()
+    {
+        return $this->hasMany(DosenPembimbing::class, 'id_skripsi', 'id_skripsi');
+    }
 }

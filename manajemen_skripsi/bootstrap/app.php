@@ -18,6 +18,7 @@ return Application::configure(basePath: dirname(__DIR__))
 
         $middleware->alias([
             'verified' => \App\Http\Middleware\EnsureEmailIsVerified::class,
+            'admin'    => \App\Http\Middleware\EnsureUserIsAdmin::class,
         ]);
 
         $middleware->redirectGuestsTo(fn () => config('app.frontend_url').'/login');

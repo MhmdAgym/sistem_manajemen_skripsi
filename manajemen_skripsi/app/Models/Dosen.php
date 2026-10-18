@@ -28,4 +28,22 @@ class Dosen extends Model
     {
         return $this->belongsTo(User::class, 'user_id');
     }
+
+    // Relasi ke model DosenPembimbing
+    public function dosenPembimbing()
+    {
+        return $this->hasMany(DosenPembimbing::class, 'id_dosen', 'id_dosen');
+    }
+
+    // Relasi ke model DosenPA
+    public function dosenPA()
+    {
+        return $this->hasMany(DosenPA::class, 'id_dosen', 'id_dosen');
+    }
+
+    // Relasi ke model DosenPengujiSkripsi
+    public function dosenPengujiSkripsi()
+    {
+        return $this->hasMany(DosenPengujiSkripsi::class, 'id_dosen', 'id_dosen');
+    }
 }

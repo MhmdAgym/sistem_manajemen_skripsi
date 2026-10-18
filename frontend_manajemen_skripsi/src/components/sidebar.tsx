@@ -16,7 +16,8 @@ import {
   ClipboardList,
   ChevronLeft,
   ChevronRight,
-  X 
+  X,
+  ShieldCheck 
 } from "lucide-react";
 
 interface SidebarProps {
@@ -38,6 +39,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           { title: "Dashboard", href: "/dashboardadmin", icon: LayoutDashboard },
           { title: "Data Mahasiswa", href: "/dashboardadmin/data_mahasiswa", icon: Users },
           { title: "Data Dosen", href: "/dashboardadmin/data_dosen", icon: UserCheck },
+          { title: "Manajemen Akun", href: "/dashboardadmin/manajemen_akun", icon: ShieldCheck },
           { title: "Manajemen Sempro", href: "/dashboardadmin/manajemen_sempro", icon: FileCheck },
           { title: "Manajemen Ujian", href: "/dashboardadmin/manajemen_ujian", icon: GraduationCap },
           { title: "Berita Acara", href: "/dashboardadmin/berita_acara", icon: FileText },
