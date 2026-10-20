@@ -5,19 +5,19 @@ import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useAuth } from "@/hooks/auth";
-import { 
-  LayoutDashboard, 
-  Users, 
-  UserCheck, 
-  FileCheck, 
-  GraduationCap, 
-  FileText, 
+import {
+  LayoutDashboard,
+  Users,
+  UserCheck,
+  FileCheck,
+  GraduationCap,
+  FileText,
   BookOpen,
   ClipboardList,
   ChevronLeft,
   ChevronRight,
   X,
-  ShieldCheck 
+  ShieldCheck
 } from "lucide-react";
 
 interface SidebarProps {
@@ -54,7 +54,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
       case "mahasiswa":
         return [
           { title: "Dashboard Mahasiswa", href: "/dashboardmahasiswa", icon: LayoutDashboard },
-          { title: "Pengajuan Judul", href: "/dashboardmahasiswa/pengajuan", icon: BookOpen },
+          { title: "Pengajuan Judul", href: "/dashboardmahasiswa/pengajuan_judul", icon: BookOpen },
           { title: "Bimbingan Saya", href: "/dashboardmahasiswa/bimbingan", icon: ClipboardList },
           { title: "Seminar Proposal", href: "/dashboardmahasiswa/sempro", icon: FileCheck },
           { title: "Ujian Skripsi", href: "/dashboardmahasiswa/ujian", icon: GraduationCap },
@@ -67,10 +67,9 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
   const menuItems = getMenuItems();
 
   return (
-    <aside 
-      className={`h-full bg-[#15803D] text-white p-4 flex flex-col justify-between transition-all duration-300 ease-in-out shrink-0 ${
-        isCollapsed ? "lg:w-20" : "lg:w-72"
-      } w-72 lg:rounded-3xl my-0 shadow-xl border-r border-emerald-600/30`}
+    <aside
+      className={`h-full bg-[#15803D] text-white p-4 flex flex-col justify-between transition-all duration-300 ease-in-out shrink-0 ${isCollapsed ? "lg:w-20" : "lg:w-72"
+        } w-72 lg:rounded-3xl my-0 shadow-xl border-r border-emerald-600/30`}
     >
       <div className="space-y-6">
         {/* Header Logo, Title & Tombol Toggle */}
@@ -103,7 +102,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           </div>
 
           {!isCollapsed && (
-            <button 
+            <button
               onClick={() => setIsCollapsed(!isCollapsed)}
               className="hidden lg:flex p-1.5 rounded-lg text-emerald-100 hover:bg-white/10 transition shrink-0"
               title="Perkecil Sidebar"
@@ -113,7 +112,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           )}
 
           {/* Tombol Close di Mobile */}
-          <button 
+          <button
             onClick={onClose}
             className="lg:hidden p-1.5 rounded-lg text-emerald-100 hover:bg-white/10 transition shrink-0"
           >
@@ -123,7 +122,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
 
         {isCollapsed && (
           <div className="hidden lg:flex justify-center pt-2">
-            <button 
+            <button
               onClick={() => setIsCollapsed(false)}
               className="p-1.5 rounded-lg text-emerald-100 hover:bg-white/10 transition"
               title="Perbesar Sidebar"
@@ -145,11 +144,10 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
                 href={item.href}
                 onClick={onClose}
                 title={isCollapsed ? item.title : undefined}
-                className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all duration-200 ${
-                  isActive
+                className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all duration-200 ${isActive
                     ? "bg-white text-[#15803D] shadow-md"
                     : "text-emerald-50 hover:bg-white/15 hover:text-white"
-                } ${isCollapsed ? "justify-center px-0" : ""}`}
+                  } ${isCollapsed ? "justify-center px-0" : ""}`}
               >
                 <Icon className={`w-4 h-4 shrink-0 ${isActive ? "text-[#15803D]" : "text-emerald-100"}`} />
                 {!isCollapsed && <span className="whitespace-nowrap truncate">{item.title}</span>}
