@@ -12,13 +12,9 @@ import {
   CheckCircle2, 
   AlertCircle, 
   Mail, 
-  UserCheck, 
-  Users, 
   GraduationCap, 
   Filter, 
-  Shield, 
   KeyRound, 
-  Calendar, 
   Check, 
   Clock 
 } from "lucide-react";

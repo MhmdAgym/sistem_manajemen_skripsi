@@ -1,0 +1,4 @@
+{
+  "typescript.tsdk": "frontend_manajemen_skripsi/node_modules/typescript/lib",
+  "js/ts.tsdk.path": "frontend_manajemen_skripsi/node_modules/typescript/lib"
+}

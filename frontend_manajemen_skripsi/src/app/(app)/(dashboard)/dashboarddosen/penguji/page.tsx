@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { FileCheck, Calendar, Award } from "lucide-react";
+import { Calendar } from "lucide-react";
 
 export default function PengujiPage() {
   const jadwalUjian = [

@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { ClipboardList, Plus, FileText, CheckCircle } from "lucide-react";
+import { Plus, FileText } from "lucide-react";
 
 export default function BimbinganPage() {
   const riwayatBimbingan = [

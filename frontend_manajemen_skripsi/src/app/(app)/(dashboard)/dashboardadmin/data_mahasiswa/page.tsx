@@ -2,19 +2,19 @@
 
 import React, { useState, useEffect, useMemo } from "react";
 import axios from "@/lib/axios";
-import { 
-  Users, 
-  Search, 
-  RefreshCw, 
-  Eye, 
-  Edit3, 
-  X, 
-  CheckCircle2, 
-  AlertCircle, 
-  GraduationCap, 
-  UserCheck, 
-  Phone, 
-  BookOpen, 
+import {
+  Users,
+  Search,
+  RefreshCw,
+  Eye,
+  Edit3,
+  X,
+  CheckCircle2,
+  AlertCircle,
+  GraduationCap,
+  UserCheck,
+  Phone,
+  BookOpen,
   Filter
 } from "lucide-react";
 
@@ -33,6 +33,14 @@ interface ActiveSkripsi {
   status_judul: string;
 }
 
+interface DosenItem {
+  id_dosen?: number;
+  id?: number;
+  name?: string;
+  nama_dosen?: string;
+  NIDN?: string;
+}
+
 interface MahasiswaData {
   id_mahasiswa: number;
   NIM: string;
@@ -42,6 +50,7 @@ interface MahasiswaData {
   fakultas: string | null;
   no_handphone: string | null;
   jenis_kelamin: string | null;
+  dosen_pa_id?: number | null;
   active_skripsi: ActiveSkripsi | null;
   dosen_pa_list: string[];
   dosen_pembimbing_list: string[];
@@ -50,6 +59,7 @@ interface MahasiswaData {
 
 export default function DataMahasiswaPage() {
   const [mahasiswaList, setMahasiswaList] = useState<MahasiswaData[]>([]);
+  const [dosenList, setDosenList] = useState<DosenItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -70,22 +80,33 @@ export default function DataMahasiswaPage() {
     prodi: "",
     no_handphone: "",
     jenis_kelamin: "",
+    dosen_pa_id: "" as string | number,
   });
   const [editErrors, setEditErrors] = useState<Record<string, string[]>>({});
   const [isSaving, setIsSaving] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
-  // Fetch data
-  const fetchMahasiswa = async () => {
+  // Fetch data mahasiswa & daftar dosen
+  const fetchData = async () => {
     try {
       setLoading(true);
       setErrorMessage(null);
-      const res = await axios.get("/api/mahasiswa");
-      setMahasiswaList(Array.isArray(res.data) ? res.data : []);
+
+      const [resMhs, resDosen] = await Promise.all([
+        axios.get("/api/mahasiswa"),
+        axios.get("/api/dosen").catch(() => ({ data: [] }))
+      ]);
+
+      setMahasiswaList(Array.isArray(resMhs.data) ? resMhs.data : resMhs.data.data || []);
+
+      const rawDosen = resDosen.data;
+      const listDosenParsed = Array.isArray(rawDosen) ? rawDosen : rawDosen.data || [];
+      setDosenList(listDosenParsed);
+
     } catch (err: any) {
-      console.error("Gagal mengambil data mahasiswa:", err);
+      console.error("Gagal mengambil data:", err);
       setErrorMessage(
-        err.response?.data?.message || "Gagal memuat data mahasiswa dari server. Pastikan server aktif."
+        err.response?.data?.message || "Gagal memuat data dari server. Pastikan server aktif."
       );
     } finally {
       setLoading(false);
@@ -93,7 +114,7 @@ export default function DataMahasiswaPage() {
   };
 
   useEffect(() => {
-    fetchMahasiswa();
+    fetchData();
   }, []);
 
   // Filter list
@@ -120,9 +141,16 @@ export default function DataMahasiswaPage() {
     return Array.from(setProdi);
   }, [mahasiswaList]);
 
-  // Handle open edit modal
+  // Handle open edit modal (Diperbarui agar membaca dosen_pa_id dengan benar)
   const handleOpenEdit = (m: MahasiswaData) => {
     setEditModalData(m);
+
+    // Mendapatkan ID dosen PA dari data mahasiswa atau relasi skripsi aktifnya
+    let currentDosenPaId = m.dosen_pa_id || "";
+    if (!currentDosenPaId && m.active_skripsi && (m.active_skripsi as any).dosen_pa_id) {
+      currentDosenPaId = (m.active_skripsi as any).dosen_pa_id;
+    }
+
     setEditForm({
       nama_mahasiswa: m.nama_mahasiswa || "",
       NIM: m.NIM || "",
@@ -130,6 +158,7 @@ export default function DataMahasiswaPage() {
       prodi: m.prodi || "",
       no_handphone: m.no_handphone || "",
       jenis_kelamin: m.jenis_kelamin || "",
+      dosen_pa_id: currentDosenPaId,
     });
     setEditErrors({});
     setConfirmOpen(false);
@@ -143,7 +172,7 @@ export default function DataMahasiswaPage() {
 
     try {
       const res = await axios.put(`/api/mahasiswa/${editModalData.id_mahasiswa}`, editForm);
-      const updatedData: MahasiswaData = res.data.data;
+      const updatedData: MahasiswaData = res.data.data || res.data;
 
       // Update state immediately
       setMahasiswaList((prev) =>
@@ -153,6 +182,7 @@ export default function DataMahasiswaPage() {
       setSuccessMessage(`Data mahasiswa ${updatedData.nama_mahasiswa} berhasil diperbarui.`);
       setEditModalData(null);
       setConfirmOpen(false);
+      fetchData();
 
       setTimeout(() => {
         setSuccessMessage(null);
@@ -185,8 +215,8 @@ export default function DataMahasiswaPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button 
-            onClick={fetchMahasiswa}
+          <button
+            onClick={fetchData}
             disabled={loading}
             className="px-4 py-2 bg-white text-[#15803D] font-bold text-xs rounded-xl shadow hover:bg-emerald-50 transition flex items-center gap-1.5 disabled:opacity-75"
           >
@@ -241,15 +271,15 @@ export default function DataMahasiswaPage() {
             {/* Input Pencarian */}
             <div className="relative w-full sm:w-64">
               <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
-              <input 
-                type="text" 
+              <input
+                type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Cari nama, NIM, prodi..." 
+                placeholder="Cari nama, NIM, prodi..."
                 className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-xs focus:outline-none focus:border-emerald-600 transition"
               />
               {searchQuery && (
-                <button 
+                <button
                   onClick={() => setSearchQuery("")}
                   className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600"
                 >
@@ -272,7 +302,7 @@ export default function DataMahasiswaPage() {
               <Users className="w-10 h-10 mx-auto text-slate-300" />
               <p className="text-sm font-semibold text-slate-600">Tidak ada data mahasiswa ditemukan</p>
               <p className="text-xs text-slate-400">
-                {searchQuery || filterProdi !== "all" 
+                {searchQuery || filterProdi !== "all"
                   ? "Coba gunakan kata kunci pencarian atau filter yang berbeda."
                   : "Belum ada data mahasiswa terdaftar di sistem."}
               </p>
@@ -306,8 +336,8 @@ export default function DataMahasiswaPage() {
                       {m.dosen_pa_list && m.dosen_pa_list.length > 0 ? (
                         <div className="space-y-1">
                           {m.dosen_pa_list.map((pa, idx) => (
-                            <span 
-                              key={idx} 
+                            <span
+                              key={idx}
                               className="inline-block px-2 py-0.5 rounded-lg text-[11px] font-medium bg-emerald-50 text-emerald-800 border border-emerald-200"
                             >
                               {pa}
@@ -322,8 +352,8 @@ export default function DataMahasiswaPage() {
                       {m.dosen_pembimbing_list && m.dosen_pembimbing_list.length > 0 ? (
                         <div className="space-y-1">
                           {m.dosen_pembimbing_list.map((dp, idx) => (
-                            <span 
-                              key={idx} 
+                            <span
+                              key={idx}
                               className="inline-block px-2 py-0.5 rounded-lg text-[11px] font-medium bg-teal-50 text-teal-800 border border-teal-200 mr-1"
                             >
                               {dp}
@@ -347,14 +377,14 @@ export default function DataMahasiswaPage() {
                     </td>
                     <td className="p-3.5 text-center">
                       <div className="flex items-center justify-center gap-1.5">
-                        <button 
+                        <button
                           onClick={() => setDetailModalData(m)}
                           className="p-1.5 text-slate-600 hover:text-emerald-700 hover:bg-emerald-50 rounded-lg transition"
                           title="Lihat Detail Mahasiswa"
                         >
                           <Eye className="w-4 h-4" />
                         </button>
-                        <button 
+                        <button
                           onClick={() => handleOpenEdit(m)}
                           className="p-1.5 text-slate-600 hover:text-[#15803D] hover:bg-emerald-50 rounded-lg transition"
                           title="Edit Data Mahasiswa"
@@ -385,7 +415,7 @@ export default function DataMahasiswaPage() {
                   <p className="text-xs text-slate-500">NIM: {detailModalData.NIM} • {detailModalData.prodi}</p>
                 </div>
               </div>
-              <button 
+              <button
                 onClick={() => setDetailModalData(null)}
                 className="p-1.5 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition"
               >
@@ -511,9 +541,9 @@ export default function DataMahasiswaPage() {
           <div className="bg-white rounded-3xl max-w-xl w-full p-6 shadow-2xl border border-slate-100 space-y-5 max-h-[90vh] overflow-y-auto">
             <div className="flex justify-between items-center pb-3 border-b border-slate-100">
               <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
-                <Edit3 className="w-4 h-4 text-emerald-600" /> Edit Data Mahasiswa
+                <Edit3 className="w-4 h-4 text-emerald-600" /> Edit Data Mahasiswa & Penetapan Dosen PA
               </h3>
-              <button 
+              <button
                 onClick={() => setEditModalData(null)}
                 className="p-1.5 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition"
               >
@@ -538,7 +568,7 @@ export default function DataMahasiswaPage() {
             <div className="space-y-4 text-xs">
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">Nama Mahasiswa *</label>
-                <input 
+                <input
                   type="text"
                   value={editForm.nama_mahasiswa}
                   onChange={(e) => setEditForm({ ...editForm, nama_mahasiswa: e.target.value })}
@@ -550,7 +580,7 @@ export default function DataMahasiswaPage() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="font-semibold text-slate-700 block mb-1">NIM (Nomor Induk Mahasiswa) *</label>
-                  <input 
+                  <input
                     type="text"
                     maxLength={10}
                     value={editForm.NIM}
@@ -558,7 +588,6 @@ export default function DataMahasiswaPage() {
                     className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 font-medium text-slate-800"
                     required
                   />
-                  <span className="text-[10px] text-slate-400 mt-0.5 block">Maksimal 10 karakter numerik.</span>
                 </div>
 
                 <div>
@@ -566,7 +595,7 @@ export default function DataMahasiswaPage() {
                   <select
                     value={editForm.jenis_kelamin}
                     onChange={(e) => setEditForm({ ...editForm, jenis_kelamin: e.target.value })}
-                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 text-slate-800"
+                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 text-slate-800 bg-white"
                   >
                     <option value="">-- Pilih Jenis Kelamin --</option>
                     <option value="Laki-laki">Laki-laki</option>
@@ -581,7 +610,7 @@ export default function DataMahasiswaPage() {
                   <select
                     value={editForm.fakultas}
                     onChange={(e) => setEditForm({ ...editForm, fakultas: e.target.value })}
-                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 text-slate-800"
+                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 text-slate-800 bg-white"
                   >
                     <option value="">-- Pilih Fakultas --</option>
                     <option value="Fakultas Sains dan Teknologi">Fakultas Sains dan Teknologi</option>
@@ -592,7 +621,7 @@ export default function DataMahasiswaPage() {
 
                 <div>
                   <label className="font-semibold text-slate-700 block mb-1">Program Studi *</label>
-                  <input 
+                  <input
                     type="text"
                     value={editForm.prodi}
                     onChange={(e) => setEditForm({ ...editForm, prodi: e.target.value })}
@@ -604,7 +633,7 @@ export default function DataMahasiswaPage() {
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">No. Handphone / WhatsApp</label>
-                <input 
+                <input
                   type="text"
                   value={editForm.no_handphone}
                   onChange={(e) => setEditForm({ ...editForm, no_handphone: e.target.value })}
@@ -613,8 +642,35 @@ export default function DataMahasiswaPage() {
                 />
               </div>
 
+              {/* DROPDOWN PENETAPAN DOSEN PA */}
+              <div className="p-4 bg-emerald-50/60 rounded-2xl border border-emerald-200 space-y-2">
+                <label className="font-bold text-emerald-900 block flex items-center gap-1.5">
+                  <UserCheck className="w-4 h-4 text-emerald-700" /> Tetapkan Dosen Pembimbing Akademik (PA)
+                </label>
+                <select
+                  value={editForm.dosen_pa_id}
+                  onChange={(e) => setEditForm({ ...editForm, dosen_pa_id: e.target.value })}
+                  className="w-full px-3.5 py-2.5 rounded-xl border border-emerald-300 bg-white focus:outline-none focus:border-emerald-600 font-medium text-slate-800 shadow-sm"
+                >
+                  <option value="">-- Pilih Dosen PA (Belum Ditetapkan) --</option>
+                  {dosenList.map((dosen) => {
+                    const dosenId = dosen.id_dosen ?? dosen.id;
+                    const dosenName = dosen.nama_dosen ?? dosen.name;
+                    const dosenNidn = dosen.NIDN ? `(NIDN: ${dosen.NIDN})` : "";
+                    return (
+                      <option key={dosenId} value={dosenId}>
+                        {dosenName} {dosenNidn}
+                      </option>
+                    );
+                  })}
+                </select>
+                <p className="text-[10px] text-emerald-700">
+                  Dosen PA yang dipilih akan menjadi penanggung jawab verifikasi pengajuan judul skripsi mahasiswa ini.
+                </p>
+              </div>
+
               <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-800 text-[11px] leading-relaxed">
-                <strong>Catatan:</strong> Perubahan nama mahasiswa dan NIM akan otomatis disinkronkan ke akun user login yang bersangkutan.
+                <strong>Catatan:</strong> Perubahan data mahasiswa dan penetapan Dosen PA akan langsung tersimpan di database.
               </div>
             </div>
 

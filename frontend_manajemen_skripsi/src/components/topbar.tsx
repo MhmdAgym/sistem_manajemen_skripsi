@@ -1,5 +1,3 @@
-"use client"
-
 import React from "react"
 import { Bell, Settings, User, Menu } from "lucide-react"
 import {
@@ -74,8 +72,7 @@ export function Topbar({ onMenuClick }: TopbarProps) {
                 <button className="w-full text-left">Pengaturan Periode</button>
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <div className="px-2 py-1.5">
-              </div>
+              <div className="px-2 py-1.5" />
             </DropdownMenuContent>
           </DropdownMenu>
 

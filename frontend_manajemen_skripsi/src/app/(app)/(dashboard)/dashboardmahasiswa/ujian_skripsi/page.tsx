@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { GraduationCap, FileText, CheckCircle } from "lucide-react";
+import { GraduationCap, CheckCircle } from "lucide-react";
 
 export default function UjianPage() {
   return (

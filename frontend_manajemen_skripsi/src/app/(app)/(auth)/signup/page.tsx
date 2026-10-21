@@ -2,13 +2,11 @@
 
 import Link from "next/link"
 import { useState } from "react"
-import { useRouter } from "next/navigation"
 
 export default function SignUpPage() {
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [name, setName] = useState("")
-  const router = useRouter()
 
   return (
     <main className="min-h-[80dvh] flex items-center justify-center p-6">

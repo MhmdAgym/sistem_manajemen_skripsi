@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { ClipboardList, CheckCircle, FileText, AlertCircle } from "lucide-react";
+import { ClipboardList } from "lucide-react";
 
 export default function PembimbingSkripsiPage() {
   const bimbinganMahasiswa = [

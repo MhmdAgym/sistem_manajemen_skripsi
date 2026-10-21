@@ -3,19 +3,28 @@ import axios from '@/lib/axios'
 import { useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 
+/**
+ * @param {{ middleware?: string, redirectIfAuthenticated?: string }} [options]
+ */
 export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
+
     const router = useRouter()
     const params = useParams()
 
-    const { data: user, error, mutate } = useSWR('/api/user', () =>
-        axios
-            .get('/api/user')
-            .then(res => res.data)
-            .catch(error => {
-                if (error.response.status !== 409) throw error
+    const { data: user, error, mutate } = useSWR(
+        '/api/user',
+        () =>
+            axios
+                .get('/api/user')
+                .then(res => res.data)
+                .catch(error => {
+                    if (error.response.status !== 409) throw error
 
-                router.push('/verify-email')
-            }),
+                    router.push('/verify-email')
+                }),
+        {
+            shouldRetryOnError: false,
+        },
     )
 
     const csrf = () => axios.get('/sanctum/csrf-cookie')
@@ -64,7 +73,7 @@ export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
             })
     }
 
-    const forgotPassword = async ({ setErrors, setStatus, email }) => {
+    const forgotPassword = async ({ email, setErrors, setStatus }) => {
         await csrf()
 
         setErrors([])
@@ -74,9 +83,17 @@ export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
             .post('/forgot-password', { email })
             .then(response => setStatus(response.data.status))
             .catch(error => {
-                if (error.response.status !== 422) throw error
-
-                setErrors(error.response.data.errors)
+                if (error.response?.status === 422) {
+                    setErrors(error.response.data.errors)
+                } else {
+                    console.error('Detail Error Forgot Password:', error)
+                    setErrors({
+                        email: [
+                            error.response?.data?.message ||
+                            'Gagal terhubung ke server backend. Pastikan server Laravel aktif dan konfigurasi CORS/Email sudah benar.'
+                        ],
+                    })
+                }
             })
     }
 

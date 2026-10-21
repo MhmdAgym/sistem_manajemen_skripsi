@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { GraduationCap, Calendar } from "lucide-react";
+import { GraduationCap } from "lucide-react";
 
 export default function ManajemenUjianPage() {
   return (

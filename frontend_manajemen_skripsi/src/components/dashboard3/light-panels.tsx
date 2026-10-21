@@ -1,6 +1,6 @@
 "use client"
 
-import { ResponsiveContainer, RadialBarChart, RadialBar, PolarAngleAxis } from "recharts"
+import { ResponsiveContainer, RadialBarChart, RadialBar } from "recharts"
 
 const radial = [{ name: "Intensity", value: 57, fill: "var(--brand)" }]
 
@@ -12,7 +12,7 @@ export function LightPanels() {
         <div className="h-44 w-full">
           <ResponsiveContainer width="100%" height="100%">
             <RadialBarChart data={radial} startAngle={90} endAngle={-270} innerRadius="70%" outerRadius="100%">
-              <PolarAngleAxis type="number" domain={[0, 100]} tick={false} />
+
               {/* background prop draws the track; use themed muted surface instead of default (too dark in dark mode) */}
               <RadialBar background={{ fill: "var(--muted)" }} dataKey="value" cornerRadius={16} />
             </RadialBarChart>

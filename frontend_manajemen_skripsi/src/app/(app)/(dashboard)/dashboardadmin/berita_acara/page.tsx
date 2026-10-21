@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { FileText, Printer } from "lucide-react";
+import { FileText } from "lucide-react";
 
 export default function BeritaAcaraPage() {
   return (

@@ -9,7 +9,7 @@ const nunitoFont = Nunito({
 
 const RootLayout = ({ children }) => {
     return (
-        <html lang="en" className={nunitoFont.className}>
+        <html lang="en" className={nunitoFont.className} suppressHydrationWarning>
             <body className="antialiased">
                 <ThemeProvider
                     attribute="class"
@@ -27,6 +27,9 @@ const RootLayout = ({ children }) => {
 export const metadata = {
     title: 'Sistem Manajemen Skripsi',
     description: 'Sistem Manajemen Skripsi',
+    icons: {
+        icon: '/images/logo-unuha.webp',
+    },
 }
 
 export default RootLayout

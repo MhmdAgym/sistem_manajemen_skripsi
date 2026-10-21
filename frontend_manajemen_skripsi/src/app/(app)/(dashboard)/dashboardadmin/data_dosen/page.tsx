@@ -2,19 +2,18 @@
 
 import React, { useState, useEffect, useMemo } from "react";
 import axios from "@/lib/axios";
-import { 
-  UserCheck, 
-  Search, 
-  RefreshCw, 
-  Eye, 
-  Edit3, 
-  X, 
-  CheckCircle2, 
-  AlertCircle, 
-  Phone, 
-  Mail, 
-  Users, 
-  BookOpen, 
+import {
+  UserCheck,
+  Search,
+  RefreshCw,
+  Eye,
+  Edit3,
+  X,
+  CheckCircle2,
+  AlertCircle,
+  Phone,
+  Mail,
+  Users,
   GraduationCap
 } from "lucide-react";
 
@@ -172,7 +171,7 @@ export default function DataDosenPage() {
             Kelola data dosen pembimbing, penguji, dan PA serta pantau beban bimbingan skripsi mahasiswa.
           </p>
         </div>
-        <button 
+        <button
           onClick={fetchDosen}
           disabled={loading}
           className="px-4 py-2 bg-white text-[#15803D] font-bold text-xs rounded-xl shadow hover:bg-emerald-50 transition flex items-center gap-1.5 disabled:opacity-75"
@@ -202,21 +201,21 @@ export default function DataDosenPage() {
       <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm space-y-5">
         <div className="flex flex-col sm:flex-row justify-between items-stretch sm:items-center gap-4">
           <h2 className="font-bold text-slate-800 text-sm flex items-center gap-2">
-            <UserCheck className="w-5 h-5 text-emerald-600" /> 
+            <UserCheck className="w-5 h-5 text-emerald-600" />
             Daftar Dosen Aktif ({filteredList.length} dari {dosenList.length})
           </h2>
 
           <div className="relative w-full sm:w-72">
             <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
-            <input 
-              type="text" 
+            <input
+              type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Cari nama, NIDN, atau email..." 
+              placeholder="Cari nama, NIDN, atau email..."
               className="w-full pl-9 pr-4 py-2 rounded-xl border border-slate-200 text-xs focus:outline-none focus:border-emerald-600 transition"
             />
             {searchQuery && (
-              <button 
+              <button
                 onClick={() => setSearchQuery("")}
                 className="absolute right-2.5 top-2.5 text-slate-400 hover:text-slate-600"
               >
@@ -265,13 +264,12 @@ export default function DataDosenPage() {
                       <div className="text-[11px] text-slate-500">{d.jenis_kelamin || "Belum diatur"}</div>
                     </td>
                     <td className="p-3.5 text-center">
-                      <button 
+                      <button
                         onClick={() => setSelectedDosenForBimbingan(d)}
-                        className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold transition shadow-sm ${
-                          d.total_mahasiswa_bimbingan > 0 
-                            ? "bg-emerald-50 text-[#15803D] hover:bg-emerald-100 border border-emerald-200" 
+                        className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold transition shadow-sm ${d.total_mahasiswa_bimbingan > 0
+                            ? "bg-emerald-50 text-[#15803D] hover:bg-emerald-100 border border-emerald-200"
                             : "bg-slate-100 text-slate-500 hover:bg-slate-200 border border-slate-200"
-                        }`}
+                          }`}
                         title="Klik untuk melihat daftar mahasiswa bimbingan"
                       >
                         <Users className="w-3.5 h-3.5" />
@@ -280,14 +278,14 @@ export default function DataDosenPage() {
                     </td>
                     <td className="p-3.5 text-center">
                       <div className="flex items-center justify-center gap-1.5">
-                        <button 
+                        <button
                           onClick={() => setDetailModalDosen(d)}
                           className="p-1.5 text-slate-600 hover:text-emerald-700 hover:bg-emerald-50 rounded-lg transition"
                           title="Lihat Detail Dosen"
                         >
                           <Eye className="w-4 h-4" />
                         </button>
-                        <button 
+                        <button
                           onClick={() => handleOpenEdit(d)}
                           className="p-1.5 text-slate-600 hover:text-[#15803D] hover:bg-emerald-50 rounded-lg transition"
                           title="Edit Data Dosen"
@@ -320,7 +318,7 @@ export default function DataDosenPage() {
                   NIDN: {selectedDosenForBimbingan.NIDN} • Total: {selectedDosenForBimbingan.total_mahasiswa_bimbingan} Mahasiswa
                 </p>
               </div>
-              <button 
+              <button
                 onClick={() => setSelectedDosenForBimbingan(null)}
                 className="p-1.5 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition"
               >
@@ -339,8 +337,8 @@ export default function DataDosenPage() {
             ) : (
               <div className="space-y-3">
                 {selectedDosenForBimbingan.mahasiswa_bimbingan.map((m, idx) => (
-                  <div 
-                    key={idx} 
+                  <div
+                    key={idx}
                     className="p-4 bg-slate-50 hover:bg-slate-100/70 rounded-2xl border border-slate-200/80 transition space-y-2"
                   >
                     <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-1">
@@ -398,7 +396,7 @@ export default function DataDosenPage() {
                   <p className="text-xs text-slate-500">NIDN: {detailModalDosen.NIDN}</p>
                 </div>
               </div>
-              <button 
+              <button
                 onClick={() => setDetailModalDosen(null)}
                 className="p-1.5 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition"
               >
@@ -470,7 +468,7 @@ export default function DataDosenPage() {
               <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
                 <Edit3 className="w-4 h-4 text-emerald-600" /> Edit Data Dosen
               </h3>
-              <button 
+              <button
                 onClick={() => setEditModalDosen(null)}
                 className="p-1.5 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition"
               >
@@ -495,7 +493,7 @@ export default function DataDosenPage() {
             <div className="space-y-4 text-xs">
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">Nama Dosen Lengkap & Gelar *</label>
-                <input 
+                <input
                   type="text"
                   value={editForm.nama_dosen}
                   onChange={(e) => setEditForm({ ...editForm, nama_dosen: e.target.value })}
@@ -507,7 +505,7 @@ export default function DataDosenPage() {
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="font-semibold text-slate-700 block mb-1">NIDN (Nomor Induk Dosen) *</label>
-                  <input 
+                  <input
                     type="text"
                     maxLength={10}
                     value={editForm.NIDN}
@@ -534,7 +532,7 @@ export default function DataDosenPage() {
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">No. Handphone / WhatsApp</label>
-                <input 
+                <input
                   type="text"
                   value={editForm.no_handphone}
                   onChange={(e) => setEditForm({ ...editForm, no_handphone: e.target.value })}

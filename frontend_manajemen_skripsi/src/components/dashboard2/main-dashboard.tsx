@@ -6,7 +6,6 @@ import {
   FileCheck, 
   Calendar, 
   ArrowUpRight,
-  BookOpen,
   Award
 } from "lucide-react";
 

@@ -7,6 +7,7 @@
           <a
             href="https://themewagon.com/themes/smart-home/"
             target="_blank"
+            rel="noopener noreferrer"
             className="h-10 rounded-md bg-brand text-background inline-flex items-center gap-2 px-4"
           >
             <svg

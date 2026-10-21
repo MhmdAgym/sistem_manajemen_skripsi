@@ -16,9 +16,15 @@ return Application::configure(basePath: dirname(__DIR__))
             \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
         ]);
 
+        // Mengecualikan seluruh rute API dari pemeriksaan CSRF (Mengatasi error CSRF token mismatch)
+        $middleware->validateCsrfTokens(except: [
+            'api/*',
+        ]);
+
         $middleware->alias([
             'verified' => \App\Http\Middleware\EnsureEmailIsVerified::class,
             'admin'    => \App\Http\Middleware\EnsureUserIsAdmin::class,
+            'role'     => \App\Http\Middleware\EnsureUserIsRole::class,
         ]);
 
         $middleware->redirectGuestsTo(fn () => config('app.frontend_url').'/login');

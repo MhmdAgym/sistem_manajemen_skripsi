@@ -28,10 +28,10 @@ class Skripsi extends Model
         return $this->belongsTo(Mahasiswa::class, 'id_mahasiswa', 'id_mahasiswa');
     }
 
-    // Relasi ke model DosenPA
+    // Relasi ke model DosenPA (satu skripsi, satu Dosen PA aktif)
     public function dosenPA()
     {
-        return $this->hasMany(DosenPA::class, 'id_skripsi', 'id_skripsi');
+        return $this->hasOne(DosenPA::class, 'id_skripsi', 'id_skripsi');
     }
 
     // Relasi ke model DosenPembimbing

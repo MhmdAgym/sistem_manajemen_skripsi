@@ -25,7 +25,7 @@ interface SidebarProps {
   onClose?: () => void;
 }
 
-export function Sidebar({ isOpen, onClose }: SidebarProps) {
+export function Sidebar({ onClose }: SidebarProps) {
   const pathname = usePathname();
   const [isCollapsed, setIsCollapsed] = useState(false);
 
@@ -47,7 +47,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
       case "dosen":
         return [
           { title: "Dashboard Dosen", href: "/dashboarddosen", icon: LayoutDashboard },
-          { title: "Pembimbing Akademik", href: "/dashboarddosen/pembimbing_akademi", icon: Users },
+          { title: "Pembimbing Akademik", href: "/dashboarddosen/pembimbing_akademik", icon: Users },
           { title: "Pembimbing Skripsi", href: "/dashboarddosen/pembimbing_skripsi", icon: ClipboardList },
           { title: "Penguji", href: "/dashboarddosen/penguji", icon: FileCheck },
         ];
@@ -57,7 +57,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
           { title: "Pengajuan Judul", href: "/dashboardmahasiswa/pengajuan_judul", icon: BookOpen },
           { title: "Bimbingan Saya", href: "/dashboardmahasiswa/bimbingan", icon: ClipboardList },
           { title: "Seminar Proposal", href: "/dashboardmahasiswa/sempro", icon: FileCheck },
-          { title: "Ujian Skripsi", href: "/dashboardmahasiswa/ujian", icon: GraduationCap },
+          { title: "Ujian Skripsi", href: "/dashboardmahasiswa/ujian_skripsi", icon: GraduationCap },
         ];
       default:
         return [];
@@ -145,8 +145,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
                 onClick={onClose}
                 title={isCollapsed ? item.title : undefined}
                 className={`flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-xs font-semibold transition-all duration-200 ${isActive
-                    ? "bg-white text-[#15803D] shadow-md"
-                    : "text-emerald-50 hover:bg-white/15 hover:text-white"
+                  ? "bg-white text-[#15803D] shadow-md"
+                  : "text-emerald-50 hover:bg-white/15 hover:text-white"
                   } ${isCollapsed ? "justify-center px-0" : ""}`}
               >
                 <Icon className={`w-4 h-4 shrink-0 ${isActive ? "text-[#15803D]" : "text-emerald-100"}`} />
