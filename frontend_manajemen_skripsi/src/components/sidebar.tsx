@@ -17,7 +17,8 @@ import {
   ChevronLeft,
   ChevronRight,
   X,
-  ShieldCheck
+  ShieldCheck,
+  Award
 } from "lucide-react";
 
 interface SidebarProps {
@@ -39,6 +40,7 @@ export function Sidebar({ onClose }: SidebarProps) {
           { title: "Dashboard", href: "/dashboardadmin", icon: LayoutDashboard },
           { title: "Data Mahasiswa", href: "/dashboardadmin/data_mahasiswa", icon: Users },
           { title: "Data Dosen", href: "/dashboardadmin/data_dosen", icon: UserCheck },
+          { title: "Penugasan Kaprodi", href: "/dashboardadmin/penugasan_kaprodi", icon: Award },
           { title: "Manajemen Akun", href: "/dashboardadmin/manajemen_akun", icon: ShieldCheck },
           { title: "Manajemen Sempro", href: "/dashboardadmin/manajemen_sempro", icon: FileCheck },
           { title: "Manajemen Ujian", href: "/dashboardadmin/manajemen_ujian", icon: GraduationCap },
@@ -50,6 +52,7 @@ export function Sidebar({ onClose }: SidebarProps) {
           { title: "Pembimbing Akademik", href: "/dashboarddosen/pembimbing_akademik", icon: Users },
           { title: "Pembimbing Skripsi", href: "/dashboarddosen/pembimbing_skripsi", icon: ClipboardList },
           { title: "Penguji", href: "/dashboarddosen/penguji", icon: FileCheck },
+          { title: "Persetujuan Kaprodi", href: "/dashboarddosen/persetujuan_kaprodi", icon: ShieldCheck },
         ];
       case "mahasiswa":
         return [
