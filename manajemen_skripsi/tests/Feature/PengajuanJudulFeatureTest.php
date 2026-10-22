@@ -8,14 +8,14 @@ use App\Models\Mahasiswa;
 use App\Models\PengajuanJudul;
 use App\Models\Skripsi;
 use App\Models\User;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Foundation\Testing\DatabaseTransactions;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Storage;
 use Tests\TestCase;
 
 class PengajuanJudulFeatureTest extends TestCase
 {
-    use RefreshDatabase;
+    use DatabaseTransactions;
 
     // -----------------------------------------------------------------------
     // HELPERS
@@ -323,7 +323,7 @@ class PengajuanJudulFeatureTest extends TestCase
             ->assertStatus(200)
             ->assertJsonFragment(['status' => 'success']);
 
-        $this->assertDatabaseHas('pengajuan_judul', ['id' => $pengajuan->id, 'status' => 'Disetujui Dosen PA']);
+        $this->assertDatabaseHas('pengajuan_judul', ['id' => $pengajuan->id, 'status' => 'Menunggu Persetujuan Kaprodi']);
     }
 
     public function test_dosen_pa_dapat_meminta_revisi(): void
@@ -337,7 +337,7 @@ class PengajuanJudulFeatureTest extends TestCase
             ])
             ->assertStatus(200);
 
-        $this->assertDatabaseHas('pengajuan_judul', ['id' => $pengajuan->id, 'status' => 'Revisi']);
+        $this->assertDatabaseHas('pengajuan_judul', ['id' => $pengajuan->id, 'status' => 'Revisi Dosen PA']);
     }
 
     public function test_dosen_pa_dapat_menolak_pengajuan(): void
@@ -351,7 +351,7 @@ class PengajuanJudulFeatureTest extends TestCase
             ])
             ->assertStatus(200);
 
-        $this->assertDatabaseHas('pengajuan_judul', ['id' => $pengajuan->id, 'status' => 'Ditolak']);
+        $this->assertDatabaseHas('pengajuan_judul', ['id' => $pengajuan->id, 'status' => 'Ditolak Dosen PA']);
     }
 
     public function test_dosen_pa_tidak_bisa_verifikasi_pengajuan_dosen_lain(): void

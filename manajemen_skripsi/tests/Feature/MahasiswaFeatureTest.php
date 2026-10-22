@@ -8,12 +8,12 @@ use App\Models\DosenPembimbing;
 use App\Models\Mahasiswa;
 use App\Models\Skripsi;
 use App\Models\User;
-use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Foundation\Testing\DatabaseTransactions;
 use Tests\TestCase;
 
 class MahasiswaFeatureTest extends TestCase
 {
-    use RefreshDatabase;
+    use DatabaseTransactions;
 
     public function test_can_list_mahasiswa_with_eager_relations(): void
     {
