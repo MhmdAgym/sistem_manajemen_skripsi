@@ -12,6 +12,7 @@ class PengajuanJudul extends Model
     protected $table = 'pengajuan_judul';
 
     protected $fillable = [
+        'skripsi_id',
         'mahasiswa_id',
         'dosen_pa_id',
         'judul',
@@ -39,7 +40,19 @@ class PengajuanJudul extends Model
 
     // Relasi ke akun User dosen PA (FK: dosen_pa_id → users.id)
     public function dosenPa()
-{
-    return $this->belongsTo(User::class, 'dosen_pa_id', 'id');
-}
+    {
+        return $this->belongsTo(User::class, 'dosen_pa_id', 'id');
+    }
+
+    // Relasi ke data Skripsi (FK: skripsi_id → skripsi.id_skripsi)
+    public function skripsi()
+    {
+        return $this->belongsTo(Skripsi::class, 'skripsi_id', 'id_skripsi');
+    }
+
+    // Relasi ke riwayat log audit (FK: pengajuan_judul_id → pengajuan_judul_logs.pengajuan_judul_id)
+    public function logs()
+    {
+        return $this->hasMany(PengajuanJudulLog::class, 'pengajuan_judul_id', 'id');
+    }
 }

@@ -46,4 +46,10 @@ class Dosen extends Model
     {
         return $this->hasMany(DosenPengujiSkripsi::class, 'id_dosen', 'id_dosen');
     }
+
+    // Relasi ke model PenugasanKaprodi (FK: dosen_id → dosen.id_dosen)
+    public function penugasanKaprodi()
+    {
+        return $this->hasMany(PenugasanKaprodi::class, 'dosen_id', 'id_dosen');
+    }
 }
