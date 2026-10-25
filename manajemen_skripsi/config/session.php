@@ -60,7 +60,7 @@ return [
     |
     */
 
-    'files' => storage_path('framework/sessions'),
+    'files' => env('SESSION_FILE_PATH') ? base_path(env('SESSION_FILE_PATH')) : storage_path('framework/sessions'),
 
     /*
     |--------------------------------------------------------------------------

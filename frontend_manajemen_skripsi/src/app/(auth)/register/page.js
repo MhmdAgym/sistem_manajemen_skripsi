@@ -6,26 +6,7 @@ import { useState } from 'react'
 import Image from 'next/image'
 import Link from 'next/link'
 import { Eye, EyeOff, Loader2 } from 'lucide-react'
-
-const daftarProdi = {
-    'Fakultas Agama Islam': [
-        'Pendidikan Agama Islam',
-        'Pendidikan Guru Madrasah Ibtidaiyah',
-        'Pendidikan Bahasa Arab',
-    ],
-    'Fakultas Ilmu Pendidikan': [
-        'Pendidikan Fisika',
-        'Pendidikan Ekonomi',
-        'Pendidikan Bahasa Inggris',
-        'Pendidikan Bahasa dan Sastra Indonesia',
-        'Pendidikan Teknologi Informasi',
-    ],
-    'Fakultas Sains dan Teknologi': [
-        'Informatika',
-        'Matematika',
-        'Sains Pertanian',
-    ],
-}
+import { FAKULTAS_PRODI as daftarProdi, FAKULTAS_LIST } from '@/constants/academic'
 
 const Page = () => {
     const { register } = useAuth({
@@ -280,7 +261,7 @@ const Page = () => {
                                             className={inputClasses}
                                             required>
                                             <option value="">Pilih fakultas</option>
-                                            {Object.keys(daftarProdi).map(namaFakultas => (
+                                            {FAKULTAS_LIST.map(namaFakultas => (
                                                 <option key={namaFakultas} value={namaFakultas}>
                                                     {namaFakultas}
                                                 </option>

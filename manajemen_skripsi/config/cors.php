@@ -29,7 +29,7 @@ return [
 
 'allowed_methods' => ['*'],
 
-'allowed_origins' => ['http://localhost:3000'], // Pastikan ini port frontend Anda
+'allowed_origins' => array_values(array_filter(explode(',', (string) env('CORS_ALLOWED_ORIGINS', 'http://localhost:3000')))),
 
 'allowed_origins_patterns' => [],
 

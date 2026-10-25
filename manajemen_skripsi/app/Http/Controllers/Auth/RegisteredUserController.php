@@ -14,6 +14,7 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Validation\Rules;
+use App\Constants\AcademicConstant;
 
 class RegisteredUserController extends Controller
 {
@@ -69,43 +70,20 @@ class RegisteredUserController extends Controller
             ],
         ]);
 
-        // Pastikan prodi sesuai dengan fakultas yang dipilih.
-        $daftarProdi = [
-            'Fakultas Agama Islam' => [
-                'Pendidikan Agama Islam',
-                'Pendidikan Guru Madrasah Ibtidaiyah',
-                'Pendidikan Bahasa Arab',
-            ],
-            'Fakultas Ilmu Pendidikan' => [
-                'Pendidikan Fisika',
-                'Pendidikan Ekonomi',
-                'Pendidikan Bahasa Inggris',
-                'Pendidikan Bahasa dan Sastra Indonesia',
-                'Pendidikan Teknologi Informasi',
-            ],
-            'Fakultas Sains dan Teknologi' => [
-                'Informatika',
-                'Matematika',
-                'Sains Pertanian',
-            ],
-        ];
-
-        if (
-            $validated['role'] === 'mahasiswa' &&
-            !in_array(
-                $validated['prodi'],
-                $daftarProdi[$validated['fakultas']] ?? [],
-                true
-            )
-        ) {
-            return response()->json([
-                'message' => 'Program studi tidak sesuai dengan fakultas.',
-                'errors' => [
-                    'prodi' => [
-                        'Program studi tidak sesuai dengan fakultas yang dipilih.',
+        // Pastikan prodi sesuai dengan fakultas yang dipilih menggunakan AcademicConstant
+        if ($validated['role'] === 'mahasiswa') {
+            $normalizedFakultas = AcademicConstant::normalizeFakultas($validated['fakultas'] ?? null);
+            if (!AcademicConstant::isValidPair($normalizedFakultas, $validated['prodi'] ?? null)) {
+                return response()->json([
+                    'message' => 'Program studi tidak sesuai dengan fakultas.',
+                    'errors' => [
+                        'prodi' => [
+                            'Program studi tidak sesuai dengan fakultas yang dipilih.',
+                        ],
                     ],
-                ],
-            ], 422);
+                ], 422);
+            }
+            $validated['fakultas'] = $normalizedFakultas;
         }
 
         DB::transaction(function () use ($validated, &$user) {

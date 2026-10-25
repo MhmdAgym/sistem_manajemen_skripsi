@@ -16,34 +16,42 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        // Pasang guard koneksi sedini mungkin pada fase registrasi provider
-        Event::listen(ConnectionEstablished::class, function (ConnectionEstablished $event) {
-            $connection = $event->connection;
-            $isTestingEnv = app()->environment('testing') || app()->runningUnitTests();
-
-            // Guard hanya aktif dan berlaku fail-closed saat berada di lingkungan testing
-            if (!$isTestingEnv) {
-                return;
-            }
-
+        $validateConnection = function ($connection) {
             $driver = (string) $connection->getConfig('driver');
             $database = (string) $connection->getConfig('database');
             $username = (string) $connection->getConfig('username');
             $host = (string) $connection->getConfig('host');
             $rawPort = $connection->getConfig('port');
+            $port = (string) ($rawPort !== null && $rawPort !== '' ? $rawPort : '3306');
 
-            // 1. Jalur SQLite: HANYA izinkan in-memory (:memory:)
-            if ($driver === 'sqlite') {
-                if ($database === ':memory:') {
-                    return;
+            // Evaluasi Konteks Pengujian: 5 indikator komprehensif
+            $isTestingContext = (
+                defined('STRICT_TEST_DATABASE_ISOLATION') ||
+                app()->environment('testing') ||
+                app()->runningUnitTests() ||
+                $database === 'manajemen_skripsi_test' ||
+                $username === 'unuha_tester'
+            );
+
+            if ($isTestingContext) {
+                // ========================================================
+                // JALUR 1: KONEKSI LINGKUNGAN PENGUJIAN (STRICT FAIL-CLOSED)
+                // ========================================================
+                if ($driver === 'sqlite') {
+                    if ($database === ':memory:') {
+                        return;
+                    }
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: File-based SQLite database [{$database}] is prohibited in testing mode."
+                    );
                 }
-                throw new \RuntimeException(
-                    "SECURITY VIOLATION: File-based SQLite database [{$database}] is prohibited in testing mode."
-                );
-            }
 
-            // 2. Jalur MySQL / MariaDB: Validasi Ketat Dua Tingkat
-            if ($driver === 'mysql' || $driver === 'mariadb') {
+                if ($driver !== 'mysql' && $driver !== 'mariadb') {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: Database driver [{$driver}] is not allowed in testing mode."
+                    );
+                }
+
                 // Tier 1: Validasi Konfigurasi Klien (Sebelum Query/DDL Aplikasi)
                 if ($database !== 'manajemen_skripsi_test') {
                     throw new \RuntimeException(
@@ -63,8 +71,6 @@ class AppServiceProvider extends ServiceProvider
                     );
                 }
 
-                // Normalisasi dan verifikasi port: tangani nilai kosong secara eksplisit, hanya izinkan 3306
-                $port = (string) ($rawPort !== null && $rawPort !== '' ? $rawPort : '3306');
                 if ($port !== '3306') {
                     throw new \RuntimeException(
                         "SECURITY VIOLATION: Testing attempted connection to unauthorized port [{$port}]. Only port 3306 is permitted."
@@ -92,8 +98,8 @@ class AppServiceProvider extends ServiceProvider
                     );
                 }
 
-                // Strictly periksa 'unuha_tester@localhost', tolak wildcard
-                if ($session->auth_user !== 'unuha_tester@localhost') {
+                // Strictly periksa 'unuha_tester@localhost' atau 'unuha_tester@127.0.0.1'
+                if ($session->auth_user !== 'unuha_tester@localhost' && $session->auth_user !== 'unuha_tester@127.0.0.1') {
                     throw new \RuntimeException(
                         "SECURITY VIOLATION: Authenticated MySQL user is [{$session->auth_user}]. Expected 'unuha_tester@localhost'."
                     );
@@ -102,11 +108,33 @@ class AppServiceProvider extends ServiceProvider
                 return;
             }
 
-            // 3. Tolak seluruh driver lainnya di lingkungan testing
-            throw new \RuntimeException(
-                "SECURITY VIOLATION: Database driver [{$driver}] is not allowed in testing mode."
-            );
+            // ========================================================
+            // JALUR 2: KONEKSI OPERASIONAL (ANTI-KONTAMINASI SILANG)
+            // ========================================================
+            if ($database === 'manajemen_skripsi_test') {
+                throw new \RuntimeException(
+                    "SECURITY VIOLATION: Operational application attempted connection to test database [manajemen_skripsi_test]."
+                );
+            }
+
+            if ($username === 'unuha_tester') {
+                throw new \RuntimeException(
+                    "SECURITY VIOLATION: Operational application attempted connection using test user [unuha_tester]."
+                );
+            }
+        };
+
+        // Pasang guard koneksi pada event ConnectionEstablished
+        Event::listen(ConnectionEstablished::class, function (ConnectionEstablished $event) use ($validateConnection) {
+            $validateConnection($event->connection);
         });
+
+        // Periksa koneksi yang mungkin sudah aktif sebelumnya
+        if (app()->bound('db')) {
+            foreach (\Illuminate\Support\Facades\DB::getConnections() as $existingConnection) {
+                $validateConnection($existingConnection);
+            }
+        }
     }
 
     /**

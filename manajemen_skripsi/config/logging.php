@@ -60,16 +60,23 @@ return [
 
         'single' => [
             'driver' => 'single',
-            'path' => storage_path('logs/laravel.log'),
+            'path' => env('LOG_PATH', storage_path('logs/laravel.log')),
             'level' => env('LOG_LEVEL', 'debug'),
             'replace_placeholders' => true,
         ],
 
         'daily' => [
             'driver' => 'daily',
-            'path' => storage_path('logs/laravel.log'),
+            'path' => env('LOG_PATH', storage_path('logs/laravel.log')),
             'level' => env('LOG_LEVEL', 'debug'),
             'days' => env('LOG_DAILY_DAYS', 14),
+            'replace_placeholders' => true,
+        ],
+
+        'testing' => [
+            'driver' => 'single',
+            'path' => env('LOG_PATH', storage_path('framework/testing/logs/testing.log')),
+            'level' => 'debug',
             'replace_placeholders' => true,
         ],
 
@@ -124,7 +131,7 @@ return [
         ],
 
         'emergency' => [
-            'path' => storage_path('logs/laravel.log'),
+            'path' => env('LOG_EMERGENCY_PATH', env('LOG_PATH', storage_path('logs/laravel.log'))),
         ],
 
     ],
