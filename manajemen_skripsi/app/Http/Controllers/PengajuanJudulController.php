@@ -323,6 +323,37 @@ class PengajuanJudulController extends Controller
                     $updateData['file_path']   = $newFilePath;
                 }
 
+                // Validasi dan pemulihan relasi skripsi_id jika data legacy
+                if (!empty($locked->skripsi_id)) {
+                    $skripsi = Skripsi::where('id_skripsi', $locked->skripsi_id)
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (!$skripsi || (int) $skripsi->id_mahasiswa !== (int) $mahasiswa->id_mahasiswa) {
+                        throw new \DomainException("Data skripsi tidak konsisten dengan profil Anda.");
+                    }
+                } else {
+                    $kandidatSkripsi = Skripsi::where('id_mahasiswa', $mahasiswa->id_mahasiswa)
+                        ->lockForUpdate()
+                        ->get();
+
+                    if ($kandidatSkripsi->isEmpty()) {
+                        throw new \DomainException("Data skripsi induk tidak ditemukan untuk akun Anda. Hubungi Administrator.");
+                    }
+
+                    if ($kandidatSkripsi->count() > 1) {
+                        throw new \DomainException("Ditemukan lebih dari satu kandidat skripsi aktif untuk akun Anda. Hubungi Administrator untuk resolusi data.");
+                    }
+
+                    $kandidat = $kandidatSkripsi->first();
+
+                    if ((int) $kandidat->id_mahasiswa !== (int) $mahasiswa->id_mahasiswa) {
+                        throw new \DomainException("Data skripsi tidak konsisten dengan profil Anda.");
+                    }
+
+                    $updateData['skripsi_id'] = $kandidat->id_skripsi;
+                }
+
                 $locked->update($updateData);
 
                 PengajuanJudulLog::create([
@@ -551,5 +582,80 @@ class PengajuanJudulController extends Controller
             'status' => 'success',
             'data'   => $semua,
         ]);
+    }
+
+    /**
+     * Unduh atau lihat dokumen pengajuan judul dengan validasi signed URL dan otorisasi peran.
+     */
+    public function unduhDokumen(Request $request, $id)
+    {
+        // 1. Validasi Keberadaan Record Pengajuan
+        $pengajuan = PengajuanJudul::with(['mahasiswa'])->findOrFail($id);
+
+        // 2. Autentikasi Pengguna
+        $user = $request->user();
+        if (!$user) {
+            abort(401, 'Unauthenticated.');
+        }
+
+        // 3. Matriks Otorisasi Berdasarkan Relasi Aktual
+        $isAuthorized = false;
+
+        if ($user->role === 'admin') {
+            $isAuthorized = true;
+        } elseif ($user->role === 'mahasiswa') {
+            // Mahasiswa hanya dapat mengakses dokumen pengajuan miliknya sendiri
+            $mahasiswaProfile = $user->mahasiswa;
+            if ($mahasiswaProfile && (int) $pengajuan->mahasiswa_id === (int) $mahasiswaProfile->id_mahasiswa) {
+                $isAuthorized = true;
+            }
+        } elseif ($user->role === 'dosen') {
+            // Cek 1: Apakah user adalah Dosen PA yang ditugaskan (dosen_pa_id merujuk ke users.id)
+            if ($pengajuan->dosen_pa_id !== null && (int) $pengajuan->dosen_pa_id === (int) $user->id) {
+                $isAuthorized = true;
+            }
+
+            // Cek 2: Apakah user adalah Kaprodi aktif untuk prodi mahasiswa pengajuan
+            if (!$isAuthorized) {
+                $dosenProfile = $user->dosen;
+                if ($dosenProfile && $pengajuan->mahasiswa) {
+                    $today = now()->toDateString();
+                    $hasKaprodiAssignment = \App\Models\PenugasanKaprodi::where('dosen_id', $dosenProfile->id_dosen)
+                        ->where('prodi', $pengajuan->mahasiswa->prodi)
+                        ->where('is_aktif', true)
+                        ->where('tanggal_mulai', '<=', $today)
+                        ->where(function ($q) use ($today) {
+                            $q->whereNull('tanggal_selesai')
+                              ->orWhere('tanggal_selesai', '>=', $today);
+                        })
+                        ->exists();
+
+                    if ($hasKaprodiAssignment) {
+                        $isAuthorized = true;
+                    }
+                }
+            }
+        }
+
+        if (!$isAuthorized) {
+            abort(403, 'Akses ditolak. Anda tidak memiliki izin untuk mengakses dokumen pengajuan ini.');
+        }
+
+        // 4. Validasi Path Berkas & Perlindungan Path Traversal
+        $filePath = $pengajuan->file_path;
+        if (empty($filePath) || str_contains($filePath, '..') || str_contains($filePath, "\0")) {
+            abort(400, 'Format path berkas tidak valid.');
+        }
+
+        if (!Storage::disk('public')->exists($filePath)) {
+            abort(404, 'Berkas fisik dokumen pengajuan tidak ditemukan.');
+        }
+
+        // 5. Sajikan Berkas dari Disk Public yang Terisolasi
+        return Storage::disk('public')->response(
+            $filePath,
+            $pengajuan->nama_file,
+            ['Content-Disposition' => 'inline; filename="' . addslashes($pengajuan->nama_file) . '"']
+        );
     }
 }

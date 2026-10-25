@@ -185,10 +185,43 @@ class KaprodiPengajuanJudulController extends Controller
                 }
 
                 // 2. Pessimistic locking pada skripsi terkait
-                $skripsi = Skripsi::where('id_skripsi', $locked->skripsi_id)->lockForUpdate()->first();
+                $skripsi = null;
 
-                if (!$skripsi || $skripsi->id_mahasiswa !== $locked->mahasiswa_id) {
-                    throw new \DomainException("Data skripsi tidak konsisten dengan pengajuan.");
+                if (!empty($locked->skripsi_id)) {
+                    // Kondisi A: skripsi_id sudah terisi
+                    $skripsi = Skripsi::where('id_skripsi', $locked->skripsi_id)
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (!$skripsi || (int) $skripsi->id_mahasiswa !== (int) $locked->mahasiswa_id) {
+                        throw new \DomainException("Data skripsi tidak konsisten dengan pengajuan.");
+                    }
+                } else {
+                    // Kondisi B: skripsi_id bernilai NULL (Data legacy)
+                    $kandidatSkripsi = Skripsi::where('id_mahasiswa', $locked->mahasiswa_id)
+                        ->lockForUpdate()
+                        ->get();
+
+                    if ($kandidatSkripsi->isEmpty()) {
+                        throw new \DomainException("Data skripsi induk tidak ditemukan untuk pengajuan ini. Hubungi Administrator.");
+                    }
+
+                    if ($kandidatSkripsi->count() > 1) {
+                        throw new \DomainException("Ditemukan lebih dari satu kandidat skripsi untuk akun mahasiswa pengaju. Hubungi Administrator untuk resolusi data.");
+                    }
+
+                    $kandidat = $kandidatSkripsi->first();
+
+                    if ((int) $kandidat->id_mahasiswa !== (int) $locked->mahasiswa_id) {
+                        throw new \DomainException("Data skripsi tidak konsisten dengan pengajuan.");
+                    }
+
+                    // Tautkan skripsi_id pada pengajuan secara atomik di dalam transaksi
+                    $locked->update([
+                        'skripsi_id' => $kandidat->id_skripsi,
+                    ]);
+
+                    $skripsi = $kandidat;
                 }
 
                 $statusSebelum = $locked->status;

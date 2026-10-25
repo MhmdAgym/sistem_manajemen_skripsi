@@ -27,9 +27,25 @@ class PengajuanJudul extends Model
     // Menambahkan atribut URL file otomatis saat dikirim ke Next.js
     protected $appends = ['file_url'];
 
-    public function getFileUrlAttribute(): string
+    public function getFileUrlAttribute(): ?string
     {
-        return asset('storage/' . $this->file_path);
+        if (empty($this->file_path) || empty($this->id)) {
+            return null;
+        }
+
+        try {
+            return \Illuminate\Support\Facades\URL::temporarySignedRoute(
+                'pengajuan-judul.dokumen',
+                now()->addMinutes(60),
+                ['id' => $this->id]
+            );
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning(
+                'Gagal membuat URL sementara dokumen pengajuan judul',
+                ['pengajuan_id' => $this->id, 'error_class' => get_class($e)]
+            );
+            return null;
+        }
     }
 
     // Relasi ke profil Mahasiswa (FK: mahasiswa_id → mahasiswa.id_mahasiswa)

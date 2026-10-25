@@ -50,7 +50,7 @@ interface RiwayatPengajuan {
   deskripsi: string;
   nama_file: string;
   ukuran_file: string;
-  file_url?: string;
+  file_url?: string | null;
   created_at: string;
   status: StatusPengajuan;
   catatan_dosen?: string | null;

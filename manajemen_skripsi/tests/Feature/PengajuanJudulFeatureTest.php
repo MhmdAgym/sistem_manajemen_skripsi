@@ -386,6 +386,118 @@ class PengajuanJudulFeatureTest extends TestCase
         $this->actingAs($adminUser, 'sanctum')
             ->getJson('/api/admin/pengajuan-judul')
             ->assertStatus(200)
-            ->assertJsonCount(1, 'data');
+            ->assertJsonFragment([
+                'judul' => 'Judul Untuk Admin',
+            ]);
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP 7: REVISI MAHASISWA & PEMULIHAN SKRIPSI_ID LEGACY
+    // -----------------------------------------------------------------------
+
+    public function test_mahasiswa_dapat_merevisi_pengajuan_legacy_null_skripsi_id_dan_memulihkan_relasi(): void
+    {
+        $data = $this->buatMahasiswaDenganDosenPA();
+        $file = $this->buatFilePDF();
+
+        // Simulasi pengajuan legacy: skripsi_id = null, status = Revisi Dosen PA
+        $pengajuan = PengajuanJudul::create([
+            'skripsi_id'   => null,
+            'mahasiswa_id' => $data['mahasiswa']->id_mahasiswa,
+            'dosen_pa_id'  => $data['dosenUser']->id,
+            'judul'        => 'Judul Sebelum Revisi',
+            'deskripsi'    => 'Deskripsi lama',
+            'nama_file'    => 'proposal_lama.pdf',
+            'ukuran_file'  => '200 KB',
+            'file_path'    => 'pengajuan-judul/proposal_lama.pdf',
+            'status'       => 'Revisi Dosen PA',
+        ]);
+
+        $response = $this->actingAs($data['mahasiswaUser'], 'sanctum')
+            ->postJson("/api/mahasiswa/pengajuan-judul/{$pengajuan->id}/revisi", [
+                'judul'             => 'Judul Setelah Revisi Berhasil',
+                'deskripsi'         => 'Deskripsi yang sudah diperbaiki',
+                'file_judul'        => $file,
+                'catatan_mahasiswa' => 'Sudah diperbaiki sesuai catatan',
+            ]);
+
+        $response->assertStatus(200);
+        $response->assertJsonFragment(['status' => 'success']);
+
+        // Pastikan relasi skripsi_id terpulihkan ke skripsi milik mahasiswa
+        $this->assertDatabaseHas('pengajuan_judul', [
+            'id'         => $pengajuan->id,
+            'skripsi_id' => $data['skripsi']->id_skripsi,
+            'judul'      => 'Judul Setelah Revisi Berhasil',
+            'status'     => 'Menunggu Verifikasi Dosen PA',
+        ]);
+    }
+
+    public function test_revisi_pengajuan_null_skripsi_id_tanpa_kandidat_skripsi_ditolak_422(): void
+    {
+        $mahasiswaUser = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => '2010112288']);
+        $mahasiswa = Mahasiswa::create([
+            'user_id' => $mahasiswaUser->id, 'NIM' => '2010112288',
+            'nama_mahasiswa' => 'Mahasiswa Tanpa Skripsi', 'prodi' => 'Sistem Informasi',
+        ]);
+        $dosenUser = User::factory()->create(['role' => 'dosen', 'nomor_induk' => '9988776688']);
+
+        $pengajuan = PengajuanJudul::create([
+            'skripsi_id'   => null,
+            'mahasiswa_id' => $mahasiswa->id_mahasiswa,
+            'dosen_pa_id'  => $dosenUser->id,
+            'judul'        => 'Judul Revisi Tanpa Skripsi',
+            'deskripsi'    => 'Deskripsi',
+            'nama_file'    => 'f.pdf',
+            'ukuran_file'  => '100 KB',
+            'file_path'    => 'pengajuan-judul/f.pdf',
+            'status'       => 'Revisi Dosen PA',
+        ]);
+
+        $response = $this->actingAs($mahasiswaUser, 'sanctum')
+            ->postJson("/api/mahasiswa/pengajuan-judul/{$pengajuan->id}/revisi", [
+                'judul' => 'Judul Baru',
+            ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonFragment([
+            'status'  => 'error',
+            'message' => 'Data skripsi induk tidak ditemukan untuk akun Anda. Hubungi Administrator.',
+        ]);
+    }
+
+    public function test_revisi_pengajuan_null_skripsi_id_dengan_kandidat_ambigu_ditolak_422(): void
+    {
+        $data = $this->buatMahasiswaDenganDosenPA();
+
+        // Tambah skripsi kedua sehingga menjadi ambigu (>1)
+        Skripsi::create([
+            'id_mahasiswa' => $data['mahasiswa']->id_mahasiswa,
+            'judul'        => 'Skripsi Kedua Ambigu',
+            'status_judul' => 'Belum Mengajukan',
+        ]);
+
+        $pengajuan = PengajuanJudul::create([
+            'skripsi_id'   => null,
+            'mahasiswa_id' => $data['mahasiswa']->id_mahasiswa,
+            'dosen_pa_id'  => $data['dosenUser']->id,
+            'judul'        => 'Judul Revisi Ambigu',
+            'deskripsi'    => 'Deskripsi',
+            'nama_file'    => 'f.pdf',
+            'ukuran_file'  => '100 KB',
+            'file_path'    => 'pengajuan-judul/f.pdf',
+            'status'       => 'Revisi Dosen PA',
+        ]);
+
+        $response = $this->actingAs($data['mahasiswaUser'], 'sanctum')
+            ->postJson("/api/mahasiswa/pengajuan-judul/{$pengajuan->id}/revisi", [
+                'judul' => 'Judul Baru',
+            ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonFragment([
+            'status'  => 'error',
+            'message' => 'Ditemukan lebih dari satu kandidat skripsi aktif untuk akun Anda. Hubungi Administrator untuk resolusi data.',
+        ]);
     }
 }

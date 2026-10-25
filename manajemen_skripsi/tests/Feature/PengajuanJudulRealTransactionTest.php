@@ -36,7 +36,10 @@ class PengajuanJudulRealTransactionTest extends TestCase
     protected array $createdDosenIds = [];
     protected array $createdSkripsiIds = [];
     protected array $createdPengajuanIds = [];
+    protected array $createdDosenPaIds = [];
+    protected array $createdPenugasanKaprodiIds = [];
     protected array $createdFilePaths = [];
+    protected array $cleanupAuditReport = [];
 
     protected function setUp(): void
     {
@@ -45,50 +48,605 @@ class PengajuanJudulRealTransactionTest extends TestCase
         // Verifikasi ketat target database adalah manajemen_skripsi_test
         $activeDb = DB::connection()->getDatabaseName();
         $this->assertEquals('manajemen_skripsi_test', $activeDb, 'CRITICAL: Suite real transaction HANYA boleh berjalan pada manajemen_skripsi_test.');
+
+        // Isolasi storage disk public pada disk virtual in-memory untuk seluruh suite pengujian
+        Storage::fake('public');
     }
 
     protected function tearDown(): void
     {
-        // Pembersihan fixture mandiri (self-cleaning) sesuai urutan foreign key
+        $mainTestStatus = 'UNKNOWN';
+        $mainTestStatusDetail = 'Uninitialized';
         try {
-            if (!empty($this->createdPengajuanIds)) {
-                DB::table('pengajuan_judul_logs')->whereIn('pengajuan_judul_id', $this->createdPengajuanIds)->delete();
-                DB::table('pengajuan_judul')->whereIn('id', $this->createdPengajuanIds)->delete();
+            if (method_exists($this, 'status')) {
+                $statusObj = $this->status();
+                if (is_object($statusObj)) {
+                    if (method_exists($statusObj, 'asString')) {
+                        $mainTestStatusDetail = $statusObj->asString();
+                    }
+                    if (method_exists($statusObj, 'isFailure') && method_exists($statusObj, 'isError') && ($statusObj->isFailure() || $statusObj->isError())) {
+                        $mainTestStatus = 'FAILED';
+                    } elseif (method_exists($statusObj, 'isSuccess') && $statusObj->isSuccess()) {
+                        $mainTestStatus = 'PASSED';
+                    } else {
+                        $mainTestStatus = 'UNKNOWN';
+                    }
+                } else {
+                    $mainTestStatus = 'UNKNOWN';
+                    $mainTestStatusDetail = 'status() did not return an object';
+                }
+            } else {
+                $mainTestStatus = 'UNKNOWN';
+                $mainTestStatusDetail = 'status() method does not exist';
             }
-            if (!empty($this->createdSkripsiIds)) {
-                DB::table('dosen_pa')->whereIn('id_skripsi', $this->createdSkripsiIds)->delete();
-                DB::table('skripsi')->whereIn('id_skripsi', $this->createdSkripsiIds)->delete();
+        } catch (\Throwable $statusEx) {
+            $mainTestStatus = 'UNKNOWN';
+            $mainTestStatusDetail = 'Exception while inspecting status: ' . $statusEx->getMessage();
+        }
+
+        $this->cleanupAuditReport['main_test_status'] = $mainTestStatus;
+        $this->cleanupAuditReport['main_test_status_detail'] = $mainTestStatusDetail;
+
+        $cleanupAnomalies = [];
+
+        // Eksekusi pembersihan fixture berantai 2 fase
+        try {
+            $this->executeTwoPhaseChainedCleanup($cleanupAnomalies);
+        } catch (\Throwable $clEx) {
+            $cleanupAnomalies[] = 'Exception tak terduga pada executeTwoPhaseChainedCleanup: ' . $clEx->getMessage();
+        }
+
+        // Pelaporan pra-teardown terlindungi
+        try {
+            $this->processReportingPreTeardown($cleanupAnomalies);
+        } catch (\Throwable $preRepEx) {
+            $cleanupAnomalies[] = 'Kegagalan pelaporan pra-teardown: ' . $preRepEx->getMessage();
+        }
+
+        // Eksekusi parent::tearDown() dengan penanganan exception dan proteksi reporter darurat
+        $parentTeardownException = null;
+        try {
+            parent::tearDown();
+        } catch (\Throwable $ptdEx) {
+            $parentTeardownException = $ptdEx;
+            $cleanupAnomalies[] = 'Parent tearDown melempar exception: ' . $ptdEx->getMessage();
+
+            // Proteksi reporter darurat: dibungkus try/catch mandiri agar tidak menimpa exception parent
+            try {
+                $this->safeEmergencyLogPostTeardown('Parent tearDown failure: ' . $ptdEx->getMessage());
+            } catch (\Throwable $loggerEx) {
+                // Catat hanya ke properti memori, DILARANG melempar exception keluar
+                $this->cleanupAuditReport['post_teardown_logger_failure'] = $loggerEx->getMessage();
             }
+        }
+
+        // -------------------------------------------------------------------
+        // PRIORITAS EXCEPTION PASCA-TEARDOWN
+        // -------------------------------------------------------------------
+
+        // Prioritas 4: Jika parent::tearDown() melempar exception, prioritaskan untuk dilempar
+        if ($parentTeardownException !== null) {
+            throw $parentTeardownException;
+        }
+
+        // Prioritas 1 & 2: Evaluasi anomali cleanup terhadap status tes utama
+        if (!empty($cleanupAnomalies)) {
+            // Jika tes utama terbukti FAILED: JANGAN melempar exception baru agar pesan error tes utama tetap murni
+            if ($mainTestStatus === 'FAILED') {
+                return;
+            }
+
+            // Jika tes utama PASSED: Melempar RuntimeException adalah wajib agar runner menandai residu cleanup
+            if ($mainTestStatus === 'PASSED') {
+                throw new \RuntimeException(
+                    "Pembersihan fixture gagal dengan anomali (tes utama PASSED):\n"
+                    . $this->formatAnomaliesSummary($cleanupAnomalies)
+                );
+            }
+
+            // Jika tes utama UNKNOWN: Kebijakan konservatif, lempar RuntimeException dengan label UNKNOWN eksplisit
+            throw new \RuntimeException(
+                "Pembersihan fixture gagal dengan anomali (status tes utama UNKNOWN / tidak dapat dipastikan):\n"
+                . $this->formatAnomaliesSummary($cleanupAnomalies)
+            );
+        }
+    }
+
+    /**
+     * Menjalankan pembersihan fixture dua fase:
+     * Fase 1: Discovery total target ID (eksplisit + relasional) tanpa mutasi.
+     * Fase 2: Chained circuit breaker cleanup (child-to-parent) dengan verifikasi residu.
+     */
+    private function executeTwoPhaseChainedCleanup(array &$cleanupAnomalies): void
+    {
+        // -------------------------------------------------------------------
+        // FASE 1: DISCOVERY TOTAL (READ-ONLY)
+        // -------------------------------------------------------------------
+
+        // 1. Pengajuan Judul Discovery
+        $targetPengajuanIds = $this->createdPengajuanIds;
+        $discoveryPengajuanOk = true;
+        if (!empty($this->createdMahasiswaIds)) {
+            try {
+                $relationalPengajuanIds = DB::table('pengajuan_judul')
+                    ->whereIn('mahasiswa_id', $this->createdMahasiswaIds)
+                    ->pluck('id')
+                    ->all();
+                $targetPengajuanIds = array_values(array_unique(array_merge($targetPengajuanIds, $relationalPengajuanIds)));
+                $this->cleanupAuditReport['pengajuan_judul_discovery'] = [
+                    'status' => 'DISCOVERY_SUCCEEDED',
+                    'count'  => count($targetPengajuanIds),
+                ];
+            } catch (\Throwable $e) {
+                $discoveryPengajuanOk = false;
+                $cleanupAnomalies[] = 'Discovery pengajuan_judul via mahasiswa_id gagal: ' . $e->getMessage();
+                $this->cleanupAuditReport['pengajuan_judul_discovery'] = [
+                    'status' => 'DISCOVERY_FAILED',
+                    'error'  => $e->getMessage(),
+                ];
+            }
+        } else {
+            $this->cleanupAuditReport['pengajuan_judul_discovery'] = [
+                'status' => empty($targetPengajuanIds) ? 'DISCOVERY_NOT_APPLICABLE' : 'DISCOVERY_SUCCEEDED_EXPLICIT_ONLY',
+                'count'  => count($targetPengajuanIds),
+            ];
+        }
+
+        // 2. Pengajuan Judul Logs Discovery
+        $targetLogIds = [];
+        $discoveryLogsOk = true;
+        if (!empty($targetPengajuanIds)) {
+            try {
+                $targetLogIds = DB::table('pengajuan_judul_logs')
+                    ->whereIn('pengajuan_judul_id', $targetPengajuanIds)
+                    ->pluck('id')
+                    ->all();
+                $this->cleanupAuditReport['pengajuan_judul_logs_discovery'] = [
+                    'status' => 'DISCOVERY_SUCCEEDED',
+                    'count'  => count($targetLogIds),
+                ];
+            } catch (\Throwable $e) {
+                $discoveryLogsOk = false;
+                $cleanupAnomalies[] = 'Discovery pengajuan_judul_logs via pengajuan_judul_id gagal: ' . $e->getMessage();
+                $this->cleanupAuditReport['pengajuan_judul_logs_discovery'] = [
+                    'status' => 'DISCOVERY_FAILED',
+                    'error'  => $e->getMessage(),
+                ];
+            }
+        } else {
+            $this->cleanupAuditReport['pengajuan_judul_logs_discovery'] = [
+                'status' => 'DISCOVERY_SUCCEEDED_ZERO_TARGETS',
+                'count'  => 0,
+            ];
+        }
+
+        // 3. Skripsi Discovery
+        $targetSkripsiIds = $this->createdSkripsiIds;
+        $discoverySkripsiOk = true;
+        if (!empty($this->createdMahasiswaIds)) {
+            try {
+                $relationalSkripsiIds = DB::table('skripsi')
+                    ->whereIn('id_mahasiswa', $this->createdMahasiswaIds)
+                    ->pluck('id_skripsi')
+                    ->all();
+                $targetSkripsiIds = array_values(array_unique(array_merge($targetSkripsiIds, $relationalSkripsiIds)));
+                $this->cleanupAuditReport['skripsi_discovery'] = [
+                    'status' => 'DISCOVERY_SUCCEEDED',
+                    'count'  => count($targetSkripsiIds),
+                ];
+            } catch (\Throwable $e) {
+                $discoverySkripsiOk = false;
+                $cleanupAnomalies[] = 'Discovery skripsi via id_mahasiswa gagal: ' . $e->getMessage();
+                $this->cleanupAuditReport['skripsi_discovery'] = [
+                    'status' => 'DISCOVERY_FAILED',
+                    'error'  => $e->getMessage(),
+                ];
+            }
+        } else {
+            $this->cleanupAuditReport['skripsi_discovery'] = [
+                'status' => empty($targetSkripsiIds) ? 'DISCOVERY_NOT_APPLICABLE' : 'DISCOVERY_SUCCEEDED_EXPLICIT_ONLY',
+                'count'  => count($targetSkripsiIds),
+            ];
+        }
+
+        // 4. Dosen PA Discovery
+        $targetDosenPaIds = $this->createdDosenPaIds;
+        $discoveryDosenPaOk = true;
+        if (!empty($targetSkripsiIds) || !empty($this->createdDosenIds)) {
+            try {
+                $query = DB::table('dosen_pa');
+                if (!empty($targetSkripsiIds) && !empty($this->createdDosenIds)) {
+                    $query->where(function ($q) use ($targetSkripsiIds) {
+                        $q->whereIn('id_skripsi', $targetSkripsiIds)
+                          ->orWhereIn('id_dosen', $this->createdDosenIds);
+                    });
+                } elseif (!empty($targetSkripsiIds)) {
+                    $query->whereIn('id_skripsi', $targetSkripsiIds);
+                } else {
+                    $query->whereIn('id_dosen', $this->createdDosenIds);
+                }
+                $relationalDosenPaIds = $query->pluck('id_dosen_pa')->all();
+                $targetDosenPaIds = array_values(array_unique(array_merge($targetDosenPaIds, $relationalDosenPaIds)));
+                $this->cleanupAuditReport['dosen_pa_discovery'] = [
+                    'status' => 'DISCOVERY_SUCCEEDED',
+                    'count'  => count($targetDosenPaIds),
+                ];
+            } catch (\Throwable $e) {
+                $discoveryDosenPaOk = false;
+                $cleanupAnomalies[] = 'Discovery dosen_pa via skripsi/dosen gagal: ' . $e->getMessage();
+                $this->cleanupAuditReport['dosen_pa_discovery'] = [
+                    'status' => 'DISCOVERY_FAILED',
+                    'error'  => $e->getMessage(),
+                ];
+            }
+        } else {
+            $this->cleanupAuditReport['dosen_pa_discovery'] = [
+                'status' => empty($targetDosenPaIds) ? 'DISCOVERY_NOT_APPLICABLE' : 'DISCOVERY_SUCCEEDED_EXPLICIT_ONLY',
+                'count'  => count($targetDosenPaIds),
+            ];
+        }
+
+        // 5. Penugasan Kaprodi Discovery (BLOCKER 1 FIX)
+        // Inisialisasi dari ID eksplisit terlebih dahulu
+        $targetPenugasanIds = $this->createdPenugasanKaprodiIds;
+        $discoveryPenugasanOk = true;
+        if (!empty($this->createdDosenIds)) {
+            try {
+                $relationalPenugasanIds = DB::table('penugasan_kaprodi')
+                    ->whereIn('dosen_id', $this->createdDosenIds)
+                    ->pluck('id')
+                    ->all();
+                $targetPenugasanIds = array_values(array_unique(array_merge($targetPenugasanIds, $relationalPenugasanIds)));
+                $this->cleanupAuditReport['penugasan_kaprodi_discovery'] = [
+                    'status' => 'DISCOVERY_SUCCEEDED',
+                    'count'  => count($targetPenugasanIds),
+                ];
+            } catch (\Throwable $e) {
+                $discoveryPenugasanOk = false;
+                $cleanupAnomalies[] = 'Discovery penugasan_kaprodi via dosen_id gagal: ' . $e->getMessage();
+                $this->cleanupAuditReport['penugasan_kaprodi_discovery'] = [
+                    'status' => 'DISCOVERY_FAILED',
+                    'error'  => $e->getMessage(),
+                ];
+            }
+        } else {
+            $this->cleanupAuditReport['penugasan_kaprodi_discovery'] = [
+                'status' => empty($targetPenugasanIds) ? 'DISCOVERY_NOT_APPLICABLE' : 'DISCOVERY_SUCCEEDED_EXPLICIT_ONLY',
+                'count'  => count($targetPenugasanIds),
+            ];
+        }
+
+        // 6. Root User Discovery (Eksplisit + Verifikasi Profil Mahasiswa & Dosen)
+        $targetUserIds = $this->createdUserIds;
+        $discoveryUsersOk = true;
+        try {
+            $profileUserIds = [];
             if (!empty($this->createdMahasiswaIds)) {
-                DB::table('mahasiswa')->whereIn('id_mahasiswa', $this->createdMahasiswaIds)->delete();
+                $profileUserIds = array_merge(
+                    $profileUserIds,
+                    DB::table('mahasiswa')->whereIn('id_mahasiswa', $this->createdMahasiswaIds)->pluck('user_id')->all()
+                );
             }
             if (!empty($this->createdDosenIds)) {
-                DB::table('penugasan_kaprodi')->whereIn('dosen_id', $this->createdDosenIds)->delete();
-                DB::table('dosen')->whereIn('id_dosen', $this->createdDosenIds)->delete();
+                $profileUserIds = array_merge(
+                    $profileUserIds,
+                    DB::table('dosen')->whereIn('id_dosen', $this->createdDosenIds)->pluck('user_id')->all()
+                );
             }
-            if (!empty($this->createdUserIds)) {
-                DB::table('users')->whereIn('id', $this->createdUserIds)->delete();
+            $targetUserIds = array_values(array_unique(array_merge($targetUserIds, array_filter($profileUserIds))));
+            $this->cleanupAuditReport['users_discovery'] = [
+                'status' => 'DISCOVERY_SUCCEEDED',
+                'count'  => count($targetUserIds),
+            ];
+        } catch (\Throwable $e) {
+            $discoveryUsersOk = false;
+            $cleanupAnomalies[] = 'Discovery users via profil mahasiswa/dosen gagal: ' . $e->getMessage();
+            $this->cleanupAuditReport['users_discovery'] = [
+                'status' => 'DISCOVERY_FAILED',
+                'error'  => $e->getMessage(),
+            ];
+        }
+
+        // -------------------------------------------------------------------
+        // FASE 2: CHAINED CIRCUIT BREAKER CLEANUP
+        // -------------------------------------------------------------------
+
+        // Langkah 1: pengajuan_judul_logs
+        $isLogClean = false;
+        if (!$discoveryLogsOk) {
+            $cleanupAnomalies[] = 'Pembersihan pengajuan_judul_logs dilewati karena discovery gagal.';
+            $this->cleanupAuditReport['pengajuan_judul_logs'] = ['status' => 'CLEANUP_SKIPPED_DISCOVERY_FAILED'];
+        } else {
+            $isLogClean = $this->safeCleanupTable('pengajuan_judul_logs', 'id', $targetLogIds, $cleanupAnomalies);
+        }
+
+        // Langkah 2: pengajuan_judul
+        $isPengajuanClean = false;
+        if (!$isLogClean) {
+            $cleanupAnomalies[] = 'Pembersihan pengajuan_judul DIBLOKIR oleh circuit breaker karena log belum bersih.';
+            $this->cleanupAuditReport['pengajuan_judul'] = ['status' => 'BLOCKED_BY_LOG_NOT_CLEAN'];
+        } elseif (!$discoveryPengajuanOk) {
+            $cleanupAnomalies[] = 'Pembersihan pengajuan_judul dilewati karena discovery pengajuan gagal.';
+            $this->cleanupAuditReport['pengajuan_judul'] = ['status' => 'CLEANUP_SKIPPED_DISCOVERY_FAILED'];
+        } else {
+            $isPengajuanClean = $this->safeCleanupTable('pengajuan_judul', 'id', $targetPengajuanIds, $cleanupAnomalies);
+        }
+
+        // Langkah 3: dosen_pa
+        $isDosenPaClean = false;
+        if (!$discoveryDosenPaOk) {
+            $cleanupAnomalies[] = 'Pembersihan dosen_pa dilewati karena discovery dosen_pa gagal.';
+            $this->cleanupAuditReport['dosen_pa'] = ['status' => 'CLEANUP_SKIPPED_DISCOVERY_FAILED'];
+        } else {
+            $isDosenPaClean = $this->safeCleanupTable('dosen_pa', 'id_dosen_pa', $targetDosenPaIds, $cleanupAnomalies);
+        }
+
+        // Langkah 4: skripsi
+        $isSkripsiClean = false;
+        if (!$isPengajuanClean) {
+            $cleanupAnomalies[] = 'Pembersihan skripsi DIBLOKIR oleh circuit breaker karena pengajuan_judul belum bersih.';
+            $this->cleanupAuditReport['skripsi'] = ['status' => 'BLOCKED_BY_PENGAJUAN_NOT_CLEAN'];
+        } elseif (!$isDosenPaClean) {
+            $cleanupAnomalies[] = 'Pembersihan skripsi DIBLOKIR oleh circuit breaker karena dosen_pa belum bersih.';
+            $this->cleanupAuditReport['skripsi'] = ['status' => 'BLOCKED_BY_DOSEN_PA_NOT_CLEAN'];
+        } elseif (!$discoverySkripsiOk) {
+            $cleanupAnomalies[] = 'Pembersihan skripsi dilewati karena discovery skripsi gagal.';
+            $this->cleanupAuditReport['skripsi'] = ['status' => 'CLEANUP_SKIPPED_DISCOVERY_FAILED'];
+        } else {
+            $isSkripsiClean = $this->safeCleanupTable('skripsi', 'id_skripsi', $targetSkripsiIds, $cleanupAnomalies);
+        }
+
+        // Langkah 5: penugasan_kaprodi (BLOCKER 1 FIX)
+        $isPenugasanClean = false;
+        if (!$discoveryPenugasanOk) {
+            // Hapus ID eksplisit jika ada untuk meminimalkan residu
+            if (!empty($targetPenugasanIds)) {
+                $this->safeCleanupTable('penugasan_kaprodi', 'id', $targetPenugasanIds, $cleanupAnomalies);
             }
-            foreach ($this->createdFilePaths as $path) {
+            $cleanupAnomalies[] = 'Penugasan Kaprodi discovery relasional gagal; status tidak bersih sehingga memblokir parent dosen.';
+            $this->cleanupAuditReport['penugasan_kaprodi'] = ['status' => 'PARTIAL_OR_UNVERIFIED_DISCOVERY_FAILED'];
+            $isPenugasanClean = false;
+        } else {
+            $isPenugasanClean = $this->safeCleanupTable('penugasan_kaprodi', 'id', $targetPenugasanIds, $cleanupAnomalies);
+        }
+
+        // Langkah 6: mahasiswa
+        $isMahasiswaClean = false;
+        if (!$isPengajuanClean) {
+            $cleanupAnomalies[] = 'Pembersihan mahasiswa DIBLOKIR oleh circuit breaker karena pengajuan_judul belum bersih.';
+            $this->cleanupAuditReport['mahasiswa'] = ['status' => 'BLOCKED_BY_PENGAJUAN_NOT_CLEAN'];
+        } elseif (!$isSkripsiClean) {
+            $cleanupAnomalies[] = 'Pembersihan mahasiswa DIBLOKIR oleh circuit breaker karena skripsi belum bersih.';
+            $this->cleanupAuditReport['mahasiswa'] = ['status' => 'BLOCKED_BY_SKRIPSI_NOT_CLEAN'];
+        } else {
+            $isMahasiswaClean = $this->safeCleanupTable('mahasiswa', 'id_mahasiswa', $this->createdMahasiswaIds, $cleanupAnomalies);
+        }
+
+        // Langkah 7: dosen
+        $isDosenClean = false;
+        if (!$isDosenPaClean) {
+            $cleanupAnomalies[] = 'Pembersihan dosen DIBLOKIR oleh circuit breaker karena dosen_pa belum bersih.';
+            $this->cleanupAuditReport['dosen'] = ['status' => 'BLOCKED_BY_DOSEN_PA_NOT_CLEAN'];
+        } elseif (!$isPenugasanClean) {
+            $cleanupAnomalies[] = 'Pembersihan dosen DIBLOKIR oleh circuit breaker karena penugasan_kaprodi belum bersih.';
+            $this->cleanupAuditReport['dosen'] = ['status' => 'BLOCKED_BY_PENUGASAN_NOT_CLEAN'];
+        } else {
+            $isDosenClean = $this->safeCleanupTable('dosen', 'id_dosen', $this->createdDosenIds, $cleanupAnomalies);
+        }
+
+        // Langkah 8: users
+        $isUsersClean = false;
+        if (!$isMahasiswaClean) {
+            $cleanupAnomalies[] = 'Pembersihan users DIBLOKIR oleh circuit breaker karena profil mahasiswa belum bersih.';
+            $this->cleanupAuditReport['users'] = ['status' => 'BLOCKED_BY_MAHASISWA_NOT_CLEAN'];
+        } elseif (!$isDosenClean) {
+            $cleanupAnomalies[] = 'Pembersihan users DIBLOKIR oleh circuit breaker karena profil dosen belum bersih.';
+            $this->cleanupAuditReport['users'] = ['status' => 'BLOCKED_BY_DOSEN_NOT_CLEAN'];
+        } elseif (!$discoveryUsersOk) {
+            $cleanupAnomalies[] = 'Pembersihan users DIBLOKIR oleh circuit breaker karena discovery profil users gagal.';
+            $this->cleanupAuditReport['users'] = ['status' => 'BLOCKED_BY_DISCOVERY_USERS_FAILED'];
+        } else {
+            $isUsersClean = $this->safeCleanupTable('users', 'id', $targetUserIds, $cleanupAnomalies);
+        }
+
+        // Langkah 9: Berkas Storage
+        $this->safeCleanupStorageFiles($cleanupAnomalies);
+    }
+
+    /**
+     * Menghapus record pada tabel target berdasarkan daftar ID dan memverifikasi residu bernilai 0.
+     */
+    private function safeCleanupTable(string $table, string $pkColumn, array $ids, array &$anomalies): bool
+    {
+        $uniqueIds = array_values(array_unique(array_filter($ids)));
+        if (empty($uniqueIds)) {
+            $this->cleanupAuditReport[$table] = [
+                'status' => 'DISCOVERY_SUCCEEDED_ZERO_TARGETS',
+                'count'  => 0,
+            ];
+            return true;
+        }
+
+        try {
+            DB::table($table)->whereIn($pkColumn, $uniqueIds)->delete();
+
+            // Verifikasi residu pasca-delete
+            $remaining = DB::table($table)->whereIn($pkColumn, $uniqueIds)->count();
+            if ($remaining === 0) {
+                $this->cleanupAuditReport[$table] = [
+                    'status' => 'DELETE_SUCCEEDED_VERIFIED',
+                    'count'  => count($uniqueIds),
+                ];
+                return true;
+            }
+
+            $anomalies[] = "Tabel {$table} masih memiliki {$remaining} record residu setelah operasi delete.";
+            $this->cleanupAuditReport[$table] = [
+                'status'  => 'DELETE_FAILED_RESIDUE_DETECTED',
+                'residue' => $remaining,
+            ];
+            return false;
+        } catch (\Throwable $e) {
+            // Operasi delete melempar exception: WAJIB dicatat sebagai anomali kegagalan operasi
+            $residueCount = null;
+            $residueCheckStatus = 'RESIDUE_CHECK_FAILED_UNKNOWN';
+            $residueCheckError = null;
+
+            try {
+                $residueCount = DB::table($table)->whereIn($pkColumn, $uniqueIds)->count();
+                if ($residueCount === 0) {
+                    $residueCheckStatus = 'ZERO_RESIDUE_AFTER_DELETE_ERROR';
+                } else {
+                    $residueCheckStatus = 'RESIDUE_STILL_PRESENT';
+                }
+            } catch (\Throwable $rcEx) {
+                $residueCheckStatus = 'RESIDUE_CHECK_FAILED_UNKNOWN';
+                $residueCheckError = $rcEx->getMessage();
+            }
+
+            $anomalies[] = "Operasi delete pada tabel {$table} gagal (exception: " . $e->getMessage()
+                . ", status residu: {$residueCheckStatus}"
+                . ($residueCount !== null ? ", jumlah: {$residueCount}" : '')
+                . ($residueCheckError !== null ? ", error verifikasi: {$residueCheckError}" : '')
+                . ')';
+
+            $this->cleanupAuditReport[$table] = [
+                'status'               => 'DELETE_OPERATION_FAILED',
+                'operation_error'      => $e->getMessage(),
+                'residue_check_status' => $residueCheckStatus,
+                'residue_count'        => $residueCount,
+                'residue_check_error'  => $residueCheckError,
+            ];
+
+            // Selalu kembalikan false agar circuit breaker memblokir parent tabel
+            return false;
+        }
+    }
+
+    /**
+     * Membersihkan berkas storage yang dicatat secara eksplisit dan memverifikasi tidak ada yang tertinggal.
+     */
+    private function safeCleanupStorageFiles(array &$anomalies): void
+    {
+        $uniquePaths = array_values(array_unique(array_filter($this->createdFilePaths)));
+        if (empty($uniquePaths)) {
+            $this->cleanupAuditReport['storage_files'] = [
+                'status' => 'NO_FILES_TO_CLEAN',
+                'count'  => 0,
+            ];
+            return;
+        }
+
+        $failedPaths = [];
+        foreach ($uniquePaths as $path) {
+            try {
                 if (Storage::disk('public')->exists($path)) {
                     Storage::disk('public')->delete($path);
                 }
+                if (Storage::disk('public')->exists($path)) {
+                    $failedPaths[] = $path;
+                }
+            } catch (\Throwable $e) {
+                $failedPaths[] = $path . ' (' . $e->getMessage() . ')';
             }
-        } catch (\Throwable $e) {
-            // Log kegagalan cleanup tanpa menyembunyikannya
-            Log::error("Gagal membersihkan fixture PengajuanJudulRealTransactionTest: " . $e->getMessage());
         }
 
-        parent::tearDown();
+        if (!empty($failedPaths)) {
+            $anomalies[] = 'Gagal menghapus berkas storage: ' . implode(', ', $failedPaths);
+            $this->cleanupAuditReport['storage_files'] = [
+                'status'  => 'STORAGE_RESIDUE_DETECTED',
+                'residue' => $failedPaths,
+            ];
+        } else {
+            $this->cleanupAuditReport['storage_files'] = [
+                'status' => 'STORAGE_ALL_DELETED',
+                'count'  => count($uniquePaths),
+            ];
+        }
+    }
+
+    /**
+     * Melakukan pelaporan hasil audit cleanup sebelum parent::tearDown() dieksekusi.
+     */
+    private function processReportingPreTeardown(array $anomalies): void
+    {
+        if (empty($anomalies)) {
+            return;
+        }
+
+        $summary = $this->formatAnomaliesSummary($anomalies);
+
+        // 1. Catat ke Laravel Log jika container masih ada
+        try {
+            Log::error("Anomali cleanup PengajuanJudulRealTransactionTest:\n" . $summary, [
+                'audit_report' => $this->cleanupAuditReport,
+            ]);
+            $this->cleanupAuditReport['laravel_log_written'] = true;
+        } catch (\Throwable $logEx) {
+            $this->cleanupAuditReport['laravel_log_written'] = false;
+            $this->cleanupAuditReport['laravel_log_error'] = $logEx->getMessage();
+        }
+
+        // 2. Tulis ke file log darurat native PHP
+        $this->safeEmergencyLogPostTeardown("Pre-Teardown Anomali:\n" . $summary);
+    }
+
+    /**
+     * Menulis log darurat menggunakan fungsi native PHP (bebas dari dependensi container Laravel).
+     */
+    private function safeEmergencyLogPostTeardown(string $message): void
+    {
+        $logDir = dirname(__DIR__, 2) . '/storage/logs';
+        $logFile = $logDir . '/cleanup_emergency.log';
+        $timestamp = date('Y-m-d H:i:s');
+        $formattedEntry = "[{$timestamp}] " . $message . PHP_EOL;
+
+        // Tulis ke file log fisik
+        $bytesWritten = @file_put_contents($logFile, $formattedEntry, FILE_APPEND | LOCK_EX);
+        if ($bytesWritten !== false && $bytesWritten > 0) {
+            $this->cleanupAuditReport['emergency_log_file_written'] = true;
+        } else {
+            $this->cleanupAuditReport['emergency_log_file_written'] = false;
+        }
+
+        // Tulis ke STDERR jika stream tersedia
+        if (defined('STDERR') && is_resource(STDERR)) {
+            $stderrBytes = @fwrite(STDERR, $formattedEntry);
+            $this->cleanupAuditReport['stderr_written'] = ($stderrBytes !== false && $stderrBytes > 0);
+        }
+    }
+
+    /**
+     * Memformat daftar anomali menjadi string ringkas untuk pelaporan dan exception.
+     */
+    private function formatAnomaliesSummary(array $anomalies): string
+    {
+        $lines = [];
+        foreach ($anomalies as $index => $anomaly) {
+            $lines[] = ' [' . ($index + 1) . '] ' . $anomaly;
+        }
+        return implode(PHP_EOL, $lines);
     }
 
     // -----------------------------------------------------------------------
     // HELPERS FIXTURE DENGAN TRACKING MANDIRI
     // -----------------------------------------------------------------------
 
-    private function buatMahasiswa(string $suffix): array
+    private function buatMahasiswa(string $suffix, string $prodi = 'Informatika'): array
     {
-        $nim = '9999' . substr(strval(time()), -4) . $suffix;
+        $cleanSuffix = str_pad(substr(preg_replace('/\D/', '', $suffix), -2), 2, '0', STR_PAD_LEFT);
+        $attempts = 0;
+        do {
+            $nim = '9' . sprintf('%07d', random_int(0, 9999999)) . $cleanSuffix;
+            $exists = DB::table('users')->where('nomor_induk', $nim)->exists()
+                   || DB::table('mahasiswa')->where('NIM', $nim)->exists();
+            $attempts++;
+        } while ($exists && $attempts < 10);
+
+        if ($exists) {
+            throw new \RuntimeException("Gagal menghasilkan NIM unik 10-digit setelah {$attempts} percobaan.");
+        }
+
         $user = User::factory()->create([
             'role'        => 'mahasiswa',
             'nomor_induk' => $nim,
@@ -100,7 +658,7 @@ class PengajuanJudulRealTransactionTest extends TestCase
             'user_id'        => $user->id,
             'NIM'            => $nim,
             'nama_mahasiswa' => 'Mhs ' . $nim,
-            'prodi'          => 'Informatika',
+            'prodi'          => $prodi,
         ]);
         $this->createdMahasiswaIds[] = $mahasiswa->id_mahasiswa;
 
@@ -109,7 +667,19 @@ class PengajuanJudulRealTransactionTest extends TestCase
 
     private function buatDosen(string $suffix): array
     {
-        $nidn = '8888' . substr(strval(time()), -4) . $suffix;
+        $cleanSuffix = str_pad(substr(preg_replace('/\D/', '', $suffix), -2), 2, '0', STR_PAD_LEFT);
+        $attempts = 0;
+        do {
+            $nidn = '8' . sprintf('%07d', random_int(0, 9999999)) . $cleanSuffix;
+            $exists = DB::table('users')->where('nomor_induk', $nidn)->exists()
+                   || DB::table('dosen')->where('NIDN', $nidn)->exists();
+            $attempts++;
+        } while ($exists && $attempts < 10);
+
+        if ($exists) {
+            throw new \RuntimeException("Gagal menghasilkan NIDN unik 10-digit setelah {$attempts} percobaan.");
+        }
+
         $user = User::factory()->create([
             'role'        => 'dosen',
             'nomor_induk' => $nidn,
@@ -141,10 +711,13 @@ class PengajuanJudulRealTransactionTest extends TestCase
 
     private function buatDosenPA(Dosen $dosen, Skripsi $skripsi): DosenPA
     {
-        return DosenPA::create([
+        $dosenPa = DosenPA::create([
             'id_dosen'   => $dosen->id_dosen,
             'id_skripsi' => $skripsi->id_skripsi,
         ]);
+        $this->createdDosenPaIds[] = $dosenPa->id_dosen_pa;
+
+        return $dosenPa;
     }
 
     private function buatPenugasanKaprodi(
@@ -152,13 +725,16 @@ class PengajuanJudulRealTransactionTest extends TestCase
         string $prodi = 'Informatika',
         bool $isAktif = true
     ): PenugasanKaprodi {
-        return PenugasanKaprodi::create([
+        $penugasan = PenugasanKaprodi::create([
             'dosen_id'        => $dosen->id_dosen,
             'prodi'           => $prodi,
             'tanggal_mulai'   => now()->subMonth()->toDateString(),
             'tanggal_selesai' => null,
             'is_aktif'        => $isAktif,
         ]);
+        $this->createdPenugasanKaprodiIds[] = $penugasan->id;
+
+        return $penugasan;
     }
 
     // -----------------------------------------------------------------------
@@ -171,8 +747,6 @@ class PengajuanJudulRealTransactionTest extends TestCase
      */
     public function test_real_commit_updates_database_and_deletes_old_file_post_commit(): void
     {
-        Storage::fake('public');
-
         $mhs = $this->buatMahasiswa('01');
         $dsn = $this->buatDosen('01');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
@@ -231,8 +805,6 @@ class PengajuanJudulRealTransactionTest extends TestCase
      */
     public function test_real_rollback_retains_old_file_and_cleans_new_file_on_audit_failure(): void
     {
-        Storage::fake('public');
-
         $mhs = $this->buatMahasiswa('02');
         $dsn = $this->buatDosen('02');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
@@ -290,8 +862,6 @@ class PengajuanJudulRealTransactionTest extends TestCase
      */
     public function test_old_file_delete_failure_post_commit_does_not_abort_database_success(): void
     {
-        Storage::fake('public');
-
         $mhs = $this->buatMahasiswa('03');
         $dsn = $this->buatDosen('03');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
@@ -407,8 +977,6 @@ class PengajuanJudulRealTransactionTest extends TestCase
      */
     public function test_store_inside_transaction_blocks_submission_if_final_title_already_approved(): void
     {
-        Storage::fake('public');
-
         $mhs = $this->buatMahasiswa('06');
         $dsn = $this->buatDosen('06');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
@@ -562,11 +1130,11 @@ class PengajuanJudulRealTransactionTest extends TestCase
     {
         Log::spy();
 
-        $mhs = $this->buatMahasiswa('09');
+        $mhs = $this->buatMahasiswa('09', 'Sains Pertanian');
         $dsnKaprodi = $this->buatDosen('09');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $skripsi = $this->buatSkripsi($mhs['mahasiswa'], 'Judul Lama Skripsi', 'diajukan');
+        $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
 
         $pengajuan = PengajuanJudul::create([
             'skripsi_id'   => $skripsi->id_skripsi,
@@ -637,9 +1205,9 @@ class PengajuanJudulRealTransactionTest extends TestCase
      */
     public function test_persetujuan_kaprodi_concurrent_status_change_returns_422_domain_exception(): void
     {
-        $mhs = $this->buatMahasiswa('10');
+        $mhs = $this->buatMahasiswa('10', 'Sains Pertanian');
         $dsnKaprodi = $this->buatDosen('10');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
 
@@ -682,10 +1250,10 @@ class PengajuanJudulRealTransactionTest extends TestCase
      */
     public function test_persetujuan_kaprodi_inconsistent_skripsi_returns_422_domain_exception(): void
     {
-        $mhs1 = $this->buatMahasiswa('11');
-        $mhs2 = $this->buatMahasiswa('12');
+        $mhs1 = $this->buatMahasiswa('11', 'Sains Pertanian');
+        $mhs2 = $this->buatMahasiswa('12', 'Sains Pertanian');
         $dsnKaprodi = $this->buatDosen('11');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
         // Skripsi milik mhs2, tetapi diajukan seolah-olah oleh mhs1
         $skripsiMhs2 = $this->buatSkripsi($mhs2['mahasiswa']);

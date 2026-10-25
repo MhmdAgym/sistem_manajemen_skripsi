@@ -42,7 +42,7 @@ class KaprodiWorkflowFeatureTest extends TestCase
         return compact('user', 'mahasiswa');
     }
 
-    private function buatDosen(string $nidn = '0011223301'): array
+    private function buatDosen(string $nidn = '0011223381'): array
     {
         $user = User::factory()->create([
             'role'        => 'dosen',
@@ -78,7 +78,7 @@ class KaprodiWorkflowFeatureTest extends TestCase
 
     private function buatPenugasanKaprodi(
         Dosen $dosen,
-        string $prodi = 'Informatika',
+        string $prodi = 'Sains Pertanian',
         bool $isAktif = true,
         ?string $mulai = null,
         ?string $selesai = null
@@ -108,7 +108,7 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_1_mahasiswa_dapat_mengajukan_judul_dengan_skripsi_miliknya_yang_valid(): void
     {
         $mhs = $this->buatMahasiswa('2010110001', 'Informatika');
-        $dsn = $this->buatDosen('0011223301');
+        $dsn = $this->buatDosen('0011223381');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa'], 'Belum Ditentukan', 'diajukan');
         $this->buatDosenPA($dsn['dosen'], $skripsi);
 
@@ -149,7 +149,7 @@ class KaprodiWorkflowFeatureTest extends TestCase
     {
         $mhs1 = $this->buatMahasiswa('2010110001', 'Informatika');
         $mhs2 = $this->buatMahasiswa('2010110002', 'Informatika');
-        $dsn = $this->buatDosen('0011223301');
+        $dsn = $this->buatDosen('0011223382');
 
         $skripsi1 = $this->buatSkripsi($mhs1['mahasiswa']);
         $this->buatDosenPA($dsn['dosen'], $skripsi1);
@@ -401,16 +401,16 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_9_kaprodi_dengan_penugasan_aktif_dan_prodi_cocok_dapat_melihat_antrean(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223309');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        // Pengajuan prodi Informatika (harus terlihat)
-        $mhsInf = $this->buatMahasiswa('2010110009', 'Informatika');
-        $skripsiInf = $this->buatSkripsi($mhsInf['mahasiswa']);
+        // Pengajuan prodi Sains Pertanian (harus terlihat)
+        $mhsSp = $this->buatMahasiswa('2010110009', 'Sains Pertanian');
+        $skripsiSp = $this->buatSkripsi($mhsSp['mahasiswa']);
         PengajuanJudul::create([
-            'skripsi_id'   => $skripsiInf->id_skripsi,
-            'mahasiswa_id' => $mhsInf['mahasiswa']->id_mahasiswa,
+            'skripsi_id'   => $skripsiSp->id_skripsi,
+            'mahasiswa_id' => $mhsSp['mahasiswa']->id_mahasiswa,
             'dosen_pa_id'  => $dsnKaprodi['user']->id,
-            'judul'        => 'Pengajuan Informatika',
+            'judul'        => 'Pengajuan Sains Pertanian',
             'deskripsi'    => 'D',
             'nama_file'    => 'f.pdf',
             'ukuran_file'  => '100 KB',
@@ -437,7 +437,7 @@ class KaprodiWorkflowFeatureTest extends TestCase
             ->getJson('/api/kaprodi/pengajuan-judul');
 
         $response->assertStatus(200);
-        $response->assertJsonFragment(['judul' => 'Pengajuan Informatika']);
+        $response->assertJsonFragment(['judul' => 'Pengajuan Sains Pertanian']);
         $response->assertJsonMissing(['judul' => 'Pengajuan Fisika']);
     }
 
@@ -454,7 +454,7 @@ class KaprodiWorkflowFeatureTest extends TestCase
 
         // 2. Dosen dengan penugasan tidak aktif (is_aktif = false)
         $dsnNonaktif = $this->buatDosen('0011223312');
-        $this->buatPenugasanKaprodi($dsnNonaktif['dosen'], 'Informatika', false);
+        $this->buatPenugasanKaprodi($dsnNonaktif['dosen'], 'Sains Pertanian', false);
         $this->actingAs($dsnNonaktif['user'], 'sanctum')
             ->getJson('/api/kaprodi/pengajuan-judul')
             ->assertStatus(403);
@@ -463,7 +463,7 @@ class KaprodiWorkflowFeatureTest extends TestCase
         $dsnExpired = $this->buatDosen('0011223313');
         $this->buatPenugasanKaprodi(
             $dsnExpired['dosen'],
-            'Informatika',
+            'Sains Pertanian',
             true,
             now()->subMonths(6)->toDateString(),
             now()->subMonth()->toDateString()
@@ -515,9 +515,9 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_12_kaprodi_tidak_dapat_menyetujui_pengajuan_yang_belum_disetujui_dosen_pa(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223315');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110015', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110015', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
 
         $pengajuan = PengajuanJudul::create([
@@ -550,9 +550,9 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_13_persetujuan_kaprodi_memperbarui_status_pengajuan_dan_judul_skripsi(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223316');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110016', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110016', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa'], 'Menunggu Judul Disetujui', 'diajukan');
 
         $pengajuan = PengajuanJudul::create([
@@ -606,9 +606,9 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_14_revisi_kaprodi_kembali_melalui_dosen_pa(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223317');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110017', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110017', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
 
         $pengajuan = PengajuanJudul::create([
@@ -669,9 +669,9 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_15_penolakan_kaprodi_tidak_memperbarui_judul_final_skripsi(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223318');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110018', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110018', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa'], 'Judul Default Skripsi', 'diajukan');
 
         $pengajuan = PengajuanJudul::create([
@@ -717,9 +717,9 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_16_kegagalan_audit_log_membatalkan_perubahan_bisnis(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223319');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110019', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110019', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa'], 'Judul Lama', 'diajukan');
 
         $pengajuan = PengajuanJudul::create([
@@ -776,9 +776,9 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_17_status_sebelum_sesudah_dan_snapshot_aktor_tersimpan_benar(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223320');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110020', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110020', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
 
         $pengajuan = PengajuanJudul::create([
@@ -833,11 +833,11 @@ class KaprodiWorkflowFeatureTest extends TestCase
      */
     public function test_19_pa_dan_kaprodi_yang_sama_tetap_mengikuti_dua_tahap_keputusan(): void
     {
-        // Dosen Rangkap: Menjadi PA sekaligus Kaprodi Informatika
+        // Dosen Rangkap: Menjadi PA sekaligus Kaprodi Sains Pertanian
         $dsnRangkap = $this->buatDosen('0011223321');
-        $this->buatPenugasanKaprodi($dsnRangkap['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnRangkap['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110021', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110021', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
         $this->buatDosenPA($dsnRangkap['dosen'], $skripsi);
 
@@ -898,9 +898,9 @@ class KaprodiWorkflowFeatureTest extends TestCase
     public function test_20_status_usang_tidak_menghasilkan_keputusan_ganda(): void
     {
         $dsnKaprodi = $this->buatDosen('0011223322');
-        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Informatika', true);
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
 
-        $mhs = $this->buatMahasiswa('2010110022', 'Informatika');
+        $mhs = $this->buatMahasiswa('2010110022', 'Sains Pertanian');
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
 
         $pengajuan = PengajuanJudul::create([
@@ -985,6 +985,174 @@ class KaprodiWorkflowFeatureTest extends TestCase
         ]);
         $this->assertDatabaseMissing('pengajuan_judul_logs', [
             'user_id' => $mhs['user']->id,
+        ]);
+    }
+
+    /**
+     * 23. Pengajuan legacy (skripsi_id = NULL) dengan tepat satu skripsi mahasiswa dapat disetujui Kaprodi dan memulihkan relasi skripsi_id.
+     */
+    public function test_23_persetujuan_kaprodi_pada_pengajuan_legacy_null_skripsi_id_dapat_disetujui_dan_memulihkan_relasi(): void
+    {
+        $mhs = $this->buatMahasiswa('2010110025', 'Sains Pertanian');
+        $dsnKaprodi = $this->buatDosen('0011223325');
+        $skripsi = $this->buatSkripsi($mhs['mahasiswa'], 'Menunggu Pengajuan Judul', 'Belum Mengajukan');
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
+
+        // Simulasi pengajuan legacy: skripsi_id = null
+        $pengajuan = PengajuanJudul::create([
+            'skripsi_id'   => null,
+            'mahasiswa_id' => $mhs['mahasiswa']->id_mahasiswa,
+            'dosen_pa_id'  => $dsnKaprodi['user']->id,
+            'judul'        => 'Pengajuan Legacy Valid',
+            'deskripsi'    => 'Deskripsi usulan',
+            'nama_file'    => 'legacy.pdf',
+            'ukuran_file'  => '100 KB',
+            'file_path'    => 'pengajuan-judul/legacy.pdf',
+            'status'       => 'Menunggu Persetujuan Kaprodi',
+        ]);
+
+        $response = $this->actingAs($dsnKaprodi['user'], 'sanctum')
+            ->patchJson("/api/kaprodi/pengajuan-judul/{$pengajuan->id}/persetujuan", [
+                'status' => 'Disetujui Kaprodi',
+            ]);
+
+        $response->assertStatus(200);
+        $response->assertJsonFragment(['status' => 'success']);
+
+        // Pastikan relasi skripsi_id terpulihkan pada pengajuan
+        $this->assertDatabaseHas('pengajuan_judul', [
+            'id'         => $pengajuan->id,
+            'skripsi_id' => $skripsi->id_skripsi,
+            'status'     => 'Disetujui Kaprodi',
+        ]);
+
+        // Pastikan skripsi terupdate judul dan statusnya
+        $this->assertDatabaseHas('skripsi', [
+            'id_skripsi'   => $skripsi->id_skripsi,
+            'judul'        => 'Pengajuan Legacy Valid',
+            'status_judul' => 'disetujui',
+        ]);
+
+        // Pastikan log audit tercatat
+        $this->assertDatabaseHas('pengajuan_judul_logs', [
+            'pengajuan_judul_id' => $pengajuan->id,
+            'tahap'              => 'persetujuan_kaprodi',
+            'tindakan'           => 'setujui_kaprodi',
+            'status_sesudah'     => 'Disetujui Kaprodi',
+        ]);
+    }
+
+    /**
+     * 24. Pengajuan legacy (skripsi_id = NULL) tanpa kandidat skripsi ditolak 422 secara aman.
+     */
+    public function test_24_persetujuan_kaprodi_pada_pengajuan_null_skripsi_id_tanpa_kandidat_skripsi_ditolak_422(): void
+    {
+        $mhs = $this->buatMahasiswa('2010110026', 'Sains Pertanian');
+        $dsnKaprodi = $this->buatDosen('0011223326');
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
+
+        // Mahasiswa tidak memiliki skripsi sama sekali
+        $pengajuan = PengajuanJudul::create([
+            'skripsi_id'   => null,
+            'mahasiswa_id' => $mhs['mahasiswa']->id_mahasiswa,
+            'dosen_pa_id'  => $dsnKaprodi['user']->id,
+            'judul'        => 'Pengajuan Tanpa Skripsi',
+            'deskripsi'    => 'Deskripsi',
+            'nama_file'    => 'f.pdf',
+            'ukuran_file'  => '100 KB',
+            'file_path'    => 'pengajuan-judul/f.pdf',
+            'status'       => 'Menunggu Persetujuan Kaprodi',
+        ]);
+
+        $response = $this->actingAs($dsnKaprodi['user'], 'sanctum')
+            ->patchJson("/api/kaprodi/pengajuan-judul/{$pengajuan->id}/persetujuan", [
+                'status' => 'Disetujui Kaprodi',
+            ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonFragment([
+            'status'  => 'error',
+            'message' => 'Data skripsi induk tidak ditemukan untuk pengajuan ini. Hubungi Administrator.',
+        ]);
+    }
+
+    /**
+     * 25. Pengajuan legacy (skripsi_id = NULL) dengan kandidat skripsi ambigu (>1) ditolak 422 secara aman.
+     */
+    public function test_25_persetujuan_kaprodi_pada_pengajuan_null_skripsi_id_dengan_kandidat_ambigu_ditolak_422(): void
+    {
+        $mhs = $this->buatMahasiswa('2010110027', 'Sains Pertanian');
+        $dsnKaprodi = $this->buatDosen('0011223327');
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
+
+        // Mahasiswa memiliki lebih dari 1 skripsi
+        $this->buatSkripsi($mhs['mahasiswa'], 'Skripsi 1');
+        $this->buatSkripsi($mhs['mahasiswa'], 'Skripsi 2');
+
+        $pengajuan = PengajuanJudul::create([
+            'skripsi_id'   => null,
+            'mahasiswa_id' => $mhs['mahasiswa']->id_mahasiswa,
+            'dosen_pa_id'  => $dsnKaprodi['user']->id,
+            'judul'        => 'Pengajuan Skripsi Ambigu',
+            'deskripsi'    => 'Deskripsi',
+            'nama_file'    => 'f.pdf',
+            'ukuran_file'  => '100 KB',
+            'file_path'    => 'pengajuan-judul/f.pdf',
+            'status'       => 'Menunggu Persetujuan Kaprodi',
+        ]);
+
+        $response = $this->actingAs($dsnKaprodi['user'], 'sanctum')
+            ->patchJson("/api/kaprodi/pengajuan-judul/{$pengajuan->id}/persetujuan", [
+                'status' => 'Disetujui Kaprodi',
+            ]);
+
+        $response->assertStatus(422);
+        $response->assertJsonFragment([
+            'status'  => 'error',
+            'message' => 'Ditemukan lebih dari satu kandidat skripsi untuk akun mahasiswa pengaju. Hubungi Administrator untuk resolusi data.',
+        ]);
+    }
+
+    /**
+     * 26. Kegagalan tindakan Kaprodi pada pengajuan legacy tidak meninggalkan mutasi relasi parsial.
+     */
+    public function test_26_kegagalan_kaprodi_pada_pengajuan_legacy_tidak_meninggalkan_relasi_parsial(): void
+    {
+        $mhs = $this->buatMahasiswa('2010110028', 'Sains Pertanian');
+        $dsnKaprodi = $this->buatDosen('0011223328');
+        $skripsi = $this->buatSkripsi($mhs['mahasiswa'], 'Menunggu Judul', 'diajukan');
+        $this->buatPenugasanKaprodi($dsnKaprodi['dosen'], 'Sains Pertanian', true);
+
+        $pengajuan = PengajuanJudul::create([
+            'skripsi_id'   => null,
+            'mahasiswa_id' => $mhs['mahasiswa']->id_mahasiswa,
+            'dosen_pa_id'  => $dsnKaprodi['user']->id,
+            'judul'        => 'Pengajuan Gagal Validasi',
+            'deskripsi'    => 'Deskripsi',
+            'nama_file'    => 'f.pdf',
+            'ukuran_file'  => '100 KB',
+            'file_path'    => 'pengajuan-judul/f.pdf',
+            'status'       => 'Menunggu Persetujuan Kaprodi',
+        ]);
+
+        // Kirim status 'Revisi Kaprodi' tanpa catatan_kaprodi yang wajib
+        $response = $this->actingAs($dsnKaprodi['user'], 'sanctum')
+            ->patchJson("/api/kaprodi/pengajuan-judul/{$pengajuan->id}/persetujuan", [
+                'status'          => 'Revisi Kaprodi',
+                'catatan_kaprodi' => '',
+            ]);
+
+        $response->assertStatus(422);
+
+        // Verifikasi skripsi_id pada pengajuan tetap null (tidak ada partial commit)
+        $this->assertDatabaseHas('pengajuan_judul', [
+            'id'         => $pengajuan->id,
+            'skripsi_id' => null,
+            'status'     => 'Menunggu Persetujuan Kaprodi',
+        ]);
+        $this->assertDatabaseHas('skripsi', [
+            'id_skripsi'   => $skripsi->id_skripsi,
+            'status_judul' => 'diajukan',
         ]);
     }
 }

@@ -57,7 +57,7 @@ interface PengajuanMahasiswa {
   deskripsi: string;
   nama_file: string;
   ukuran_file: string;
-  file_url: string;
+  file_url?: string | null;
   created_at: string;
   status: StatusPengajuan;
   catatan_dosen?: string | null;
@@ -383,21 +383,29 @@ export default function PembimbingAkademiPage() {
                     </div>
 
                     <div className="flex items-center gap-1.5 ml-2">
-                      <a
-                        href={item.file_url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="px-2.5 py-1.5 bg-white hover:bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-[11px] font-semibold flex items-center gap-1 transition shadow-sm"
-                      >
-                        <ExternalLink className="w-3.5 h-3.5" /> Lihat
-                      </a>
-                      <a
-                        href={item.file_url}
-                        download={item.nama_file}
-                        className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-[11px] font-semibold flex items-center gap-1 transition shadow-sm"
-                      >
-                        <Download className="w-3.5 h-3.5" /> Unduh
-                      </a>
+                      {item.file_url ? (
+                        <>
+                          <a
+                            href={item.file_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-2.5 py-1.5 bg-white hover:bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-xl text-[11px] font-semibold flex items-center gap-1 transition shadow-sm"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" /> Lihat
+                          </a>
+                          <a
+                            href={item.file_url}
+                            download={item.nama_file}
+                            className="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-[11px] font-semibold flex items-center gap-1 transition shadow-sm"
+                          >
+                            <Download className="w-3.5 h-3.5" /> Unduh
+                          </a>
+                        </>
+                      ) : (
+                        <span className="text-slate-400 text-[11px] italic">
+                          Dokumen tidak tersedia
+                        </span>
+                      )}
                     </div>
                   </div>
 

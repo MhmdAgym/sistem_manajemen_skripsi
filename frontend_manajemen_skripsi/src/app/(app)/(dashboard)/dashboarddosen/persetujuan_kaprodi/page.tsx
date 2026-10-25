@@ -46,7 +46,7 @@ interface PengajuanKaprodi {
   nama_file: string;
   ukuran_file: string;
   file_path?: string;
-  file_url?: string;
+  file_url?: string | null;
   status: string;
   catatan_dosen?: string | null;
   created_at: string;

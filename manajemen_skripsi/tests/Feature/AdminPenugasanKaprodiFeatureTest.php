@@ -238,7 +238,7 @@ class AdminPenugasanKaprodiFeatureTest extends TestCase
 
         $payload = [
             'dosen_id'        => $dsn['dosen']->id_dosen,
-            'prodi'           => 'Informatika',
+            'prodi'           => 'Pendidikan Bahasa dan Sastra Indonesia',
             'tanggal_mulai'   => now()->toDateString(),
             'tanggal_selesai' => null,
             'is_aktif'        => true,
@@ -251,7 +251,7 @@ class AdminPenugasanKaprodiFeatureTest extends TestCase
 
         $this->assertDatabaseHas('penugasan_kaprodi', [
             'dosen_id' => $dsn['dosen']->id_dosen,
-            'prodi'    => 'Informatika',
+            'prodi'    => 'Pendidikan Bahasa dan Sastra Indonesia',
             'is_aktif' => true,
         ]);
     }
@@ -398,17 +398,17 @@ class AdminPenugasanKaprodiFeatureTest extends TestCase
 
         PenugasanKaprodi::create([
             'dosen_id'        => $dsn1['dosen']->id_dosen,
-            'prodi'           => 'Informatika',
+            'prodi'           => 'Pendidikan Guru Madrasah Ibtidaiyah',
             'tanggal_mulai'   => now()->subMonth()->toDateString(),
             'tanggal_selesai' => null,
             'is_aktif'        => true,
         ]);
 
-        // Coba menugaskan dosen 2 pada prodi Informatika tanpa gantikan_penugasan_aktif
+        // Coba menugaskan dosen 2 pada prodi Pendidikan Guru Madrasah Ibtidaiyah tanpa gantikan_penugasan_aktif
         $response = $this->actingAs($admin)
             ->postJson('/api/admin/penugasan-kaprodi', [
                 'dosen_id'      => $dsn2['dosen']->id_dosen,
-                'prodi'         => 'Informatika',
+                'prodi'         => 'Pendidikan Guru Madrasah Ibtidaiyah',
                 'tanggal_mulai' => now()->toDateString(),
             ])
             ->assertStatus(409)
@@ -428,7 +428,7 @@ class AdminPenugasanKaprodiFeatureTest extends TestCase
 
         $oldPenugasan = PenugasanKaprodi::create([
             'dosen_id'        => $dsn1['dosen']->id_dosen,
-            'prodi'           => 'Informatika',
+            'prodi'           => 'Pendidikan Agama Islam',
             'tanggal_mulai'   => now()->subMonths(6)->toDateString(),
             'tanggal_selesai' => null,
             'is_aktif'        => true,
@@ -437,7 +437,7 @@ class AdminPenugasanKaprodiFeatureTest extends TestCase
         $response = $this->actingAs($admin)
             ->postJson('/api/admin/penugasan-kaprodi', [
                 'dosen_id'                 => $dsn2['dosen']->id_dosen,
-                'prodi'                    => 'Informatika',
+                'prodi'                    => 'Pendidikan Agama Islam',
                 'tanggal_mulai'            => now()->toDateString(),
                 'gantikan_penugasan_aktif' => true,
             ])
@@ -451,7 +451,7 @@ class AdminPenugasanKaprodiFeatureTest extends TestCase
         // Kaprodi baru aktif
         $this->assertDatabaseHas('penugasan_kaprodi', [
             'dosen_id' => $dsn2['dosen']->id_dosen,
-            'prodi'    => 'Informatika',
+            'prodi'    => 'Pendidikan Agama Islam',
             'is_aktif' => true,
         ]);
 
