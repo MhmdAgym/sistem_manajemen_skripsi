@@ -40,9 +40,16 @@ class DosenController extends Controller
         return $d;
     }
 
-    // Tampilkan semua data dosen beserta relasi bimbingan unik
-    public function index()
+    // Tampilkan semua data dosen beserta relasi bimbingan unik (Hanya untuk Admin)
+    public function index(Request $request)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin mengakses daftar lengkap dosen.'
+            ], 403);
+        }
+
         $dosen = Dosen::with(['user', 'dosenPembimbing.skripsi.mahasiswa'])
             ->orderBy('id_dosen', 'desc')
             ->get()
@@ -51,9 +58,16 @@ class DosenController extends Controller
         return response()->json($dosen);
     }
 
-    // Simpan data dosen baru
+    // Simpan data dosen baru (Hanya untuk Admin)
     public function store(Request $request)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin menambahkan data dosen.'
+            ], 403);
+        }
+
         $validatedData = $request->validate([
             'NIDN'          => 'required|string|max:10|unique:dosen,NIDN',
             'user_id'       => 'required|exists:users,id',
@@ -84,21 +98,41 @@ class DosenController extends Controller
         ], 201);
     }
 
-    // Tampilkan detail satu dosen
-    public function show($id)
+    // Tampilkan detail satu dosen (Admin atau Dosen bersangkutan)
+    public function show(Request $request, $id)
     {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
         $dosen = Dosen::with(['user', 'dosenPembimbing.skripsi.mahasiswa'])->find($id);
 
         if (!$dosen) {
             return response()->json(['message' => 'Data dosen tidak ditemukan'], 404);
         }
 
+        if ($user->role !== 'admin') {
+            if ($user->role !== 'dosen' || $dosen->user_id !== $user->id) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk melihat profil dosen ini.'
+                ], 403);
+            }
+        }
+
         return response()->json($this->formatDosen($dosen));
     }
 
-    // Update data dosen
+    // Update data dosen (Hanya untuk Admin)
     public function update(Request $request, $id)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin mengubah data dosen.'
+            ], 403);
+        }
+
         $dosen = Dosen::find($id);
 
         if (!$dosen) {
@@ -112,6 +146,9 @@ class DosenController extends Controller
             'no_handphone'  => 'nullable|string|max:20',
             'jenis_kelamin' => 'nullable|string|in:Laki-laki,Perempuan',
         ]);
+
+        // Pencegahan IDOR / manipulasi relasi user
+        unset($validatedData['user_id']);
 
         DB::transaction(function () use ($dosen, $validatedData) {
             $dosen->update($validatedData);
@@ -139,9 +176,16 @@ class DosenController extends Controller
         ]);
     }
 
-    // Hapus data dosen
-    public function destroy($id)
+    // Hapus data dosen (Hanya untuk Admin)
+    public function destroy(Request $request, $id)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin menghapus data dosen.'
+            ], 403);
+        }
+
         $dosen = Dosen::find($id);
 
         if (!$dosen) {

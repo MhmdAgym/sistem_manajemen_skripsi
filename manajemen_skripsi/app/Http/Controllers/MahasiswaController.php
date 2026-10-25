@@ -7,6 +7,7 @@ use App\Models\Skripsi;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
+use App\Constants\AcademicConstant;
 
 class MahasiswaController extends Controller
 {
@@ -77,9 +78,16 @@ class MahasiswaController extends Controller
         ]);
     }
 
-    // Tampilkan semua data mahasiswa beserta relasinya (untuk Admin)
-    public function index()
+    // Tampilkan semua data mahasiswa beserta relasinya (Hanya untuk Admin)
+    public function index(Request $request)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin mengakses daftar lengkap mahasiswa.'
+            ], 403);
+        }
+
         $mahasiswa = Mahasiswa::with(['user', 'skripsi.dosenPA.dosen', 'skripsi.dosenPembimbing.dosen'])
             ->orderBy('id_mahasiswa', 'desc')
             ->get()
@@ -88,9 +96,16 @@ class MahasiswaController extends Controller
         return response()->json($mahasiswa);
     }
 
-    // Simpan data mahasiswa baru
+    // Simpan data mahasiswa baru (Hanya untuk Admin)
     public function store(Request $request)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin menambahkan data mahasiswa.'
+            ], 403);
+        }
+
         $validatedData = $request->validate([
             'NIM'            => 'required|string|max:10|unique:mahasiswa,NIM',
             'user_id'        => 'required|exists:users,id',
@@ -101,6 +116,18 @@ class MahasiswaController extends Controller
             'jenis_kelamin'  => 'nullable|string|in:Laki-laki,Perempuan',
             'dosen_pa_id'    => 'nullable|exists:dosen,id_dosen',
         ]);
+
+        // Validasi kesesuaian pasangan Fakultas dan Program Studi
+        $normalizedFakultas = AcademicConstant::normalizeFakultas($validatedData['fakultas'] ?? null);
+        if (!AcademicConstant::isValidPair($normalizedFakultas, $validatedData['prodi'] ?? null)) {
+            return response()->json([
+                'message' => 'Program studi tidak sesuai dengan fakultas yang dipilih.',
+                'errors'  => [
+                    'prodi' => ['Program studi tidak sesuai dengan fakultas yang dipilih.'],
+                ],
+            ], 422);
+        }
+        $validatedData['fakultas'] = $normalizedFakultas;
 
         $mahasiswa = DB::transaction(function () use ($validatedData, $request) {
             $m = Mahasiswa::create($validatedData);
@@ -135,13 +162,44 @@ class MahasiswaController extends Controller
         ], 201);
     }
 
-    // Tampilkan detail satu mahasiswa
-    public function show($id)
+    // Tampilkan detail satu mahasiswa (Admin, Mahasiswa bersangkutan, atau Dosen PA/Pembimbing terkait)
+    public function show(Request $request, $id)
     {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
         $mahasiswa = Mahasiswa::with(['user', 'skripsi.dosenPA.dosen', 'skripsi.dosenPembimbing.dosen'])->find($id);
 
         if (!$mahasiswa) {
             return response()->json(['message' => 'Data mahasiswa tidak ditemukan'], 404);
+        }
+
+        // Otorisasi:
+        // 1. Admin boleh melihat semua data
+        // 2. Mahasiswa hanya boleh melihat datanya sendiri
+        // 3. Dosen boleh melihat jika ia adalah Dosen PA atau Dosen Pembimbing mahasiswa tersebut
+        if ($user->role !== 'admin') {
+            $isOwner = ($user->role === 'mahasiswa' && $mahasiswa->user_id === $user->id);
+            $isAssignedDosen = false;
+
+            if ($user->role === 'dosen') {
+                $dosen = \App\Models\Dosen::where('user_id', $user->id)->first();
+                if ($dosen) {
+                    $isAssignedDosen = $mahasiswa->skripsi && $mahasiswa->skripsi->contains(function ($s) use ($dosen) {
+                        $isPA = $s->dosenPA && $s->dosenPA->id_dosen == $dosen->id_dosen;
+                        $isPembimbing = $s->dosenPembimbing && $s->dosenPembimbing->contains('id_dosen', $dosen->id_dosen);
+                        return $isPA || $isPembimbing;
+                    });
+                }
+            }
+
+            if (!$isOwner && !$isAssignedDosen) {
+                return response()->json([
+                    'message' => 'Anda tidak memiliki hak akses untuk melihat profil mahasiswa ini.'
+                ], 403);
+            }
         }
 
         return response()->json($this->formatMahasiswa($mahasiswa));
@@ -150,6 +208,13 @@ class MahasiswaController extends Controller
     // Update data mahasiswa & Dosen PA oleh Admin
     public function update(Request $request, $id)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin mengubah data mahasiswa.'
+            ], 403);
+        }
+
         $mahasiswa = Mahasiswa::with('skripsi.dosenPA')->find($id);
 
         if (!$mahasiswa) {
@@ -166,6 +231,30 @@ class MahasiswaController extends Controller
             'jenis_kelamin'  => 'nullable|string|in:Laki-laki,Perempuan',
             'dosen_pa_id'    => 'nullable|exists:dosen,id_dosen',
         ]);
+
+        // Pencegahan IDOR / Mass Assignment relasi user: user_id profil tidak boleh diubah sembarangan
+        unset($validatedData['user_id']);
+
+        // Validasi keabsahan pasangan Fakultas dan Program Studi jika diubah
+        if ($request->has('fakultas') || $request->has('prodi')) {
+            $targetFakultas = $request->has('fakultas') ? $request->input('fakultas') : $mahasiswa->fakultas;
+            $targetProdi    = $request->has('prodi') ? $request->input('prodi') : $mahasiswa->prodi;
+
+            $normalizedFakultas = AcademicConstant::normalizeFakultas($targetFakultas);
+
+            if (!AcademicConstant::isValidPair($normalizedFakultas, $targetProdi)) {
+                return response()->json([
+                    'message' => 'Program studi tidak sesuai dengan fakultas yang dipilih.',
+                    'errors'  => [
+                        'prodi' => ['Program studi tidak sesuai dengan fakultas yang dipilih.'],
+                    ],
+                ], 422);
+            }
+
+            if ($request->has('fakultas')) {
+                $validatedData['fakultas'] = $normalizedFakultas;
+            }
+        }
 
         DB::transaction(function () use ($mahasiswa, $validatedData, $request) {
             $mahasiswa->update($validatedData);
@@ -213,9 +302,16 @@ class MahasiswaController extends Controller
         ]);
     }
 
-    // Hapus data mahasiswa
-    public function destroy($id)
+    // Hapus data mahasiswa (Hanya untuk Admin)
+    public function destroy(Request $request, $id)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json([
+                'message' => 'Hanya admin yang memiliki izin menghapus data mahasiswa.'
+            ], 403);
+        }
+
         $mahasiswa = Mahasiswa::find($id);
 
         if (!$mahasiswa) {

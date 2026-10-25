@@ -7,8 +7,19 @@ use Illuminate\Http\Request;
 
 class DosenPAController extends Controller
 {
-    public function index()
+    private function checkAdmin(Request $request)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json(['message' => 'Hanya admin yang memiliki izin mengakses endpoint ini.'], 403);
+        }
+        return null;
+    }
+
+    public function index(Request $request)
+    {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         // Menampilkan data Dosen PA beserta detail dosen dan skripsinya
         $dosen_pa = DosenPA::with(['dosen', 'skripsi'])->get();
         return response()->json($dosen_pa);
@@ -16,6 +27,8 @@ class DosenPAController extends Controller
 
     public function store(Request $request)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $validatedData = $request->validate([
             'id_dosen'   => 'required|exists:dosen,id_dosen',
             'id_skripsi' => 'required|exists:skripsi,id_skripsi',
@@ -35,8 +48,10 @@ class DosenPAController extends Controller
         ], 201);
     }
 
-    public function show($id)
+    public function show(Request $request, $id)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $dosen_pa = DosenPA::with(['dosen', 'skripsi'])->find($id);
 
         if (!$dosen_pa) {
@@ -48,6 +63,8 @@ class DosenPAController extends Controller
 
     public function update(Request $request, $id)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $dosen_pa = DosenPA::find($id);
 
         if (!$dosen_pa) {
@@ -67,8 +84,10 @@ class DosenPAController extends Controller
         ]);
     }
 
-    public function destroy($id)
+    public function destroy(Request $request, $id)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $dosen_pa = DosenPA::find($id);
 
         if (!$dosen_pa) {

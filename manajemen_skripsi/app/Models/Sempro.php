@@ -24,4 +24,22 @@ class Sempro extends Model
     {
         return $this->belongsTo(Skripsi::class, 'id_skripsi', 'id_skripsi');
     }
+
+    // Relasi ke model PengujiSempro
+    public function pengujiSempro()
+    {
+        return $this->hasMany(PengujiSempro::class, 'id_sempro', 'id_sempro');
+    }
+
+    // Relasi ke model NilaiSempro
+    public function nilaiSempro()
+    {
+        return $this->hasMany(NilaiSempro::class, 'id_sempro', 'id_sempro');
+    }
+
+    // Relasi ke model UjianSkripsi
+    public function ujianSkripsi()
+    {
+        return $this->hasOne(UjianSkripsi::class, 'id_sempro', 'id_sempro');
+    }
 }

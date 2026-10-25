@@ -7,14 +7,27 @@ use Illuminate\Http\Request;
 
 class AdminController extends Controller
 {
-    public function index()
+    private function checkAdmin(Request $request)
     {
+        $user = $request->user();
+        if (!$user || $user->role !== 'admin') {
+            return response()->json(['message' => 'Hanya admin yang memiliki izin mengakses endpoint ini.'], 403);
+        }
+        return null;
+    }
+
+    public function index(Request $request)
+    {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $admin = Admin::with('user')->get();
         return response()->json($admin);
     }
 
     public function store(Request $request)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $validatedData = $request->validate([
             'nama_admin' => 'required|string|max:255',
             'users_id'   => 'required|exists:users,id',
@@ -28,8 +41,10 @@ class AdminController extends Controller
         ], 201);
     }
 
-    public function show($id)
+    public function show(Request $request, $id)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $admin = Admin::with('user')->find($id);
 
         if (!$admin) {
@@ -41,6 +56,8 @@ class AdminController extends Controller
 
     public function update(Request $request, $id)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $admin = Admin::find($id);
 
         if (!$admin) {
@@ -60,8 +77,10 @@ class AdminController extends Controller
         ]);
     }
 
-    public function destroy($id)
+    public function destroy(Request $request, $id)
     {
+        if ($deny = $this->checkAdmin($request)) return $deny;
+
         $admin = Admin::find($id);
 
         if (!$admin) {

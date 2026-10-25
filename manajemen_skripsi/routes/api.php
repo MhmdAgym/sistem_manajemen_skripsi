@@ -67,7 +67,7 @@ Route::middleware(['auth:sanctum', 'admin'])->group(function () {
     Route::apiResource('users', UserController::class)->only(['index', 'show', 'update']);
 });
 
-// [ADMIN] Manajemen Penugasan Kaprodi
+// [ADMIN] Manajemen Penugasan Kaprodi, Admin, & Dosen PA
 Route::middleware(['auth:sanctum', 'admin'])->group(function () {
     Route::get('/admin/penugasan-kaprodi/dosen-options', [PenugasanKaprodiController::class, 'dosenOptions']);
     Route::get('/admin/penugasan-kaprodi', [PenugasanKaprodiController::class, 'index']);
@@ -75,21 +75,25 @@ Route::middleware(['auth:sanctum', 'admin'])->group(function () {
     Route::get('/admin/penugasan-kaprodi/{id}', [PenugasanKaprodiController::class, 'show']);
     Route::patch('/admin/penugasan-kaprodi/{id}', [PenugasanKaprodiController::class, 'update']);
     Route::patch('/admin/penugasan-kaprodi/{id}/nonaktifkan', [PenugasanKaprodiController::class, 'nonaktifkan']);
+
+    // Admin & Penetapan Dosen PA
+    Route::apiResource('admin', AdminController::class);
+    Route::apiResource('dosen-pa', DosenPAController::class);
 });
 
-// ---------------------------------------------------------------------------
-// RUTE CRUD API SISTEM — apiResource wildcard didaftarkan SETELAH route spesifik
-// ---------------------------------------------------------------------------
-Route::apiResource('admin', AdminController::class);
-Route::apiResource('mahasiswa', MahasiswaController::class);
-Route::apiResource('dosen', DosenController::class);
-Route::apiResource('skripsi', SkripsiController::class);
-Route::apiResource('dosen-pa', DosenPAController::class);
-Route::apiResource('dosen-pembimbing', DosenPembimbingController::class);
-Route::apiResource('bimbingan', BimbinganController::class);
-Route::apiResource('sempro', SemproController::class);
-Route::apiResource('penguji-sempro', PengujiSemproController::class);
-Route::apiResource('nilai-sempro', NilaiSemproController::class);
-Route::apiResource('ujian-skripsi', UjianSkripsiController::class);
-Route::apiResource('dosen-penguji-skripsi', DosenPengujiSkripsiController::class);
-Route::apiResource('nilai-skripsi', NilaiSkripsiController::class);
+// [DOSEN PEMBIMBING, BIMBINGAN, UJIAN & PENILAIAN] — Rute Terlindungi dengan Autentikasi Sanctum & Otorisasi Peran
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::apiResource('dosen-pembimbing', DosenPembimbingController::class);
+    Route::apiResource('bimbingan', BimbinganController::class);
+    Route::apiResource('sempro', SemproController::class);
+    Route::apiResource('penguji-sempro', PengujiSemproController::class);
+    Route::apiResource('nilai-sempro', NilaiSemproController::class);
+    Route::apiResource('ujian-skripsi', UjianSkripsiController::class);
+    Route::apiResource('dosen-penguji-skripsi', DosenPengujiSkripsiController::class);
+    Route::apiResource('nilai-skripsi', NilaiSkripsiController::class);
+
+    // Master Data Mahasiswa, Dosen, dan Skripsi (Otorisasi granular diatur pada level Controller)
+    Route::apiResource('mahasiswa', MahasiswaController::class);
+    Route::apiResource('dosen', DosenController::class);
+    Route::apiResource('skripsi', SkripsiController::class);
+});

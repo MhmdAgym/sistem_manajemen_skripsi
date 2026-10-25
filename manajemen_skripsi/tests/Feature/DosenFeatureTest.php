@@ -17,7 +17,8 @@ class DosenFeatureTest extends TestCase
 
     public function test_can_list_dosen_with_bimbingan_count(): void
     {
-        $response = $this->getJson('/api/dosen');
+        $admin = User::factory()->create(['role' => 'admin']);
+        $response = $this->actingAs($admin, 'sanctum')->getJson('/api/dosen');
 
         $response->assertStatus(200);
         $response->assertJsonStructure([
@@ -36,14 +37,15 @@ class DosenFeatureTest extends TestCase
 
     public function test_dosen_without_bimbingan_returns_zero_count(): void
     {
-        $user = User::factory()->create(['role' => 'dosen', 'nomor_induk' => '1212121212']);
+        $nidn = (string) rand(1000000000, 9999999999);
+        $user = User::factory()->create(['role' => 'dosen', 'nomor_induk' => $nidn]);
         $dosen = Dosen::create([
             'user_id' => $user->id,
-            'NIDN' => '1212121212',
+            'NIDN' => $nidn,
             'nama_dosen' => 'Dosen Baru Belum Ada Bimbingan',
         ]);
 
-        $response = $this->getJson("/api/dosen/{$dosen->id_dosen}");
+        $response = $this->actingAs($user, 'sanctum')->getJson("/api/dosen/{$dosen->id_dosen}");
 
         $response->assertStatus(200);
         $response->assertJson([
@@ -55,18 +57,22 @@ class DosenFeatureTest extends TestCase
 
     public function test_dosen_bimbingan_counts_unique_students_and_ignores_pa(): void
     {
-        $userDosen = User::factory()->create(['role' => 'dosen', 'nomor_induk' => '3434343434']);
+        $nidn = (string) rand(1000000000, 9999999999);
+        $nim1 = (string) rand(1000000000, 9999999999);
+        $nim2 = (string) rand(1000000000, 9999999999);
+
+        $userDosen = User::factory()->create(['role' => 'dosen', 'nomor_induk' => $nidn]);
         $dosen = Dosen::create([
             'user_id' => $userDosen->id,
-            'NIDN' => '3434343434',
+            'NIDN' => $nidn,
             'nama_dosen' => 'Dr. Bimbingan Murni',
         ]);
 
         // Mahasiswa 1
-        $userMhs1 = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => '5555555551']);
+        $userMhs1 = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $nim1]);
         $mhs1 = Mahasiswa::create([
             'user_id' => $userMhs1->id,
-            'NIM' => '5555555551',
+            'NIM' => $nim1,
             'nama_mahasiswa' => 'Mahasiswa Bimbingan 1',
             'prodi' => 'Informatika',
             'fakultas' => 'Fakultas Sains dan Teknologi',
@@ -94,10 +100,10 @@ class DosenFeatureTest extends TestCase
         ]);
 
         // Mahasiswa 2 (hanya Dosen PA, BUKAN dosen pembimbing)
-        $userMhs2 = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => '5555555552']);
+        $userMhs2 = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $nim2]);
         $mhs2 = Mahasiswa::create([
             'user_id' => $userMhs2->id,
-            'NIM' => '5555555552',
+            'NIM' => $nim2,
             'nama_mahasiswa' => 'Mahasiswa Hanya PA',
             'prodi' => 'Sistem Informasi',
         ]);
@@ -112,7 +118,7 @@ class DosenFeatureTest extends TestCase
             'id_skripsi' => $skripsi2->id_skripsi,
         ]);
 
-        $response = $this->getJson("/api/dosen/{$dosen->id_dosen}");
+        $response = $this->actingAs($userDosen, 'sanctum')->getJson("/api/dosen/{$dosen->id_dosen}");
 
         $response->assertStatus(200);
         // Pastikan jumlah mahasiswa bimbingan adalah 1 (unik), dan Mahasiswa 2 (PA) TIDAK dihitung
@@ -129,21 +135,25 @@ class DosenFeatureTest extends TestCase
 
     public function test_can_update_dosen_and_sync_with_user(): void
     {
+        $admin = User::factory()->create(['role' => 'admin']);
+        $nidn1 = (string) rand(1000000000, 9999999999);
+        $nidn2 = (string) rand(1000000000, 9999999999);
+
         $user = User::factory()->create([
             'name' => 'Original Dosen',
             'role' => 'dosen',
-            'nomor_induk' => '4444444441',
+            'nomor_induk' => $nidn1,
         ]);
 
         $dosen = Dosen::create([
             'user_id' => $user->id,
-            'NIDN' => '4444444441',
+            'NIDN' => $nidn1,
             'nama_dosen' => 'Original Dosen',
         ]);
 
-        $response = $this->putJson("/api/dosen/{$dosen->id_dosen}", [
+        $response = $this->actingAs($admin, 'sanctum')->putJson("/api/dosen/{$dosen->id_dosen}", [
             'nama_dosen' => 'Dr. Dosen Terupdate, M.Kom.',
-            'NIDN' => '4444444442',
+            'NIDN' => $nidn2,
             'no_handphone' => '081234567899',
             'jenis_kelamin' => 'Laki-laki',
         ]);
@@ -152,7 +162,7 @@ class DosenFeatureTest extends TestCase
         $this->assertDatabaseHas('dosen', [
             'id_dosen' => $dosen->id_dosen,
             'nama_dosen' => 'Dr. Dosen Terupdate, M.Kom.',
-            'NIDN' => '4444444442',
+            'NIDN' => $nidn2,
             'no_handphone' => '081234567899',
             'jenis_kelamin' => 'Laki-laki',
         ]);
@@ -161,7 +171,7 @@ class DosenFeatureTest extends TestCase
         $this->assertDatabaseHas('users', [
             'id' => $user->id,
             'name' => 'Dr. Dosen Terupdate, M.Kom.',
-            'nomor_induk' => '4444444442',
+            'nomor_induk' => $nidn2,
         ]);
     }
 }
