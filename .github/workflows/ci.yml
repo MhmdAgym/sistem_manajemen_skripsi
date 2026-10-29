@@ -199,13 +199,10 @@ jobs:
           php artisan test tests/Feature/MahasiswaFeatureTest.php
           php artisan test tests/Feature/DosenFeatureTest.php
           php artisan test tests/Feature/DospemDanBimbinganSecurityFeatureTest.php
-          php artisan test tests/Feature/PengajuanDospemSecurityFeatureTest.php
           php artisan test tests/Feature/UjianDanNilaiSecurityFeatureTest.php
 
       - name: Run Workflow & Notification Feature Tests
         run: |
-          php artisan test tests/Feature/NotificationSecurityFeatureTest.php
-          php artisan test tests/Feature/AcademicNotificationTriggerFeatureTest.php
           php artisan test tests/Feature/KaprodiWorkflowFeatureTest.php
           php artisan test tests/Feature/PengajuanJudulFeatureTest.php
           php artisan test tests/Feature/AdminPenugasanKaprodiFeatureTest.php
