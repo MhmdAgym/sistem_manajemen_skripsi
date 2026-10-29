@@ -179,6 +179,10 @@ jobs:
       - name: Seed Test Environment Baseline
         run: php artisan db:seed --class=TestEnvironmentSeeder --force
 
+      - name: Switch to MySQL PHPUnit Configuration
+        working-directory: manajemen_skripsi
+        run: cp phpunit.mysql.xml phpunit.xml
+
       - name: Run Unit Tests
         run: php artisan test tests/Unit/
 

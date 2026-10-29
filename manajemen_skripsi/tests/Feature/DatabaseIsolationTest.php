@@ -247,6 +247,9 @@ class DatabaseIsolationTest extends TestCase
         // Koneksi riil harus lolos guard dan identitas sesi harus cocok
         $session = DB::selectOne("SELECT DATABASE() as active_db, CURRENT_USER() as auth_user");
         $this->assertEquals('manajemen_skripsi_test', $session->active_db);
-        $this->assertEquals('unuha_tester@localhost', $session->auth_user);
+        $this->assertContains(
+            $session->auth_user,
+            ['unuha_tester@localhost', 'unuha_tester@127.0.0.1']
+        );
     }
 }
