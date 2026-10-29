@@ -1,0 +1,198 @@
+name: CI — Sistem Manajemen Skripsi UNUHA
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend CI (Next.js)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend_manajemen_skripsi
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend_manajemen_skripsi/package-lock.json
+
+      - name: Install dependencies (Reproducible)
+        run: npm ci
+
+      - name: Type check (TypeScript)
+        run: npx tsc --noEmit
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Build Next.js
+        env:
+          NEXT_PUBLIC_BACKEND_URL: http://localhost:8000
+        run: npm run build
+
+  backend:
+    name: Backend CI (Laravel 12 / PHP 8.2)
+    runs-on: ubuntu-latest
+    env:
+      DB_PASSWORD: ci_test_dummy_password_2026
+      MYSQL_ROOT_PASSWORD: ci_mysql_root_password_temp
+    defaults:
+      run:
+        working-directory: manajemen_skripsi
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup and Start MySQL Server (Native)
+        run: |
+          # Register masks so secrets are redacted from all GitHub Actions logs
+          echo "::add-mask::$DB_PASSWORD"
+          echo "::add-mask::$MYSQL_ROOT_PASSWORD"
+
+          # Verify MySQL server installation without assuming pre-installed presence
+          if ! command -v mysqld &> /dev/null; then
+            echo "MySQL server not found. Installing mysql-server package..."
+            sudo apt-get update -q
+            sudo apt-get install -y -q mysql-server
+          fi
+
+          # Start MySQL service
+          echo "Starting MySQL service..."
+          sudo systemctl start mysql.service
+
+          # Wait for MySQL service to accept connections with 30s timeout
+          echo "Waiting for MySQL service to become ready (max 30s)..."
+          TIMEOUT=30
+          ELAPSED=0
+          until sudo mysqladmin ping --silent; do
+            if [ $ELAPSED -ge $TIMEOUT ]; then
+              echo "::error::MySQL service failed to become ready within ${TIMEOUT} seconds."
+              exit 1
+            fi
+            sleep 1
+            ELAPSED=$((ELAPSED + 1))
+          done
+          echo "MySQL service is healthy and ready after ${ELAPSED}s."
+
+          # Configure root password and test user on loopback interfaces
+          sudo mysql -e "
+            ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+            CREATE DATABASE IF NOT EXISTS \`manajemen_skripsi_test\`;
+            CREATE USER IF NOT EXISTS 'unuha_tester'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
+            CREATE USER IF NOT EXISTS 'unuha_tester'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';
+            ALTER USER 'unuha_tester'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
+            ALTER USER 'unuha_tester'@'127.0.0.1' IDENTIFIED BY '${DB_PASSWORD}';
+            GRANT ALL PRIVILEGES ON \`manajemen_skripsi_test\`.* TO 'unuha_tester'@'localhost';
+            GRANT ALL PRIVILEGES ON \`manajemen_skripsi_test\`.* TO 'unuha_tester'@'127.0.0.1';
+            FLUSH PRIVILEGES;
+          "
+
+      - name: Verify MySQL Session Identity (Fail-Fast Guard Check)
+        run: |
+          SESSION_PROBE=$(mysql -h 127.0.0.1 -P 3306 -u unuha_tester -p"$DB_PASSWORD" -D manajemen_skripsi_test -N -s -e "SELECT DATABASE(), CURRENT_USER();")
+          ACTIVE_DB=$(echo "$SESSION_PROBE" | awk '{print $1}')
+          AUTH_USER=$(echo "$SESSION_PROBE" | awk '{print $2}')
+
+          echo "Verifying MySQL session identity against Laravel guard requirements:"
+          echo "- Active Database: $ACTIVE_DB"
+          echo "- Authenticated User: $AUTH_USER"
+
+          if [ "$ACTIVE_DB" != "manajemen_skripsi_test" ]; then
+            echo "::error::Guard violation: Active database [$ACTIVE_DB] does not match 'manajemen_skripsi_test'."
+            exit 1
+          fi
+
+          if [ "$AUTH_USER" != "unuha_tester@127.0.0.1" ] && [ "$AUTH_USER" != "unuha_tester@localhost" ]; then
+            echo "::error::Guard violation: Authenticated user [$AUTH_USER] is rejected by AppServiceProvider guard (expected 'unuha_tester@127.0.0.1' or 'unuha_tester@localhost')."
+            exit 1
+          fi
+
+          echo "Session identity guard verification PASSED."
+
+      - name: Setup PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo_mysql, mbstring, bcmath, curl, xml, zip, openssl, pcntl
+          coverage: none
+
+      - name: Setup CI Environment File
+        run: |
+          printf "%s\n" \
+            'APP_NAME="Sistem Manajemen Skripsi UNUHA"' \
+            'APP_ENV=testing' \
+            'APP_KEY=' \
+            'APP_DEBUG=true' \
+            'APP_URL=http://localhost:8000' \
+            'LOG_CHANNEL=stack' \
+            'LOG_LEVEL=debug' \
+            'DB_CONNECTION=mysql' \
+            'DB_HOST=127.0.0.1' \
+            'DB_PORT=3306' \
+            'DB_DATABASE=manajemen_skripsi_test' \
+            'DB_USERNAME=unuha_tester' \
+            "DB_PASSWORD=${DB_PASSWORD}" \
+            'SESSION_DRIVER=array' \
+            'QUEUE_CONNECTION=sync' \
+            'CACHE_STORE=array' \
+            'BROADCAST_CONNECTION=null' \
+            'MAIL_MAILER=array' > .env
+
+      - name: Install Composer Dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: Generate Application Key
+        run: php artisan key:generate --env=testing
+
+      - name: Run Database Migrations
+        run: php artisan migrate --force
+
+      - name: Seed Test Environment Baseline
+        run: php artisan db:seed --class=TestEnvironmentSeeder --force
+
+      - name: Run Unit Tests
+        run: php artisan test tests/Unit/
+
+      - name: Run Core & Auth Feature Tests
+        run: |
+          php artisan test tests/Feature/ExampleTest.php
+          php artisan test tests/Feature/DatabaseIsolationTest.php
+          php artisan test tests/Feature/Auth/
+          php artisan test tests/Feature/UserManagementFeatureTest.php
+
+      - name: Run Security & Master Feature Tests
+        run: |
+          php artisan test tests/Feature/MasterDanSkripsiSecurityFeatureTest.php
+          php artisan test tests/Feature/MahasiswaFeatureTest.php
+          php artisan test tests/Feature/DosenFeatureTest.php
+          php artisan test tests/Feature/DospemDanBimbinganSecurityFeatureTest.php
+          php artisan test tests/Feature/PengajuanDospemSecurityFeatureTest.php
+          php artisan test tests/Feature/UjianDanNilaiSecurityFeatureTest.php
+
+      - name: Run Workflow & Notification Feature Tests
+        run: |
+          php artisan test tests/Feature/NotificationSecurityFeatureTest.php
+          php artisan test tests/Feature/AcademicNotificationTriggerFeatureTest.php
+          php artisan test tests/Feature/KaprodiWorkflowFeatureTest.php
+          php artisan test tests/Feature/PengajuanJudulFeatureTest.php
+          php artisan test tests/Feature/AdminPenugasanKaprodiFeatureTest.php
