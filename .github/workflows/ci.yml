@@ -95,7 +95,16 @@ jobs:
           echo "MySQL service is healthy and ready after ${ELAPSED}s."
 
           # Configure root password and test user on loopback interfaces
-          sudo mysql -e "
+          # Deteksi autentikasi awal root pada runner (default runner image: 'root', fallback: blank)
+          INIT_ROOT_PASS=""
+          if MYSQL_PWD=root mysql -u root -e "SELECT 1;" &> /dev/null; then
+            INIT_ROOT_PASS="root"
+          elif ! mysql -u root -e "SELECT 1;" &> /dev/null; then
+            echo "::error::Gagal mengautentikasi ke MySQL server runner sebagai root menggunakan kredensial standar."
+            exit 1
+          fi
+
+          MYSQL_PWD="$INIT_ROOT_PASS" mysql -u root -e "
             ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
             CREATE DATABASE IF NOT EXISTS \`manajemen_skripsi_test\`;
             CREATE USER IF NOT EXISTS 'unuha_tester'@'localhost' IDENTIFIED BY '${DB_PASSWORD}';
