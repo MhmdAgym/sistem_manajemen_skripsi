@@ -6,6 +6,7 @@ use App\Models\PengajuanJudul;
 use App\Models\PengajuanJudulLog;
 use App\Models\Mahasiswa;
 use App\Models\Skripsi;
+use App\Services\AcademicNotificationDispatcher;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -171,7 +172,7 @@ class PengajuanJudulController extends Controller
                     'catatan_dosen' => null,
                 ]);
 
-                PengajuanJudulLog::create([
+                $log = PengajuanJudulLog::create([
                     'pengajuan_judul_id' => $pengajuan->id,
                     'user_id'            => $user->id,
                     'aktor_nama'         => $user->name,
@@ -185,6 +186,8 @@ class PengajuanJudulController extends Controller
                     'snapshot_judul'     => $pengajuan->judul,
                     'snapshot_file_path' => $filePath,
                 ]);
+
+                app(AcademicNotificationDispatcher::class)->dispatchEvt01PengajuanJudulBaru($pengajuan, $log);
             });
         } catch (\Throwable $e) {
             // Bersihkan berkas baru yang sempat terunggah jika transaksi gagal
@@ -356,7 +359,7 @@ class PengajuanJudulController extends Controller
 
                 $locked->update($updateData);
 
-                PengajuanJudulLog::create([
+                $log = PengajuanJudulLog::create([
                     'pengajuan_judul_id' => $locked->id,
                     'user_id'            => $user->id,
                     'aktor_nama'         => $user->name,
@@ -370,6 +373,8 @@ class PengajuanJudulController extends Controller
                     'snapshot_judul'     => $locked->judul,
                     'snapshot_file_path' => $locked->file_path,
                 ]);
+
+                app(AcademicNotificationDispatcher::class)->dispatchEvt02PengajuanJudulRevisi($locked, $log);
 
                 $updatedPengajuan = $locked;
             });
@@ -521,7 +526,7 @@ class PengajuanJudulController extends Controller
 
                 $dosenProfile = $dosenUser->dosen;
 
-                PengajuanJudulLog::create([
+                $log = PengajuanJudulLog::create([
                     'pengajuan_judul_id' => $locked->id,
                     'user_id'            => $dosenUser->id,
                     'aktor_nama'         => $dosenUser->name,
@@ -539,6 +544,13 @@ class PengajuanJudulController extends Controller
                     'snapshot_judul'     => $locked->judul,
                     'snapshot_file_path' => $locked->file_path,
                 ]);
+
+                $dispatcher = app(AcademicNotificationDispatcher::class);
+                match ($targetStatus) {
+                    'Menunggu Persetujuan Kaprodi' => $dispatcher->dispatchEvt03DosenPaSetujui($locked, $log),
+                    'Revisi Dosen PA'              => $dispatcher->dispatchEvt04DosenPaRevisi($locked, $log),
+                    'Ditolak Dosen PA'             => $dispatcher->dispatchEvt05DosenPaTolak($locked, $log),
+                };
 
                 $updatedPengajuan = $locked;
             });

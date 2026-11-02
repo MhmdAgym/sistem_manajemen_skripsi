@@ -52,4 +52,10 @@ class Dosen extends Model
     {
         return $this->hasMany(PenugasanKaprodi::class, 'dosen_id', 'id_dosen');
     }
+
+    // Relasi ke penetapan pengajuan dospem (FK: dosen_id → dosen.id_dosen)
+    public function pengajuanDospem()
+    {
+        return $this->hasMany(PengajuanDospem::class, 'dosen_id', 'id_dosen');
+    }
 }

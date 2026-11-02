@@ -51,4 +51,16 @@ class Skripsi extends Model
     {
         return $this->hasOne(PengajuanJudul::class, 'skripsi_id', 'id_skripsi')->latestOfMany();
     }
+
+    // Relasi ke seluruh riwayat pengajuan dosen pembimbing
+    public function pengajuanDospem()
+    {
+        return $this->hasMany(PengajuanDospem::class, 'skripsi_id', 'id_skripsi');
+    }
+
+    // Relasi ke pengajuan dosen pembimbing terbaru
+    public function latestPengajuanDospem()
+    {
+        return $this->hasOne(PengajuanDospem::class, 'skripsi_id', 'id_skripsi')->latestOfMany();
+    }
 }

@@ -7,6 +7,7 @@ use App\Models\PengajuanJudul;
 use App\Models\PengajuanJudulLog;
 use App\Models\PenugasanKaprodi;
 use App\Models\Skripsi;
+use App\Services\AcademicNotificationDispatcher;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -243,7 +244,7 @@ class KaprodiPengajuanJudulController extends Controller
                 // 5. Catat log audit append-only
                 $dosenProfile = $user->dosen;
 
-                PengajuanJudulLog::create([
+                $log = PengajuanJudulLog::create([
                     'pengajuan_judul_id' => $locked->id,
                     'user_id'            => $user->id,
                     'aktor_nama'         => $user->name,
@@ -261,6 +262,13 @@ class KaprodiPengajuanJudulController extends Controller
                     'snapshot_judul'     => $locked->judul,
                     'snapshot_file_path' => $locked->file_path,
                 ]);
+
+                $dispatcher = app(AcademicNotificationDispatcher::class);
+                match ($validated['status']) {
+                    'Disetujui Kaprodi' => $dispatcher->dispatchEvt06KaprodiSetujui($locked, $log),
+                    'Revisi Kaprodi'    => $dispatcher->dispatchEvt07KaprodiRevisi($locked, $log),
+                    'Ditolak Kaprodi'   => $dispatcher->dispatchEvt08KaprodiTolak($locked, $log),
+                };
 
                 $updatedPengajuan = $locked;
             });

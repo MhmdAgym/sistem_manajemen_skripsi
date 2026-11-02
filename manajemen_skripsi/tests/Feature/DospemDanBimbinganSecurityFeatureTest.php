@@ -122,22 +122,22 @@ class DospemDanBimbinganSecurityFeatureTest extends TestCase
             'id_dosen'   => $dsn['dosen']->id_dosen,
         ]);
 
-        // Guest POST
+        // Guest POST -> Rute mutasi legacy ditutup di router (405)
         $resStore = $this->postJson('/api/dosen-pembimbing', [
             'id_skripsi' => $skripsi->id_skripsi,
             'id_dosen'   => $dsn['dosen']->id_dosen,
         ]);
-        $resStore->assertStatus(401);
+        $resStore->assertStatus(405);
 
-        // Guest PUT
+        // Guest PUT -> Rute mutasi legacy ditutup di router (405)
         $resUpdate = $this->putJson('/api/dosen-pembimbing/' . $dp->id_pembimbing, [
             'id_dosen' => $dsn['dosen']->id_dosen,
         ]);
-        $resUpdate->assertStatus(401);
+        $resUpdate->assertStatus(405);
 
-        // Guest DELETE
+        // Guest DELETE -> Rute mutasi legacy ditutup di router (405)
         $resDelete = $this->deleteJson('/api/dosen-pembimbing/' . $dp->id_pembimbing);
-        $resDelete->assertStatus(401);
+        $resDelete->assertStatus(405);
     }
 
     // -----------------------------------------------------------------------
@@ -181,33 +181,33 @@ class DospemDanBimbinganSecurityFeatureTest extends TestCase
             'id_dosen'   => $dsn['dosen']->id_dosen,
         ]);
 
-        // Mahasiswa mencoba menetapkan pembimbing
+        // Mahasiswa mencoba menetapkan pembimbing -> Rute mutasi legacy ditutup (405)
         $this->actingAs($mhs['user'], 'sanctum')
             ->postJson('/api/dosen-pembimbing', [
                 'id_skripsi' => $skripsi->id_skripsi,
                 'id_dosen'   => $dsn['dosen']->id_dosen,
             ])
-            ->assertStatus(403);
+            ->assertStatus(405);
 
-        // Mahasiswa mencoba menghapus penugasan pembimbing
+        // Mahasiswa mencoba menghapus penugasan pembimbing -> Rute mutasi legacy ditutup (405)
         $this->actingAs($mhs['user'], 'sanctum')
             ->deleteJson('/api/dosen-pembimbing/' . $dp->id_pembimbing)
-            ->assertStatus(403);
+            ->assertStatus(405);
 
-        // Dosen mencoba menetapkan pembimbing
+        // Dosen mencoba menetapkan pembimbing -> Rute mutasi legacy ditutup (405)
         $this->actingAs($dsn['user'], 'sanctum')
             ->postJson('/api/dosen-pembimbing', [
                 'id_skripsi' => $skripsi->id_skripsi,
                 'id_dosen'   => $dsn['dosen']->id_dosen,
             ])
-            ->assertStatus(403);
+            ->assertStatus(405);
 
-        // Dosen mencoba memperbarui penugasan pembimbing
+        // Dosen mencoba memperbarui penugasan pembimbing -> Rute mutasi legacy ditutup (405)
         $this->actingAs($dsn['user'], 'sanctum')
             ->putJson('/api/dosen-pembimbing/' . $dp->id_pembimbing, [
                 'id_dosen' => $dsn['dosen']->id_dosen,
             ])
-            ->assertStatus(403);
+            ->assertStatus(405);
     }
 
     // -----------------------------------------------------------------------
@@ -347,42 +347,49 @@ class DospemDanBimbinganSecurityFeatureTest extends TestCase
     // SKENARIO 8: ADMIN TETAP DAPAT MELAKUKAN OPERASI PENUGASAN YANG SAH
     // -----------------------------------------------------------------------
 
-    public function test_8_admin_tetap_dapat_melakukan_operasi_penugasan_yang_sah(): void
+    public function test_8_admin_tidak_dapat_melakukan_mutasi_via_endpoint_legacy_tetapi_baca_tetap_berjalan(): void
     {
         $admin = $this->buatAdmin();
         $mhs = $this->buatMahasiswa();
         $dsn1 = $this->buatDosen();
         $dsn2 = $this->buatDosen();
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
-
-        // Admin menetapkan pembimbing 1
-        $resStore = $this->actingAs($admin['user'], 'sanctum')->postJson('/api/dosen-pembimbing', [
+        $dp = DosenPembimbing::create([
             'id_skripsi' => $skripsi->id_skripsi,
             'id_dosen'   => $dsn1['dosen']->id_dosen,
         ]);
-        $resStore->assertStatus(201);
-        $resStore->assertJsonFragment(['message' => 'Dosen Pembimbing berhasil ditetapkan']);
-        $dpId = $resStore->json('data.id_pembimbing');
 
-        // Admin melihat list
+        // 1. Admin mencoba menetapkan pembimbing via legacy route -> Wajib ditolak 405
+        $resStore = $this->actingAs($admin['user'], 'sanctum')->postJson('/api/dosen-pembimbing', [
+            'id_skripsi' => $skripsi->id_skripsi,
+            'id_dosen'   => $dsn2['dosen']->id_dosen,
+        ]);
+        $resStore->assertStatus(405);
+
+        // 2. Admin melihat list penugasan pembimbing -> Sah 200
         $resIndex = $this->actingAs($admin['user'], 'sanctum')->getJson('/api/dosen-pembimbing');
         $resIndex->assertStatus(200);
 
-        // Admin melihat detail
-        $resShow = $this->actingAs($admin['user'], 'sanctum')->getJson('/api/dosen-pembimbing/' . $dpId);
+        // 3. Admin melihat detail penugasan pembimbing -> Sah 200
+        $resShow = $this->actingAs($admin['user'], 'sanctum')->getJson('/api/dosen-pembimbing/' . $dp->id_pembimbing);
         $resShow->assertStatus(200);
 
-        // Admin mengupdate dosen pembimbing menjadi dsn2
-        $resUpdate = $this->actingAs($admin['user'], 'sanctum')->putJson('/api/dosen-pembimbing/' . $dpId, [
+        // 4. Admin mencoba mengupdate dosen pembimbing via legacy route -> Wajib ditolak 405
+        $resUpdate = $this->actingAs($admin['user'], 'sanctum')->putJson('/api/dosen-pembimbing/' . $dp->id_pembimbing, [
             'id_dosen' => $dsn2['dosen']->id_dosen,
         ]);
-        $resUpdate->assertStatus(200);
-        $resUpdate->assertJsonFragment(['message' => 'Data Dosen Pembimbing berhasil diperbarui']);
+        $resUpdate->assertStatus(405);
 
-        // Admin menghapus penugasan
-        $resDelete = $this->actingAs($admin['user'], 'sanctum')->deleteJson('/api/dosen-pembimbing/' . $dpId);
-        $resDelete->assertStatus(200);
-        $this->assertDatabaseMissing('dosen_pembimbing', ['id_pembimbing' => $dpId]);
+        // 5. Admin mencoba menghapus penugasan via legacy route -> Wajib ditolak 405
+        $resDelete = $this->actingAs($admin['user'], 'sanctum')->deleteJson('/api/dosen-pembimbing/' . $dp->id_pembimbing);
+        $resDelete->assertStatus(405);
+
+        // 6. Pastikan data di database tetap utuh dan tidak berubah
+        $this->assertDatabaseHas('dosen_pembimbing', [
+            'id_pembimbing' => $dp->id_pembimbing,
+            'id_skripsi'    => $skripsi->id_skripsi,
+            'id_dosen'      => $dsn1['dosen']->id_dosen,
+        ]);
     }
 
     // -----------------------------------------------------------------------
@@ -436,28 +443,10 @@ class DospemDanBimbinganSecurityFeatureTest extends TestCase
         $dsn = $this->buatDosen();
         $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
 
-        // Payload kosong saat admin menetapkan pembimbing
+        // Upaya mutasi legacy ditolak 405 (tidak lagi memicu validasi 422 controller)
         $this->actingAs($admin['user'], 'sanctum')
             ->postJson('/api/dosen-pembimbing', [])
-            ->assertStatus(422)
-            ->assertJsonValidationErrors(['id_skripsi', 'id_dosen']);
-
-        // Penugasan pertama berhasil
-        $this->actingAs($admin['user'], 'sanctum')
-            ->postJson('/api/dosen-pembimbing', [
-                'id_skripsi' => $skripsi->id_skripsi,
-                'id_dosen'   => $dsn['dosen']->id_dosen,
-            ])
-            ->assertStatus(201);
-
-        // Penugasan dosen yang SAMA pada skripsi yang SAMA (duplikasi) ditolak 422
-        $this->actingAs($admin['user'], 'sanctum')
-            ->postJson('/api/dosen-pembimbing', [
-                'id_skripsi' => $skripsi->id_skripsi,
-                'id_dosen'   => $dsn['dosen']->id_dosen,
-            ])
-            ->assertStatus(422)
-            ->assertJsonValidationErrors(['id_dosen']);
+            ->assertStatus(405);
 
         // Mahasiswa mencoba membuat bimbingan pada skripsi yang BELUM memiliki pembimbing
         $mhsTanpaDospem = $this->buatMahasiswa();

@@ -41,6 +41,7 @@ export function Sidebar({ onClose }: SidebarProps) {
           { title: "Data Mahasiswa", href: "/dashboardadmin/data_mahasiswa", icon: Users },
           { title: "Data Dosen", href: "/dashboardadmin/data_dosen", icon: UserCheck },
           { title: "Penugasan Kaprodi", href: "/dashboardadmin/penugasan_kaprodi", icon: Award },
+          { title: "Penetapan Dospem", href: "/dashboardadmin/penetapan_dospem", icon: UserCheck },
           { title: "Manajemen Akun", href: "/dashboardadmin/manajemen_akun", icon: ShieldCheck },
           { title: "Manajemen Sempro", href: "/dashboardadmin/manajemen_sempro", icon: FileCheck },
           { title: "Manajemen Ujian", href: "/dashboardadmin/manajemen_ujian", icon: GraduationCap },
@@ -58,6 +59,7 @@ export function Sidebar({ onClose }: SidebarProps) {
         return [
           { title: "Dashboard Mahasiswa", href: "/dashboardmahasiswa", icon: LayoutDashboard },
           { title: "Pengajuan Judul", href: "/dashboardmahasiswa/pengajuan_judul", icon: BookOpen },
+          { title: "Pengajuan Dospem", href: "/dashboardmahasiswa/pengajuan_dospem", icon: UserCheck },
           { title: "Bimbingan Saya", href: "/dashboardmahasiswa/bimbingan", icon: ClipboardList },
           { title: "Seminar Proposal", href: "/dashboardmahasiswa/sempro", icon: FileCheck },
           { title: "Ujian Skripsi", href: "/dashboardmahasiswa/ujian_skripsi", icon: GraduationCap },

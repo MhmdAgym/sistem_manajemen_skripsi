@@ -20,12 +20,22 @@ use App\Http\Controllers\UserController;
 use App\Http\Controllers\PengajuanJudulController;
 use App\Http\Controllers\KaprodiPengajuanJudulController;
 use App\Http\Controllers\Admin\PenugasanKaprodiController;
+use App\Http\Controllers\Mahasiswa\PengajuanDospemMahasiswaController;
+use App\Http\Controllers\Admin\PengajuanDospemAdminController;
+use App\Http\Controllers\NotificationController;
 
 // ---------------------------------------------------------------------------
-// SANCTUM USER DETECTION
+// SANCTUM USER DETECTION & NOTIFIKASI AKADEMIK TERPUSAT
 // ---------------------------------------------------------------------------
-Route::middleware(['auth:sanctum'])->get('/user', function (Request $request) {
-    return $request->user();
+Route::middleware(['auth:sanctum'])->group(function () {
+    Route::get('/user', function (Request $request) {
+        return $request->user();
+    });
+
+    Route::get('/notifications', [NotificationController::class, 'index']);
+    Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
+    Route::patch('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
+    Route::patch('/notifications/mark-all-read', [NotificationController::class, 'markAllRead']);
 });
 
 // ---------------------------------------------------------------------------
@@ -43,6 +53,13 @@ Route::middleware(['auth:sanctum', 'role:mahasiswa'])->group(function () {
     Route::get('/mahasiswa/pengajuan-judul', [PengajuanJudulController::class, 'index']);
     Route::post('/mahasiswa/pengajuan-judul', [PengajuanJudulController::class, 'store']);
     Route::post('/mahasiswa/pengajuan-judul/{id}/revisi', [PengajuanJudulController::class, 'revisi']);
+});
+
+// [MAHASISWA] Pengajuan Dosen Pembimbing Proposal
+Route::middleware(['auth:sanctum', 'role:mahasiswa'])->group(function () {
+    Route::get('/mahasiswa/pengajuan-dospem/status-kelayakan', [PengajuanDospemMahasiswaController::class, 'statusKelayakan']);
+    Route::get('/mahasiswa/pengajuan-dospem', [PengajuanDospemMahasiswaController::class, 'index']);
+    Route::post('/mahasiswa/pengajuan-dospem', [PengajuanDospemMahasiswaController::class, 'store']);
 });
 
 // [DOSEN PA] Lihat daftar & verifikasi pengajuan
@@ -76,6 +93,13 @@ Route::middleware(['auth:sanctum', 'admin'])->group(function () {
     Route::patch('/admin/penugasan-kaprodi/{id}', [PenugasanKaprodiController::class, 'update']);
     Route::patch('/admin/penugasan-kaprodi/{id}/nonaktifkan', [PenugasanKaprodiController::class, 'nonaktifkan']);
 
+    // [ADMIN] Pengajuan & Penetapan Dosen Pembimbing Proposal
+    Route::get('/admin/pengajuan-dospem/dosen-options', [PengajuanDospemAdminController::class, 'dosenOptions']);
+    Route::get('/admin/pengajuan-dospem', [PengajuanDospemAdminController::class, 'index']);
+    Route::get('/admin/pengajuan-dospem/{id}', [PengajuanDospemAdminController::class, 'show']);
+    Route::post('/admin/pengajuan-dospem/{id}/tetapkan', [PengajuanDospemAdminController::class, 'tetapkan']);
+    Route::patch('/admin/pengajuan-dospem/{id}/status', [PengajuanDospemAdminController::class, 'status']);
+
     // Admin & Penetapan Dosen PA
     Route::apiResource('admin', AdminController::class);
     Route::apiResource('dosen-pa', DosenPAController::class);
@@ -83,7 +107,7 @@ Route::middleware(['auth:sanctum', 'admin'])->group(function () {
 
 // [DOSEN PEMBIMBING, BIMBINGAN, UJIAN & PENILAIAN] — Rute Terlindungi dengan Autentikasi Sanctum & Otorisasi Peran
 Route::middleware(['auth:sanctum'])->group(function () {
-    Route::apiResource('dosen-pembimbing', DosenPembimbingController::class);
+    Route::apiResource('dosen-pembimbing', DosenPembimbingController::class)->only(['index', 'show']);
     Route::apiResource('bimbingan', BimbinganController::class);
     Route::apiResource('sempro', SemproController::class);
     Route::apiResource('penguji-sempro', PengujiSemproController::class);

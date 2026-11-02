@@ -2,6 +2,7 @@ import useSWR from 'swr'
 import axios from '@/lib/axios'
 import { useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
+import { destroyEcho } from '@/lib/echo'
 
 /**
  * @param {{ middleware?: string, redirectIfAuthenticated?: string }} [options]
@@ -18,6 +19,9 @@ export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
                 .get('/api/user')
                 .then(res => res.data)
                 .catch(error => {
+                    // Perubahan 1 (A-02): Guard network error — periksa keberadaan response
+                    // sebelum mengakses status agar tidak menyebabkan TypeError
+                    if (!error.response) throw error
                     if (error.response.status !== 409) throw error
 
                     router.push('/verify-email')
@@ -122,6 +126,12 @@ export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
     }
 
     const logout = async () => {
+        try {
+            destroyEcho()
+        } catch (e) {
+            console.error('[AUTH] Gagal mendiskoneksi Echo saat logout:', e)
+        }
+
         if (!error) {
             await axios.post('/logout').then(() => mutate())
         }
@@ -151,7 +161,9 @@ export const useAuth = ({ middleware, redirectIfAuthenticated } = {}) => {
         ) {
             router.push(getRedirectPath(user))
         }
-        if (middleware === 'auth' && error) logout()
+        // Perubahan 2 (A-02): Logout hanya jika server mengonfirmasi HTTP 401 (sesi tidak valid).
+        // Network error, HTTP 403, dan HTTP 500 tidak memicu logout otomatis.
+        if (middleware === 'auth' && error?.response?.status === 401) logout()
     }, [user, error])
 
     return {

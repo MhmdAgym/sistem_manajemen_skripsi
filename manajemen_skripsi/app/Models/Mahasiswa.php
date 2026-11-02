@@ -42,4 +42,10 @@ class Mahasiswa extends Model
     {
         return $this->hasOne(Skripsi::class, 'id_mahasiswa', 'id_mahasiswa')->latestOfMany('id_skripsi');
     }
+
+    // Relasi ke seluruh riwayat pengajuan dosen pembimbing mahasiswa
+    public function pengajuanDospem()
+    {
+        return $this->hasMany(PengajuanDospem::class, 'mahasiswa_id', 'id_mahasiswa');
+    }
 }
