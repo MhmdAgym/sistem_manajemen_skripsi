@@ -302,7 +302,7 @@ class BchatDeviceConcurrencyTest extends TestCase
         $this->atomicWrite($config1File, json_encode($worker1Config, JSON_PRETTY_PRINT));
         $this->atomicWrite($config2File, json_encode($worker2Config, JSON_PRETTY_PRINT));
 
-        $phpBinary = 'D:\\Aplikasi\\Xampp\\php\\php.exe';
+        $phpBinary = (new \Symfony\Component\Process\PhpExecutableFinder())->find() ?: PHP_BINARY;
         $workerScript = base_path('tests/Feature/Bchat/Support/DeviceConcurrencyWorker.php');
 
         $process1 = new Process([
