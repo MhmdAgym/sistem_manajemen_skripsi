@@ -333,4 +333,182 @@ class MasterDanSkripsiSecurityFeatureTest extends TestCase
         $this->actingAs($mhsUser, 'sanctum')->getJson('/api/dosen-pa')->assertStatus(403);
         $this->actingAs($dosenUser, 'sanctum')->getJson('/api/dosen-pa')->assertStatus(403);
     }
+
+    /**
+     * 11. Dosen PA update tidak dapat dialihkan ke skripsi yang sudah memiliki Dosen PA (422).
+     */
+    public function test_11_dosen_pa_update_cannot_reassign_to_skripsi_with_existing_pa(): void
+    {
+        $adminUser = User::factory()->create(['role' => 'admin', 'nomor_induk' => $this->generateNumber()]);
+
+        // Siapkan 2 dosen
+        $dosenUser1 = User::factory()->create(['role' => 'dosen', 'nomor_induk' => $this->generateNumber()]);
+        $dosen1 = Dosen::create(['user_id' => $dosenUser1->id, 'NIDN' => $dosenUser1->nomor_induk, 'nama_dosen' => 'Dosen PA 1']);
+
+        $dosenUser2 = User::factory()->create(['role' => 'dosen', 'nomor_induk' => $this->generateNumber()]);
+        $dosen2 = Dosen::create(['user_id' => $dosenUser2->id, 'NIDN' => $dosenUser2->nomor_induk, 'nama_dosen' => 'Dosen PA 2']);
+
+        // Siapkan 3 mahasiswa dan skripsi
+        $mhsUser1 = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $this->generateNumber()]);
+        $mhs1 = Mahasiswa::create(['user_id' => $mhsUser1->id, 'NIM' => $mhsUser1->nomor_induk, 'nama_mahasiswa' => 'Mhs 1', 'prodi' => 'Informatika', 'fakultas' => 'Fakultas Sains dan Teknologi']);
+        $skripsi1 = Skripsi::create(['id_mahasiswa' => $mhs1->id_mahasiswa, 'judul' => 'Skripsi 1', 'status_judul' => 'disetujui']);
+
+        $mhsUser2 = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $this->generateNumber()]);
+        $mhs2 = Mahasiswa::create(['user_id' => $mhsUser2->id, 'NIM' => $mhsUser2->nomor_induk, 'nama_mahasiswa' => 'Mhs 2', 'prodi' => 'Informatika', 'fakultas' => 'Fakultas Sains dan Teknologi']);
+        $skripsi2 = Skripsi::create(['id_mahasiswa' => $mhs2->id_mahasiswa, 'judul' => 'Skripsi 2', 'status_judul' => 'disetujui']);
+
+        $mhsUser3 = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $this->generateNumber()]);
+        $mhs3 = Mahasiswa::create(['user_id' => $mhsUser3->id, 'NIM' => $mhsUser3->nomor_induk, 'nama_mahasiswa' => 'Mhs 3', 'prodi' => 'Informatika', 'fakultas' => 'Fakultas Sains dan Teknologi']);
+        $skripsi3 = Skripsi::create(['id_mahasiswa' => $mhs3->id_mahasiswa, 'judul' => 'Skripsi 3', 'status_judul' => 'disetujui']);
+
+        // Dosen PA 1 terhubung ke skripsi 1
+        $pa1 = DosenPA::create(['id_dosen' => $dosen1->id_dosen, 'id_skripsi' => $skripsi1->id_skripsi]);
+
+        // Dosen PA 2 terhubung ke skripsi 2
+        $pa2 = DosenPA::create(['id_dosen' => $dosen2->id_dosen, 'id_skripsi' => $skripsi2->id_skripsi]);
+
+        // 1. Admin mencoba update PA 2 untuk mengambil skripsi 1 (sudah ada PA 1) -> 422
+        $resConflict = $this->actingAs($adminUser, 'sanctum')->putJson("/api/dosen-pa/{$pa2->id_dosen_pa}", [
+            'id_skripsi' => $skripsi1->id_skripsi,
+        ]);
+        $resConflict->assertStatus(422)
+            ->assertJsonValidationErrors(['id_skripsi'])
+            ->assertJsonFragment([
+                'message' => 'Skripsi ini sudah memiliki Dosen PA lain.',
+            ]);
+
+        // 2. Admin update PA 2 dengan skripsi yang sama (skripsi 2) -> 200
+        $resSame = $this->actingAs($adminUser, 'sanctum')->putJson("/api/dosen-pa/{$pa2->id_dosen_pa}", [
+            'id_skripsi' => $skripsi2->id_skripsi,
+        ]);
+        $resSame->assertStatus(200);
+
+        // 3. Admin update PA 2 mengarah ke skripsi 3 (belum memiliki PA) -> 200
+        $resReassign = $this->actingAs($adminUser, 'sanctum')->putJson("/api/dosen-pa/{$pa2->id_dosen_pa}", [
+            'id_skripsi' => $skripsi3->id_skripsi,
+        ]);
+        $resReassign->assertStatus(200);
+    }
+
+    /**
+     * 12. Admin store dan update memvalidasi role akun admin dan keunikan users_id.
+     */
+    public function test_12_admin_store_and_update_validates_admin_role_and_unique_users_id(): void
+    {
+        $adminAuth = User::factory()->create(['role' => 'admin', 'nomor_induk' => $this->generateNumber()]);
+
+        // 1. Store dengan user ber-role mahasiswa ditolak (422)
+        $mhsUser = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $this->generateNumber()]);
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/admin', [
+            'nama_admin' => 'Admin Palsu',
+            'users_id'   => $mhsUser->id,
+        ])->assertStatus(422)->assertJsonValidationErrors(['users_id']);
+
+        // 2. Store dengan user role admin berhasil (201)
+        $validUser1 = User::factory()->create(['role' => 'admin', 'nomor_induk' => $this->generateNumber()]);
+        $resStore = $this->actingAs($adminAuth, 'sanctum')->postJson('/api/admin', [
+            'nama_admin' => 'Admin Baru 1',
+            'users_id'   => $validUser1->id,
+        ]);
+        $resStore->assertStatus(201);
+        $adminId1 = $resStore->json('data.id_admin');
+
+        // 3. Store dengan users_id yang sama ditolak karena unique (422)
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/admin', [
+            'nama_admin' => 'Admin Duplikat',
+            'users_id'   => $validUser1->id,
+        ])->assertStatus(422)->assertJsonValidationErrors(['users_id']);
+
+        // 4. Update data admin yang sama mempertahankan users_id -> 200
+        $this->actingAs($adminAuth, 'sanctum')->putJson("/api/admin/{$adminId1}", [
+            'nama_admin' => 'Admin Baru 1 Updated',
+            'users_id'   => $validUser1->id,
+        ])->assertStatus(200);
+
+        // 5. Update dengan user ber-role bukan admin ditolak (422)
+        $this->actingAs($adminAuth, 'sanctum')->putJson("/api/admin/{$adminId1}", [
+            'users_id' => $mhsUser->id,
+        ])->assertStatus(422)->assertJsonValidationErrors(['users_id']);
+
+        // 6. Buat admin kedua, lalu update admin kedua memakai users_id admin pertama -> Ditolak (422)
+        $validUser2 = User::factory()->create(['role' => 'admin', 'nomor_induk' => $this->generateNumber()]);
+        $resStore2 = $this->actingAs($adminAuth, 'sanctum')->postJson('/api/admin', [
+            'nama_admin' => 'Admin Baru 2',
+            'users_id'   => $validUser2->id,
+        ]);
+        $resStore2->assertStatus(201);
+        $adminId2 = $resStore2->json('data.id_admin');
+
+        $this->actingAs($adminAuth, 'sanctum')->putJson("/api/admin/{$adminId2}", [
+            'users_id' => $validUser1->id,
+        ])->assertStatus(422)->assertJsonValidationErrors(['users_id']);
+    }
+
+    /**
+     * 13. Mahasiswa store memvalidasi role user_id harus mahasiswa dan unik.
+     */
+    public function test_13_mahasiswa_store_validates_role_and_unique_user_id(): void
+    {
+        $adminAuth = User::factory()->create(['role' => 'admin', 'nomor_induk' => $this->generateNumber()]);
+
+        // 1. User ber-role 'dosen' tidak dapat didaftarkan sebagai mahasiswa -> 422
+        $dosenUser = User::factory()->create(['role' => 'dosen', 'nomor_induk' => $this->generateNumber()]);
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/mahasiswa', [
+            'user_id'        => $dosenUser->id,
+            'NIM'            => '9999990001',
+            'nama_mahasiswa' => 'Mahasiswa Salah Role',
+            'prodi'          => 'Informatika',
+            'fakultas'       => 'Fakultas Sains dan Teknologi',
+        ])->assertStatus(422)->assertJsonValidationErrors(['user_id']);
+
+        // 2. User ber-role 'mahasiswa' valid -> 201
+        $mhsUser = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $this->generateNumber()]);
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/mahasiswa', [
+            'user_id'        => $mhsUser->id,
+            'NIM'            => '9999990002',
+            'nama_mahasiswa' => 'Mahasiswa Sah',
+            'prodi'          => 'Informatika',
+            'fakultas'       => 'Fakultas Sains dan Teknologi',
+        ])->assertStatus(201);
+
+        // 3. User yang sudah dipakai mahasiswa lain tidak dapat didaftarkan ulang -> 422
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/mahasiswa', [
+            'user_id'        => $mhsUser->id,
+            'NIM'            => '9999990003',
+            'nama_mahasiswa' => 'Mahasiswa Duplicate User',
+            'prodi'          => 'Informatika',
+            'fakultas'       => 'Fakultas Sains dan Teknologi',
+        ])->assertStatus(422)->assertJsonValidationErrors(['user_id']);
+    }
+
+    /**
+     * 14. Dosen store memvalidasi role user_id harus dosen dan unik.
+     */
+    public function test_14_dosen_store_validates_role_and_unique_user_id(): void
+    {
+        $adminAuth = User::factory()->create(['role' => 'admin', 'nomor_induk' => $this->generateNumber()]);
+
+        // 1. User ber-role 'mahasiswa' tidak dapat didaftarkan sebagai dosen -> 422
+        $mhsUser = User::factory()->create(['role' => 'mahasiswa', 'nomor_induk' => $this->generateNumber()]);
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/dosen', [
+            'user_id'    => $mhsUser->id,
+            'NIDN'       => '8888880001',
+            'nama_dosen' => 'Dosen Salah Role',
+        ])->assertStatus(422)->assertJsonValidationErrors(['user_id']);
+
+        // 2. User ber-role 'dosen' valid -> 201
+        $dosenUser = User::factory()->create(['role' => 'dosen', 'nomor_induk' => $this->generateNumber()]);
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/dosen', [
+            'user_id'    => $dosenUser->id,
+            'NIDN'       => '8888880002',
+            'nama_dosen' => 'Dosen Sah',
+        ])->assertStatus(201);
+
+        // 3. User yang sudah dipakai dosen lain tidak dapat didaftarkan ulang -> 422
+        $this->actingAs($adminAuth, 'sanctum')->postJson('/api/dosen', [
+            'user_id'    => $dosenUser->id,
+            'NIDN'       => '8888880003',
+            'nama_dosen' => 'Dosen Duplicate User',
+        ])->assertStatus(422)->assertJsonValidationErrors(['user_id']);
+    }
 }

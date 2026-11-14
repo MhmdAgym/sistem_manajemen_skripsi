@@ -58,4 +58,28 @@ class Dosen extends Model
     {
         return $this->hasMany(PengajuanDospem::class, 'dosen_id', 'id_dosen');
     }
+
+    // Relasi ke seluruh riwayat penugasan pembimbing (FK: dosen_id -> dosen.id_dosen)
+    public function penugasanPembimbing()
+    {
+        return $this->hasMany(PenugasanPembimbing::class, 'dosen_id', 'id_dosen');
+    }
+
+    // Relasi ke penugasan pembimbing aktif (FK: dosen_id -> dosen.id_dosen)
+    public function penugasanPembimbingAktif()
+    {
+        return $this->hasMany(PenugasanPembimbing::class, 'dosen_id', 'id_dosen')->where('status_penugasan', 'AKTIF');
+    }
+
+    // Relasi ke dokumen SK yang mengusulkan dosen ini sebagai Pembimbing 1
+    public function usulanSkDokumen1()
+    {
+        return $this->hasMany(SkSkripsiDokumen::class, 'dosen_1_usulan_id', 'id_dosen');
+    }
+
+    // Relasi ke dokumen SK yang mengusulkan dosen ini sebagai Pembimbing 2
+    public function usulanSkDokumen2()
+    {
+        return $this->hasMany(SkSkripsiDokumen::class, 'dosen_2_usulan_id', 'id_dosen');
+    }
 }

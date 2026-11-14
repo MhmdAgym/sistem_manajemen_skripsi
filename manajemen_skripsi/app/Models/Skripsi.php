@@ -63,4 +63,28 @@ class Skripsi extends Model
     {
         return $this->hasOne(PengajuanDospem::class, 'skripsi_id', 'id_skripsi')->latestOfMany();
     }
+
+    // Relasi ke seluruh berkas fisik SK Pembimbing Skripsi
+    public function skDokumen()
+    {
+        return $this->hasMany(SkSkripsiDokumen::class, 'skripsi_id', 'id_skripsi');
+    }
+
+    // Relasi ke berkas fisik SK Pembimbing Skripsi aktif terkini
+    public function skDokumenTerkini()
+    {
+        return $this->hasOne(SkSkripsiDokumen::class, 'skripsi_id', 'id_skripsi')->where('is_terkini', true);
+    }
+
+    // Relasi ke seluruh riwayat penugasan pembimbing (proposal dan skripsi)
+    public function penugasanPembimbing()
+    {
+        return $this->hasMany(PenugasanPembimbing::class, 'skripsi_id', 'id_skripsi');
+    }
+
+    // Relasi ke penugasan pembimbing berstatus aktif
+    public function penugasanPembimbingAktif()
+    {
+        return $this->hasMany(PenugasanPembimbing::class, 'skripsi_id', 'id_skripsi')->where('status_penugasan', 'AKTIF');
+    }
 }

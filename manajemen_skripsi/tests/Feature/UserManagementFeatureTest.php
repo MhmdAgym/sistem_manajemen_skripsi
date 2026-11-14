@@ -24,7 +24,6 @@ class UserManagementFeatureTest extends TestCase
     {
         $mahasiswaUser = User::factory()->create([
             'role' => 'mahasiswa',
-            'nomor_induk' => '1234567890',
         ]);
 
         Sanctum::actingAs($mahasiswaUser);

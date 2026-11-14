@@ -210,3 +210,6 @@ jobs:
           php artisan test tests/Feature/KaprodiWorkflowFeatureTest.php
           php artisan test tests/Feature/PengajuanJudulFeatureTest.php
           php artisan test tests/Feature/AdminPenugasanKaprodiFeatureTest.php
+
+      - name: Run B-CHAT End-to-End & Security Tests
+        run: php artisan test tests/Feature/Bchat tests/Unit/Services tests/Unit/BchatPhase5b1SchemaAndRelationsTest.php

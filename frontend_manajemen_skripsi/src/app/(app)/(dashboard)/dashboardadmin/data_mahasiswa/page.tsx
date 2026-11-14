@@ -17,6 +17,13 @@ import {
   BookOpen,
   Filter
 } from "lucide-react";
+import {
+  FAKULTAS_LIST,
+  getProdiByFakultas,
+  getFakultasByProdi,
+  isValidFakultasProdi,
+  normalizeFakultas,
+} from "@/constants/academic";
 
 interface UserProfile {
   id: number;
@@ -151,10 +158,12 @@ export default function DataMahasiswaPage() {
       currentDosenPaId = (m.active_skripsi as any).dosen_pa_id;
     }
 
+    const normalizedFakultas = normalizeFakultas(m.fakultas);
+
     setEditForm({
       nama_mahasiswa: m.nama_mahasiswa || "",
       NIM: m.NIM || "",
-      fakultas: m.fakultas || "",
+      fakultas: normalizedFakultas || (m.fakultas || ""),
       prodi: m.prodi || "",
       no_handphone: m.no_handphone || "",
       jenis_kelamin: m.jenis_kelamin || "",
@@ -164,9 +173,86 @@ export default function DataMahasiswaPage() {
     setConfirmOpen(false);
   };
 
+  // Handler perubahan fakultas pada edit modal (otomatis menyesuaikan opsi prodi)
+  const handleFakultasChange = (newFakultas: string) => {
+    const validProdis = getProdiByFakultas(newFakultas);
+    const isCurrentProdiValidInNewFakultas = validProdis.includes(editForm.prodi);
+
+    setEditForm((prev) => ({
+      ...prev,
+      fakultas: newFakultas,
+      prodi: isCurrentProdiValidInNewFakultas ? prev.prodi : "",
+    }));
+
+    if (editErrors.prodi || editErrors.fakultas) {
+      setEditErrors((prev) => {
+        const next = { ...prev };
+        delete next.prodi;
+        delete next.fakultas;
+        return next;
+      });
+    }
+  };
+
+  // Daftar prodi yang tersedia berdasarkan fakultas yang saat ini dipilih pada form edit
+  const availableProdis = useMemo(() => {
+    return getProdiByFakultas(editForm.fakultas);
+  }, [editForm.fakultas]);
+
+  // Deteksi apakah data mahasiswa saat ini memiliki pasangan fakultas & prodi yang tidak konsisten
+  const isLegacyDataInconsistent = useMemo(() => {
+    if (!editModalData) return false;
+    const storedFakultas = normalizeFakultas(editModalData.fakultas);
+    const storedProdi = editModalData.prodi;
+    if (storedFakultas || storedProdi) {
+      return !isValidFakultasProdi(storedFakultas, storedProdi);
+    }
+    return false;
+  }, [editModalData]);
+
+  // Validasi form sebelum menampilkan konfirmasi simpan
+  const handleInitiateConfirm = () => {
+    const errors: Record<string, string[]> = {};
+    if (!editForm.nama_mahasiswa.trim()) {
+      errors.nama_mahasiswa = ["Nama Mahasiswa wajib diisi."];
+    }
+    if (!editForm.NIM.trim()) {
+      errors.NIM = ["NIM wajib diisi."];
+    }
+    if (!editForm.fakultas) {
+      errors.fakultas = ["Fakultas wajib dipilih."];
+    }
+    if (!editForm.prodi) {
+      errors.prodi = ["Program Studi wajib dipilih."];
+    } else if (editForm.fakultas && !isValidFakultasProdi(editForm.fakultas, editForm.prodi)) {
+      errors.prodi = ["Program Studi tidak sesuai dengan Fakultas yang dipilih."];
+    }
+
+    if (Object.keys(errors).length > 0) {
+      setEditErrors(errors);
+      return;
+    }
+
+    setEditErrors({});
+    setConfirmOpen(true);
+  };
+
   // Submit edit
   const handleSaveEdit = async () => {
     if (!editModalData) return;
+
+    if (!editForm.fakultas) {
+      setEditErrors({ fakultas: ["Fakultas wajib dipilih."] });
+      setConfirmOpen(false);
+      return;
+    }
+
+    if (!editForm.prodi || !isValidFakultasProdi(editForm.fakultas, editForm.prodi)) {
+      setEditErrors({ prodi: ["Program Studi wajib dipilih dan harus sesuai dengan Fakultas."] });
+      setConfirmOpen(false);
+      return;
+    }
+
     setIsSaving(true);
     setEditErrors({});
 
@@ -565,6 +651,28 @@ export default function DataMahasiswaPage() {
               </div>
             )}
 
+            {/* Peringatan jika data lama tidak konsisten */}
+            {isLegacyDataInconsistent && (
+              <div className="p-3 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl text-xs space-y-1">
+                <div className="font-bold flex items-center gap-1.5 text-amber-800">
+                  <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                  Perhatian: Data Fakultas & Program Studi Tersimpan Tidak Konsisten
+                </div>
+                <p className="text-[11px] text-amber-700 leading-relaxed">
+                  Data pada database saat ini memiliki Fakultas:{" "}
+                  <strong className="text-amber-900">{editModalData?.fakultas || "(Belum diatur)"}</strong> dan
+                  Program Studi: <strong className="text-amber-900">{editModalData?.prodi || "(Belum diatur)"}</strong>.
+                  {editModalData?.prodi && getFakultasByProdi(editModalData.prodi) && (
+                    <span>
+                      {" "}(Program Studi <em>{editModalData.prodi}</em> secara resmi berada di bawah{" "}
+                      <strong>{getFakultasByProdi(editModalData.prodi)}</strong>).
+                    </span>
+                  )}
+                  {" "}Silakan pilih pasangan Fakultas dan Program Studi yang sesuai untuk memperbarui data ini.
+                </p>
+              </div>
+            )}
+
             <div className="space-y-4 text-xs">
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">Nama Mahasiswa *</label>
@@ -606,28 +714,61 @@ export default function DataMahasiswaPage() {
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label className="font-semibold text-slate-700 block mb-1">Fakultas</label>
+                  <label className="font-semibold text-slate-700 block mb-1">Fakultas *</label>
                   <select
                     value={editForm.fakultas}
-                    onChange={(e) => setEditForm({ ...editForm, fakultas: e.target.value })}
-                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 text-slate-800 bg-white"
+                    onChange={(e) => handleFakultasChange(e.target.value)}
+                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 text-slate-800 bg-white font-medium"
+                    required
                   >
                     <option value="">-- Pilih Fakultas --</option>
-                    <option value="Fakultas Sains dan Teknologi">Fakultas Sains dan Teknologi</option>
-                    <option value="Fakultas Ilmu Pendidikan">Fakultas Ilmu Pendidikan</option>
-                    <option value="Fakultas Agama Islam">Fakultas Agama Islam</option>
+                    {FAKULTAS_LIST.map((fak) => (
+                      <option key={fak} value={fak}>
+                        {fak}
+                      </option>
+                    ))}
+                    {editForm.fakultas && !FAKULTAS_LIST.includes(editForm.fakultas as any) && (
+                      <option value={editForm.fakultas} disabled>
+                        ⚠️ {editForm.fakultas} (Fakultas tidak terdaftar)
+                      </option>
+                    )}
                   </select>
                 </div>
 
                 <div>
                   <label className="font-semibold text-slate-700 block mb-1">Program Studi *</label>
-                  <input
-                    type="text"
+                  <select
                     value={editForm.prodi}
-                    onChange={(e) => setEditForm({ ...editForm, prodi: e.target.value })}
-                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 font-medium text-slate-800"
+                    onChange={(e) => {
+                      setEditForm({ ...editForm, prodi: e.target.value });
+                      if (editErrors.prodi) {
+                        setEditErrors((prev) => {
+                          const next = { ...prev };
+                          delete next.prodi;
+                          return next;
+                        });
+                      }
+                    }}
+                    disabled={!editForm.fakultas}
+                    className="w-full px-3.5 py-2 rounded-xl border border-slate-200 focus:outline-none focus:border-emerald-600 text-slate-800 bg-white font-medium disabled:bg-slate-100 disabled:text-slate-400 disabled:cursor-not-allowed"
                     required
-                  />
+                  >
+                    <option value="">
+                      {editForm.fakultas
+                        ? "-- Pilih Program Studi --"
+                        : "-- Pilih Fakultas Terlebih Dahulu --"}
+                    </option>
+                    {availableProdis.map((prodiName) => (
+                      <option key={prodiName} value={prodiName}>
+                        {prodiName}
+                      </option>
+                    ))}
+                    {editForm.prodi && !availableProdis.includes(editForm.prodi) && (
+                      <option value={editForm.prodi} disabled>
+                        ⚠️ {editForm.prodi} (Tidak sesuai dengan {editForm.fakultas || "Fakultas"})
+                      </option>
+                    )}
+                  </select>
                 </div>
               </div>
 
@@ -707,7 +848,7 @@ export default function DataMahasiswaPage() {
                   Batal
                 </button>
                 <button
-                  onClick={() => setConfirmOpen(true)}
+                  onClick={handleInitiateConfirm}
                   className="px-4 py-2 bg-[#15803D] text-white text-xs font-bold rounded-xl shadow hover:bg-emerald-700 transition flex items-center gap-1.5"
                 >
                   Simpan Perubahan

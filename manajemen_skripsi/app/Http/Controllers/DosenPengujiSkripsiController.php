@@ -92,6 +92,22 @@ class DosenPengujiSkripsiController extends Controller
             ], 422);
         }
 
+        // Cek Keunikan Peran: Hanya boleh ada tepat satu ketua penguji pada satu ujian skripsi
+        if ($validatedData['peran'] === 'ketua') {
+            $existsKetua = DosenPengujiSkripsi::where('id_ujian_skripsi', $validatedData['id_ujian_skripsi'])
+                ->where('peran', 'ketua')
+                ->first();
+
+            if ($existsKetua) {
+                return response()->json([
+                    'message' => 'Posisi ketua penguji pada ujian skripsi ini sudah terisi.',
+                    'errors'  => [
+                        'peran' => ['Posisi ketua penguji pada ujian skripsi ini sudah terisi.'],
+                    ],
+                ], 422);
+            }
+        }
+
         $penguji = DosenPengujiSkripsi::create($validatedData);
 
         return response()->json([
@@ -168,12 +184,14 @@ class DosenPengujiSkripsiController extends Controller
             'peran'            => 'sometimes|required|in:ketua,anggota',
         ]);
 
-        if ($request->has('id_dosen') || $request->has('id_ujian_skripsi')) {
-            $checkDosenId = $validatedData['id_dosen'] ?? $penguji->id_dosen;
-            $checkUjianId = $validatedData['id_ujian_skripsi'] ?? $penguji->id_ujian_skripsi;
+        $targetUjianId = $validatedData['id_ujian_skripsi'] ?? $penguji->id_ujian_skripsi;
+        $targetDosenId = $validatedData['id_dosen'] ?? $penguji->id_dosen;
+        $targetPeran   = $validatedData['peran'] ?? $penguji->peran;
 
-            $exists = DosenPengujiSkripsi::where('id_dosen', $checkDosenId)
-                ->where('id_ujian_skripsi', $checkUjianId)
+        // 1. Cek apakah dosen sudah terdaftar di ujian target (selain record saat ini)
+        if ($request->has('id_dosen') || $request->has('id_ujian_skripsi')) {
+            $exists = DosenPengujiSkripsi::where('id_dosen', $targetDosenId)
+                ->where('id_ujian_skripsi', $targetUjianId)
                 ->where('id_penguji_skripsi', '!=', $id)
                 ->first();
 
@@ -182,6 +200,23 @@ class DosenPengujiSkripsiController extends Controller
                     'message' => 'Dosen ini sudah terdaftar sebagai penguji pada ujian skripsi ini',
                     'errors'  => [
                         'id_dosen' => ['Dosen ini sudah terdaftar sebagai penguji pada ujian skripsi ini'],
+                    ],
+                ], 422);
+            }
+        }
+
+        // 2. Cek apakah peran 'ketua' sudah terisi oleh dosen lain pada ujian skripsi tersebut
+        if ($targetPeran === 'ketua') {
+            $existsKetua = DosenPengujiSkripsi::where('id_ujian_skripsi', $targetUjianId)
+                ->where('peran', 'ketua')
+                ->where('id_penguji_skripsi', '!=', $id)
+                ->first();
+
+            if ($existsKetua) {
+                return response()->json([
+                    'message' => 'Posisi ketua penguji pada ujian skripsi ini sudah terisi.',
+                    'errors'  => [
+                        'peran' => ['Posisi ketua penguji pada ujian skripsi ini sudah terisi.'],
                     ],
                 ], 422);
             }

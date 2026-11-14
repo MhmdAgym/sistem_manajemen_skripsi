@@ -108,7 +108,11 @@ class MahasiswaController extends Controller
 
         $validatedData = $request->validate([
             'NIM'            => 'required|string|max:10|unique:mahasiswa,NIM',
-            'user_id'        => 'required|exists:users,id',
+            'user_id'        => [
+                'required',
+                Rule::exists('users', 'id')->where('role', 'mahasiswa'),
+                Rule::unique('mahasiswa', 'user_id'),
+            ],
             'nama_mahasiswa' => 'required|string|max:255',
             'prodi'          => 'required|string|max:255',
             'fakultas'       => 'nullable|string|max:255',

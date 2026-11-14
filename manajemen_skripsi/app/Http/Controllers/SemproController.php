@@ -76,17 +76,18 @@ class SemproController extends Controller
             'status_sempro'  => 'sometimes|required|in:lulus,tidak lulus',
         ]);
 
+        $skripsi = Skripsi::find($validatedData['id_skripsi']);
+        if (!$skripsi) {
+            return response()->json(['message' => 'Data skripsi tidak ditemukan.'], 404);
+        }
+
         if ($user->role === 'mahasiswa') {
             $mahasiswa = $user->mahasiswa;
             if (!$mahasiswa) {
                 return response()->json(['message' => 'Profil mahasiswa tidak ditemukan.'], 404);
             }
 
-            $skripsi = Skripsi::where('id_skripsi', $validatedData['id_skripsi'])
-                ->where('id_mahasiswa', $mahasiswa->id_mahasiswa)
-                ->first();
-
-            if (!$skripsi) {
+            if ((int) $skripsi->id_mahasiswa !== (int) $mahasiswa->id_mahasiswa) {
                 return response()->json([
                     'message' => 'Akses ditolak. Anda tidak berhak mendaftarkan seminar proposal untuk skripsi ini.'
                 ], 403);
@@ -102,6 +103,16 @@ class SemproController extends Controller
             return response()->json([
                 'message' => 'Akses ditolak. Peran Anda tidak memiliki kewenangan untuk mendaftarkan seminar proposal.'
             ], 403);
+        }
+
+        // Validasi Prasyarat Akademik: Judul skripsi harus sudah disetujui Kaprodi
+        if ($skripsi->status_judul !== 'disetujui') {
+            return response()->json([
+                'message' => 'Pendaftaran seminar proposal hanya dapat dilakukan jika judul skripsi telah disetujui oleh Kaprodi.',
+                'errors'  => [
+                    'id_skripsi' => ['Judul skripsi belum berstatus disetujui.'],
+                ],
+            ], 422);
         }
 
         // Cegah pendaftaran sempro ganda untuk skripsi yang sama

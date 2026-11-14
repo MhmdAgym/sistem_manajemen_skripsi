@@ -23,6 +23,16 @@ use App\Http\Controllers\Admin\PenugasanKaprodiController;
 use App\Http\Controllers\Mahasiswa\PengajuanDospemMahasiswaController;
 use App\Http\Controllers\Admin\PengajuanDospemAdminController;
 use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\Mahasiswa\SkSkripsiDokumenMahasiswaController;
+use App\Http\Controllers\Admin\SkSkripsiDokumenAdminController;
+use App\Http\Controllers\Admin\PenugasanPembimbingAdminController;
+use App\Http\Controllers\Api\Bchat\BchatDeviceController;
+use App\Http\Controllers\Api\Bchat\BchatKeyPackageController;
+use App\Http\Controllers\Api\Bchat\BchatRoomController;
+use App\Http\Controllers\Api\Bchat\BchatWelcomeAckController;
+use App\Http\Controllers\Api\Bchat\BchatWelcomeController;
+use App\Http\Controllers\Api\Bchat\BchatMessageController;
+use App\Http\Controllers\Api\Bchat\BchatAttachmentController;
 
 // ---------------------------------------------------------------------------
 // SANCTUM USER DETECTION & NOTIFIKASI AKADEMIK TERPUSAT
@@ -36,6 +46,55 @@ Route::middleware(['auth:sanctum'])->group(function () {
     Route::get('/notifications/unread-count', [NotificationController::class, 'unreadCount']);
     Route::patch('/notifications/{id}/read', [NotificationController::class, 'markAsRead']);
     Route::patch('/notifications/mark-all-read', [NotificationController::class, 'markAllRead']);
+});
+
+// ---------------------------------------------------------------------------
+// B-CHAT E2EE: DEVICE CONTROL PLANE (Phase 5B.3A)
+// ---------------------------------------------------------------------------
+Route::middleware(['auth:sanctum'])->prefix('bchat/devices')->group(function () {
+    Route::post('/step-up', [BchatDeviceController::class, 'stepUp'])->middleware('throttle:10,1');
+    Route::post('/registration-nonce', [BchatDeviceController::class, 'issueRegistrationNonce'])->middleware('throttle:10,1');
+    Route::post('/register', [BchatDeviceController::class, 'register'])->middleware('throttle:10,1');
+    Route::get('/status', [BchatDeviceController::class, 'status'])->middleware('throttle:30,1');
+});
+
+// ---------------------------------------------------------------------------
+// B-CHAT E2EE: KEYPACKAGE DEPOSIT PLANE (Tahap 2C.3)
+// ---------------------------------------------------------------------------
+Route::middleware(['auth:sanctum'])->prefix('bchat/key-packages')->group(function () {
+    Route::post('/', [BchatKeyPackageController::class, 'upload'])->middleware('throttle:30,1');
+});
+
+// ---------------------------------------------------------------------------
+// B-CHAT E2EE: ROOM DISCOVERY & WELCOME ACK HANDSHAKE (Tahap 2C.1 / 2C.3)
+// ---------------------------------------------------------------------------
+Route::middleware(['auth:sanctum'])->prefix('bchat/rooms')->group(function () {
+    Route::get('/', [BchatRoomController::class, 'index'])
+        ->middleware('throttle:60,1');
+    Route::get('/{roomUuid}', [BchatRoomController::class, 'show'])
+        ->middleware('throttle:60,1');
+    Route::get('/{roomUuid}/partner-key-package', [BchatKeyPackageController::class, 'fetchPartnerKeyPackage'])
+        ->middleware('throttle:60,1');
+    Route::post('/{roomUuid}/welcome', [BchatWelcomeController::class, 'publish'])
+        ->middleware('throttle:10,1');
+    Route::post('/{roomUuid}/welcome-challenge', [BchatWelcomeController::class, 'challenge'])
+        ->middleware('throttle:10,1');
+    Route::post('/{roomUuid}/welcome-ack', [BchatWelcomeAckController::class, 'welcomeAck'])
+        ->middleware('throttle:10,1');
+    Route::post('/{roomUuid}/messages', [BchatMessageController::class, 'store'])
+        ->middleware('throttle:60,1');
+    Route::get('/{roomUuid}/messages', [BchatMessageController::class, 'index'])
+        ->middleware('throttle:60,1');
+
+    // B-CHAT E2EE Attachment Transport Plane (Tahap 2)
+    Route::post('/{roomUuid}/attachments/upload-session', [BchatAttachmentController::class, 'createUploadSession'])
+        ->middleware('throttle:30,1');
+    Route::put('/{roomUuid}/attachments/upload-session/{sessionUuid}/chunks/{chunkIndex}', [BchatAttachmentController::class, 'uploadChunk'])
+        ->middleware('throttle:120,1');
+    Route::post('/{roomUuid}/attachments/upload-session/{sessionUuid}/complete', [BchatAttachmentController::class, 'completeUploadSession'])
+        ->middleware('throttle:30,1');
+    Route::get('/{roomUuid}/attachments/{attachmentUuid}/chunks/{chunkIndex}', [BchatAttachmentController::class, 'downloadChunk'])
+        ->middleware('throttle:120,1');
 });
 
 // ---------------------------------------------------------------------------
@@ -60,6 +119,15 @@ Route::middleware(['auth:sanctum', 'role:mahasiswa'])->group(function () {
     Route::get('/mahasiswa/pengajuan-dospem/status-kelayakan', [PengajuanDospemMahasiswaController::class, 'statusKelayakan']);
     Route::get('/mahasiswa/pengajuan-dospem', [PengajuanDospemMahasiswaController::class, 'index']);
     Route::post('/mahasiswa/pengajuan-dospem', [PengajuanDospemMahasiswaController::class, 'store']);
+});
+
+// [MAHASISWA] Dokumen SK Pembimbing Skripsi
+Route::middleware(['auth:sanctum', 'role:mahasiswa'])->group(function () {
+    Route::get('/mahasiswa/sk-dokumen', [SkSkripsiDokumenMahasiswaController::class, 'index']);
+    Route::post('/mahasiswa/sk-dokumen', [SkSkripsiDokumenMahasiswaController::class, 'store']);
+    Route::get('/mahasiswa/sk-dokumen/{id}', [SkSkripsiDokumenMahasiswaController::class, 'show']);
+    Route::post('/mahasiswa/sk-dokumen/{id}/revisi', [SkSkripsiDokumenMahasiswaController::class, 'update']);
+    Route::get('/mahasiswa/sk-dokumen/{id}/download', [SkSkripsiDokumenMahasiswaController::class, 'download']);
 });
 
 // [DOSEN PA] Lihat daftar & verifikasi pengajuan
@@ -99,6 +167,18 @@ Route::middleware(['auth:sanctum', 'admin'])->group(function () {
     Route::get('/admin/pengajuan-dospem/{id}', [PengajuanDospemAdminController::class, 'show']);
     Route::post('/admin/pengajuan-dospem/{id}/tetapkan', [PengajuanDospemAdminController::class, 'tetapkan']);
     Route::patch('/admin/pengajuan-dospem/{id}/status', [PengajuanDospemAdminController::class, 'status']);
+
+    // [ADMIN] Verifikasi Dokumen SK Pembimbing Skripsi
+    Route::get('/admin/sk-dokumen', [SkSkripsiDokumenAdminController::class, 'index']);
+    Route::get('/admin/sk-dokumen/{id}', [SkSkripsiDokumenAdminController::class, 'show']);
+    Route::patch('/admin/sk-dokumen/{id}/verifikasi', [SkSkripsiDokumenAdminController::class, 'verify']);
+    Route::get('/admin/sk-dokumen/{id}/download', [SkSkripsiDokumenAdminController::class, 'download']);
+
+    // [ADMIN] Penugasan Pembimbing Skripsi
+    Route::get('/admin/penugasan-pembimbing', [PenugasanPembimbingAdminController::class, 'index']);
+    Route::post('/admin/penugasan-pembimbing', [PenugasanPembimbingAdminController::class, 'store']);
+    Route::get('/admin/penugasan-pembimbing/{id}', [PenugasanPembimbingAdminController::class, 'show']);
+    Route::patch('/admin/penugasan-pembimbing/{id}/status', [PenugasanPembimbingAdminController::class, 'update']);
 
     // Admin & Penetapan Dosen PA
     Route::apiResource('admin', AdminController::class);

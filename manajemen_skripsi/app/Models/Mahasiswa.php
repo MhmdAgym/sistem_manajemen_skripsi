@@ -48,4 +48,16 @@ class Mahasiswa extends Model
     {
         return $this->hasMany(PengajuanDospem::class, 'mahasiswa_id', 'id_mahasiswa');
     }
+
+    // Relasi ke seluruh riwayat unggahan berkas SK Pembimbing Skripsi mahasiswa
+    public function skDokumen()
+    {
+        return $this->hasMany(SkSkripsiDokumen::class, 'mahasiswa_id', 'id_mahasiswa');
+    }
+
+    // Relasi ke berkas SK Pembimbing Skripsi aktif terkini milik mahasiswa
+    public function skDokumenTerkini()
+    {
+        return $this->hasOne(SkSkripsiDokumen::class, 'mahasiswa_id', 'id_mahasiswa')->where('is_terkini', true);
+    }
 }

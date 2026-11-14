@@ -66,4 +66,16 @@ class User extends Authenticatable implements MustVerifyEmail
     {
         return $this->hasOne(Admin::class, 'users_id', 'id');
     }
+
+    // Relasi ke dokumen SK yang diverifikasi/diperiksa oleh akun ini (FK: admin_id -> users.id)
+    public function skDokumenDiperiksa()
+    {
+        return $this->hasMany(SkSkripsiDokumen::class, 'admin_id', 'id');
+    }
+
+    // Relasi ke seluruh mutasi penugasan pembimbing yang dicatat oleh akun ini (FK: user_id -> users.id)
+    public function penugasanPembimbingLogs()
+    {
+        return $this->hasMany(PenugasanPembimbingLog::class, 'user_id', 'id');
+    }
 }

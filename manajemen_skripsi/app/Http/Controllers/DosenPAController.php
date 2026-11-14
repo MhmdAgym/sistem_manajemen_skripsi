@@ -76,6 +76,21 @@ class DosenPAController extends Controller
             'id_skripsi' => 'sometimes|required|exists:skripsi,id_skripsi',
         ]);
 
+        if (isset($validatedData['id_skripsi'])) {
+            $exists = DosenPA::where('id_skripsi', $validatedData['id_skripsi'])
+                ->where('id_dosen_pa', '!=', $id)
+                ->first();
+
+            if ($exists) {
+                return response()->json([
+                    'message' => 'Skripsi ini sudah memiliki Dosen PA lain.',
+                    'errors'  => [
+                        'id_skripsi' => ['Skripsi ini sudah memiliki Dosen PA lain.'],
+                    ],
+                ], 422);
+            }
+        }
+
         $dosen_pa->update($validatedData);
 
         return response()->json([

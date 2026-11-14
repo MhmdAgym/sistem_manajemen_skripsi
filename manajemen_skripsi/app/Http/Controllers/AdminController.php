@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use App\Models\Admin;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
 
 class AdminController extends Controller
 {
@@ -30,7 +31,11 @@ class AdminController extends Controller
 
         $validatedData = $request->validate([
             'nama_admin' => 'required|string|max:255',
-            'users_id'   => 'required|exists:users,id',
+            'users_id'   => [
+                'required',
+                Rule::exists('users', 'id')->where('role', 'admin'),
+                Rule::unique('admin', 'users_id'),
+            ],
         ]);
 
         $admin = Admin::create($validatedData);
@@ -66,7 +71,12 @@ class AdminController extends Controller
 
         $validatedData = $request->validate([
             'nama_admin' => 'sometimes|required|string|max:255',
-            'users_id'   => 'sometimes|required|exists:users,id',
+            'users_id'   => [
+                'sometimes',
+                'required',
+                Rule::exists('users', 'id')->where('role', 'admin'),
+                Rule::unique('admin', 'users_id')->ignore($id, 'id_admin'),
+            ],
         ]);
 
         $admin->update($validatedData);

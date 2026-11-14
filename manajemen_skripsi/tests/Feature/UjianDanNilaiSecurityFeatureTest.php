@@ -501,4 +501,147 @@ class UjianDanNilaiSecurityFeatureTest extends TestCase
         ]);
         $res->assertStatus(403);
     }
+
+    // -----------------------------------------------------------------------
+    // TEST 13: VALIDASI PRASYARAT SEMPRO - STATUS JUDUL SKRIPSI HARUS DISETUJUI
+    // -----------------------------------------------------------------------
+
+    public function test_13_pendaftaran_sempro_ditolak_jika_judul_skripsi_belum_disetujui(): void
+    {
+        $admin = $this->buatAdmin();
+        $mhs = $this->buatMahasiswa();
+
+        // 1. Skripsi masih berstatus 'diajukan'
+        $skripsiDiajukan = $this->buatSkripsi($mhs['mahasiswa'], 'diajukan');
+
+        // Mahasiswa mencoba mendaftar sempro untuk skripsi yang belum disetujui
+        $resMhs = $this->actingAs($mhs['user'], 'sanctum')->postJson('/api/sempro', [
+            'id_skripsi'     => $skripsiDiajukan->id_skripsi,
+            'tanggal_sempro' => now()->addDays(5)->toDateString(),
+        ]);
+        $resMhs->assertStatus(422)
+            ->assertJsonValidationErrors(['id_skripsi'])
+            ->assertJsonFragment([
+                'message' => 'Pendaftaran seminar proposal hanya dapat dilakukan jika judul skripsi telah disetujui oleh Kaprodi.',
+            ]);
+
+        // Admin juga ditolak jika judul skripsi belum disetujui
+        $resAdmin = $this->actingAs($admin['user'], 'sanctum')->postJson('/api/sempro', [
+            'id_skripsi'     => $skripsiDiajukan->id_skripsi,
+            'tanggal_sempro' => now()->addDays(5)->toDateString(),
+        ]);
+        $resAdmin->assertStatus(422)
+            ->assertJsonValidationErrors(['id_skripsi']);
+
+        // 2. Skripsi dengan status 'disetujui' dapat didaftarkan oleh mahasiswa pemiliknya
+        $skripsiDisetujui = $this->buatSkripsi($mhs['mahasiswa'], 'disetujui');
+        $resSukses = $this->actingAs($mhs['user'], 'sanctum')->postJson('/api/sempro', [
+            'id_skripsi'     => $skripsiDisetujui->id_skripsi,
+            'tanggal_sempro' => now()->addDays(5)->toDateString(),
+        ]);
+        $resSukses->assertStatus(201);
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 14: ATURAN SINGLE KETUA PADA PENGUJI UJIAN SKRIPSI (STORE)
+    // -----------------------------------------------------------------------
+
+    public function test_14_penetapan_ketua_kedua_pada_ujian_skripsi_ditolak_tetapi_beberapa_anggota_diterima(): void
+    {
+        $admin = $this->buatAdmin();
+        $mhs = $this->buatMahasiswa();
+        $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
+        $sempro = $this->buatSempro($skripsi, 'lulus');
+        $ujian = $this->buatUjianSkripsi($sempro);
+
+        $dsn1 = $this->buatDosen();
+        $dsn2 = $this->buatDosen();
+        $dsn3 = $this->buatDosen();
+
+        // 1. Tambah ketua pertama -> Sukses (201)
+        $resKetua1 = $this->actingAs($admin['user'], 'sanctum')->postJson('/api/dosen-penguji-skripsi', [
+            'id_ujian_skripsi' => $ujian->id_ujian_skripsi,
+            'id_dosen'         => $dsn1['dosen']->id_dosen,
+            'peran'            => 'ketua',
+        ]);
+        $resKetua1->assertStatus(201);
+
+        // 2. Tambah ketua kedua -> Ditolak (422)
+        $resKetua2 = $this->actingAs($admin['user'], 'sanctum')->postJson('/api/dosen-penguji-skripsi', [
+            'id_ujian_skripsi' => $ujian->id_ujian_skripsi,
+            'id_dosen'         => $dsn2['dosen']->id_dosen,
+            'peran'            => 'ketua',
+        ]);
+        $resKetua2->assertStatus(422)
+            ->assertJsonValidationErrors(['peran'])
+            ->assertJsonFragment([
+                'message' => 'Posisi ketua penguji pada ujian skripsi ini sudah terisi.',
+            ]);
+
+        // 3. Tambah anggota pertama -> Sukses (201)
+        $resAnggota1 = $this->actingAs($admin['user'], 'sanctum')->postJson('/api/dosen-penguji-skripsi', [
+            'id_ujian_skripsi' => $ujian->id_ujian_skripsi,
+            'id_dosen'         => $dsn2['dosen']->id_dosen,
+            'peran'            => 'anggota',
+        ]);
+        $resAnggota1->assertStatus(201);
+
+        // 4. Tambah anggota kedua -> Sukses (201, diperbolehkan multiple anggota)
+        $resAnggota2 = $this->actingAs($admin['user'], 'sanctum')->postJson('/api/dosen-penguji-skripsi', [
+            'id_ujian_skripsi' => $ujian->id_ujian_skripsi,
+            'id_dosen'         => $dsn3['dosen']->id_dosen,
+            'peran'            => 'anggota',
+        ]);
+        $resAnggota2->assertStatus(201);
+    }
+
+    // -----------------------------------------------------------------------
+    // TEST 15: ATURAN SINGLE KETUA PADA UPDATE PENGUJI UJIAN SKRIPSI
+    // -----------------------------------------------------------------------
+
+    public function test_15_update_peran_ketua_pada_ujian_skripsi_menolak_duplikasi_tetapi_menerima_update_sah(): void
+    {
+        $admin = $this->buatAdmin();
+        $mhs = $this->buatMahasiswa();
+        $skripsi = $this->buatSkripsi($mhs['mahasiswa']);
+        $sempro = $this->buatSempro($skripsi, 'lulus');
+        $ujian = $this->buatUjianSkripsi($sempro);
+
+        $dsn1 = $this->buatDosen();
+        $dsn2 = $this->buatDosen();
+
+        $penguji1 = DosenPengujiSkripsi::create([
+            'id_ujian_skripsi' => $ujian->id_ujian_skripsi,
+            'id_dosen'         => $dsn1['dosen']->id_dosen,
+            'peran'            => 'ketua',
+        ]);
+
+        $penguji2 = DosenPengujiSkripsi::create([
+            'id_ujian_skripsi' => $ujian->id_ujian_skripsi,
+            'id_dosen'         => $dsn2['dosen']->id_dosen,
+            'peran'            => 'anggota',
+        ]);
+
+        // 1. Coba update penguji2 (anggota) menjadi ketua saat ketua sudah ada -> Ditolak (422)
+        $resConflict = $this->actingAs($admin['user'], 'sanctum')->putJson('/api/dosen-penguji-skripsi/' . $penguji2->id_penguji_skripsi, [
+            'peran' => 'ketua',
+        ]);
+        $resConflict->assertStatus(422)
+            ->assertJsonValidationErrors(['peran'])
+            ->assertJsonFragment([
+                'message' => 'Posisi ketua penguji pada ujian skripsi ini sudah terisi.',
+            ]);
+
+        // 2. Update penguji1 (ketua) tanpa mengubah peran -> Sukses (200)
+        $resSameKetua = $this->actingAs($admin['user'], 'sanctum')->putJson('/api/dosen-penguji-skripsi/' . $penguji1->id_penguji_skripsi, [
+            'peran' => 'ketua',
+        ]);
+        $resSameKetua->assertStatus(200);
+
+        // 3. Update penguji2 tetap sebagai anggota -> Sukses (200)
+        $resSameAnggota = $this->actingAs($admin['user'], 'sanctum')->putJson('/api/dosen-penguji-skripsi/' . $penguji2->id_penguji_skripsi, [
+            'peran' => 'anggota',
+        ]);
+        $resSameAnggota->assertStatus(200);
+    }
 }

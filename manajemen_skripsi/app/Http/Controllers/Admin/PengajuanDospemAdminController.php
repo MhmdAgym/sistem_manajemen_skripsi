@@ -9,8 +9,12 @@ use App\Models\PengajuanDospem;
 use App\Models\PengajuanDospemLog;
 use App\Models\PengajuanJudul;
 use App\Models\PengajuanJudulLog;
+use App\Models\PenugasanPembimbing;
+use App\Models\PenugasanPembimbingLog;
 use App\Models\Skripsi;
 use App\Services\AcademicNotificationDispatcher;
+use App\Services\BchatProvisioningOutboxService;
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -183,6 +187,16 @@ class PengajuanDospemAdminController extends Controller
                     throw new \DomainException('Skripsi ini sudah memiliki Dosen Pembimbing yang terdaftar pada sistem.', 409);
                 }
 
+                $slotTerisi = PenugasanPembimbing::where('skripsi_id', $lockedSkripsi->id_skripsi)
+                    ->where('tahap', 'proposal')
+                    ->where('pembimbing_ke', 1)
+                    ->where('status_penugasan', 'AKTIF')
+                    ->exists();
+
+                if ($slotTerisi) {
+                    throw new \DomainException('Skripsi ini sudah memiliki Dosen Pembimbing Proposal aktif pada sistem.', 409);
+                }
+
                 // 5. Ambil data dosen terpilih
                 $dosen = Dosen::find($validated['id_dosen']);
                 if (!$dosen) {
@@ -199,13 +213,46 @@ class PengajuanDospemAdminController extends Controller
                     'catatan_admin' => $catatanAdmin,
                 ]);
 
-                // 7. Simpan record penugasan operasional ke tabel dosen_pembimbing
+                // 7. Simpan record penugasan operasional ke tabel dosen_pembimbing (skema kompatibel legacy)
                 DosenPembimbing::create([
                     'id_skripsi' => $lockedSkripsi->id_skripsi,
                     'id_dosen'   => $dosen->id_dosen,
                 ]);
 
-                // 8. Tulis log audit penetapan append-only
+                // 8. Simpan penugasan pembimbing resmi kanonis (tahap proposal)
+                $penugasan = PenugasanPembimbing::create([
+                    'skripsi_id'          => $lockedSkripsi->id_skripsi,
+                    'tahap'               => 'proposal',
+                    'pembimbing_ke'       => 1,
+                    'dosen_id'            => $dosen->id_dosen,
+                    'sk_dokumen_id'       => null,
+                    'pengajuan_dospem_id' => $lockedPengajuan->id,
+                    'status_penugasan'    => 'AKTIF',
+                    'tanggal_mulai'       => Carbon::now('UTC')->toDateString(),
+                    'tanggal_selesai'     => null,
+                    'digantikan_oleh_id'  => null,
+                ]);
+
+                // 9. Catat riwayat audit mutasi penugasan pembimbing kanonis
+                PenugasanPembimbingLog::create([
+                    'penugasan_pembimbing_id' => $penugasan->id,
+                    'user_id'                 => $user->id,
+                    'aktor_nama'              => $user->name,
+                    'aktor_role'              => 'admin',
+                    'tindakan'                => 'PENETAPAN_AWAL',
+                    'status_sebelum'          => null,
+                    'status_sesudah'          => 'AKTIF',
+                    'snapshot_dosen_lama_id'  => null,
+                    'snapshot_dosen_baru_id'  => $dosen->id_dosen,
+                    'catatan'                 => $catatanAdmin ?? 'Penetapan Dosen Pembimbing Proposal resmi.',
+                    'created_at'              => Carbon::now('UTC'),
+                ]);
+
+                // 10. Tulis event transactional outbox provisioning room proposal E2EE
+                app(BchatProvisioningOutboxService::class)
+                    ->recordProposalProvisioningEvent($penugasan);
+
+                // 11. Tulis log audit penetapan pengajuan dospem append-only
                 $log = PengajuanDospemLog::create([
                     'pengajuan_dospem_id' => $lockedPengajuan->id,
                     'user_id'             => $user->id,
@@ -221,6 +268,7 @@ class PengajuanDospemAdminController extends Controller
                     'snapshot_dosen_nama' => $dosen->nama_dosen,
                 ]);
 
+                // 12. Dispatch notifikasi akademik (dieksekusi otomatis via afterCommit)
                 app(AcademicNotificationDispatcher::class)
                     ->dispatchEvt10AdminTetapkanDospem($lockedPengajuan, $log, $dosen);
 

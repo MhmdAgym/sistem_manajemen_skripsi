@@ -70,7 +70,11 @@ class DosenController extends Controller
 
         $validatedData = $request->validate([
             'NIDN'          => 'required|string|max:10|unique:dosen,NIDN',
-            'user_id'       => 'required|exists:users,id',
+            'user_id'       => [
+                'required',
+                Rule::exists('users', 'id')->where('role', 'dosen'),
+                Rule::unique('dosen', 'user_id'),
+            ],
             'nama_dosen'    => 'required|string|max:255',
             'no_handphone'  => 'nullable|string|max:20',
             'jenis_kelamin' => 'nullable|string|in:Laki-laki,Perempuan',

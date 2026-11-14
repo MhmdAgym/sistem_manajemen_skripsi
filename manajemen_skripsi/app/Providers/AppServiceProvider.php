@@ -7,7 +7,12 @@ use Illuminate\Auth\Notifications\VerifyEmail;
 use Illuminate\Database\Events\ConnectionEstablished;
 use Illuminate\Notifications\Messages\MailMessage;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\ServiceProvider;
+use App\Models\SkSkripsiDokumen;
+use App\Models\PenugasanPembimbing;
+use App\Policies\SkSkripsiDokumenPolicy;
+use App\Policies\PenugasanPembimbingPolicy;
 
 class AppServiceProvider extends ServiceProvider
 {
@@ -109,6 +114,80 @@ class AppServiceProvider extends ServiceProvider
             }
 
             // ========================================================
+            // JALUR 3: KONEKSI LINGKUNGAN UAT (STRICT FAIL-CLOSED)
+            // ========================================================
+            if (app()->environment('uat')) {
+                // 1. Validasi Driver
+                if ($driver !== 'mysql' && $driver !== 'mariadb') {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: Database driver [{$driver}] is not allowed in UAT mode."
+                    );
+                }
+
+                // 2. Validasi Target Database Klien
+                if ($database !== 'manajemen_skripsi_uat') {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: UAT environment attempted connection to unauthorized database [{$database}]. Only 'manajemen_skripsi_uat' is permitted."
+                    );
+                }
+
+                // 3. Larang User Testing
+                if ($username === 'unuha_tester') {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: Testing user [unuha_tester] is prohibited in UAT mode."
+                    );
+                }
+
+                // 4. Validasi Host dan Port
+                if ($host !== '127.0.0.1' && $host !== 'localhost') {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: UAT attempted connection to unauthorized host [{$host}]. Only local loopback (127.0.0.1/localhost) is permitted."
+                    );
+                }
+
+                if ($port !== '3306') {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: UAT attempted connection to unauthorized port [{$port}]. Only port 3306 is permitted."
+                    );
+                }
+
+                // 5. Runtime Probe: Validasi Sesi Server Aktif
+                try {
+                    $session = $connection->selectOne("SELECT DATABASE() as active_db, CURRENT_USER() as auth_user");
+                } catch (\Throwable $e) {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: Failed to verify MySQL session identity in UAT: " . $e->getMessage()
+                    );
+                }
+
+                if (!$session || empty($session->active_db) || empty($session->auth_user)) {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: Server session identity returned empty or null values in UAT."
+                    );
+                }
+
+                if ($session->active_db !== 'manajemen_skripsi_uat') {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: Active server database is [{$session->active_db}]. Expected 'manajemen_skripsi_uat'."
+                    );
+                }
+
+                if ($session->active_db === 'manajemen_skripsi' || $session->active_db === 'manajemen_skripsi_test') {
+                    throw new \RuntimeException(
+                        "FATAL SECURITY VIOLATION: Attempted connection to protected database [{$session->active_db}] during UAT."
+                    );
+                }
+
+                if (str_starts_with((string) $session->auth_user, 'unuha_tester@')) {
+                    throw new \RuntimeException(
+                        "SECURITY VIOLATION: Authenticated MySQL user is [{$session->auth_user}]. Testing user prohibited in UAT."
+                    );
+                }
+
+                return;
+            }
+
+            // ========================================================
             // JALUR 2: KONEKSI OPERASIONAL (ANTI-KONTAMINASI SILANG)
             // ========================================================
             if ($database === 'manajemen_skripsi_test') {
@@ -120,6 +199,12 @@ class AppServiceProvider extends ServiceProvider
             if ($username === 'unuha_tester') {
                 throw new \RuntimeException(
                     "SECURITY VIOLATION: Operational application attempted connection using test user [unuha_tester]."
+                );
+            }
+
+            if ($database === 'manajemen_skripsi_uat') {
+                throw new \RuntimeException(
+                    "SECURITY VIOLATION: Operational application attempted connection to UAT database [manajemen_skripsi_uat]."
                 );
             }
         };
@@ -161,5 +246,9 @@ class AppServiceProvider extends ServiceProvider
                     'url' => $url,
                 ]);
         });
+
+        // Registrasi eksplisit Policy Modul Akademik B-CHAT
+        Gate::policy(SkSkripsiDokumen::class, SkSkripsiDokumenPolicy::class);
+        Gate::policy(PenugasanPembimbing::class, PenugasanPembimbingPolicy::class);
     }
 }

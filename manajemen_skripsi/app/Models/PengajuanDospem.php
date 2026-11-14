@@ -63,4 +63,20 @@ class PengajuanDospem extends Model
     {
         return $this->hasOne(PengajuanDospemLog::class, 'pengajuan_dospem_id', 'id')->latestOfMany();
     }
+
+    /**
+     * Relasi ke penugasan pembimbing yang diterbitkan dari pengajuan dospem ini (FK: pengajuan_dospem_id -> pengajuan_dospem.id)
+     */
+    public function penugasanPembimbing(): HasMany
+    {
+        return $this->hasMany(PenugasanPembimbing::class, 'pengajuan_dospem_id', 'id');
+    }
+
+    /**
+     * Relasi ke penugasan pembimbing berstatus aktif
+     */
+    public function penugasanPembimbingAktif(): HasOne
+    {
+        return $this->hasOne(PenugasanPembimbing::class, 'pengajuan_dospem_id', 'id')->where('status_penugasan', 'AKTIF');
+    }
 }
