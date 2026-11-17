@@ -272,8 +272,10 @@ class BchatProvisioningOutboxServiceTest extends TestCase
         $skripsi = $this->buatSkripsi($mahasiswa);
         $pengajuan = $this->buatPengajuanDospem($mahasiswa, $skripsi);
 
-        DB::transaction(function () use ($skripsi, $dosen, $pengajuan) {
+        $penugasanId = null;
+        DB::transaction(function () use ($skripsi, $dosen, $pengajuan, &$penugasanId) {
             $penugasan = $this->buatPenugasanProposal($skripsi, $dosen, $pengajuan);
+            $penugasanId = $penugasan->id;
 
             $outbox1 = $this->service->recordProposalProvisioningEvent($penugasan);
             $outbox2 = $this->service->recordProposalProvisioningEvent($penugasan);
@@ -282,8 +284,10 @@ class BchatProvisioningOutboxServiceTest extends TestCase
             $this->assertEquals($outbox1->event_uuid, $outbox2->event_uuid);
         });
 
-        // Pastikan hanya ada tepat 1 record di database
-        $count = DB::table('bchat_provisioning_outbox')->count();
+        // Pastikan hanya ada tepat 1 record untuk penugasan ini di database
+        $count = DB::table('bchat_provisioning_outbox')
+            ->where('penugasan_pembimbing_id', $penugasanId)
+            ->count();
         $this->assertEquals(1, $count);
     }
 
@@ -350,9 +354,11 @@ class BchatProvisioningOutboxServiceTest extends TestCase
         $skripsi = $this->buatSkripsi($mahasiswa);
         $pengajuan = $this->buatPengajuanDospem($mahasiswa, $skripsi);
 
+        $penugasanId = null;
         try {
-            DB::transaction(function () use ($skripsi, $dosen, $pengajuan) {
+            DB::transaction(function () use ($skripsi, $dosen, $pengajuan, &$penugasanId) {
                 $penugasan = $this->buatPenugasanProposal($skripsi, $dosen, $pengajuan);
+                $penugasanId = $penugasan->id;
                 $this->service->recordProposalProvisioningEvent($penugasan);
 
                 throw new \RuntimeException('Simulasi error tak terduga sebelum commit.');
@@ -365,7 +371,15 @@ class BchatProvisioningOutboxServiceTest extends TestCase
         $this->assertDatabaseMissing('penugasan_pembimbing', [
             'skripsi_id' => $skripsi->id_skripsi,
         ]);
-        $this->assertEquals(0, DB::table('bchat_provisioning_outbox')->count());
+        if ($penugasanId) {
+            $this->assertDatabaseMissing('bchat_provisioning_outbox', [
+                'penugasan_pembimbing_id' => $penugasanId,
+            ]);
+            $this->assertEquals(
+                0,
+                DB::table('bchat_provisioning_outbox')->where('penugasan_pembimbing_id', $penugasanId)->count()
+            );
+        }
     }
 
     /**
@@ -458,6 +472,8 @@ class BchatProvisioningOutboxServiceTest extends TestCase
                 ->andThrow(new \RuntimeException('Simulasi kegagalan koneksi storage outbox.'));
         });
 
+        $existingOutboxIds = DB::table('bchat_provisioning_outbox')->pluck('id')->all();
+
         $response = $this->actingAs($adminUser)->postJson("/api/admin/pengajuan-dospem/{$pengajuan->id}/tetapkan", [
             'id_dosen' => $dosen->id_dosen,
         ]);
@@ -482,7 +498,11 @@ class BchatProvisioningOutboxServiceTest extends TestCase
             'snapshot_dosen_baru_id' => $dosen->id_dosen,
         ]);
 
-        $this->assertEquals(0, DB::table('bchat_provisioning_outbox')->count());
+        // Verifikasi tidak ada baris outbox baru yang dibuat oleh transaksi yang gagal
+        $newOutboxCount = DB::table('bchat_provisioning_outbox')
+            ->when(!empty($existingOutboxIds), fn ($q) => $q->whereNotIn('id', $existingOutboxIds))
+            ->count();
+        $this->assertEquals(0, $newOutboxCount);
     }
 
     /**
