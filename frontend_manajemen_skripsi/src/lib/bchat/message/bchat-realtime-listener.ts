@@ -31,8 +31,11 @@ import {
   reconcileInboundMessages,
   getGroupStateCursor,
   updateGroupStateCursor,
+  computeContiguousResolvedSequence,
+  isHistoryTombstonePlaintext,
   type DecryptedMessageItem,
   type BchatInboundErrorCategory,
+  type UnresolvedSequenceDetail,
 } from '@/lib/bchat/message/bchat-message-coordinator';
 
 // -----------------------------------------------------------------------------
@@ -54,19 +57,35 @@ export type SubscriptionState =
   | 'ERROR'
   | 'UNSUBSCRIBED';
 
+export interface BchatRecoveryState {
+  isRecoveryRequired: boolean;
+  failedSequence: number | null;
+  unresolvedSequences: UnresolvedSequenceDetail[];
+  sequenceGaps: number[];
+  contiguousSequence: number;
+  highestObservedSequence: number;
+  detail: string | null;
+}
+
 export interface BchatRealtimeSubscriberOptions {
   roomUuid: string;
   currentUserId: number;
   deviceUuid: string;
   workerRpc: BchatWorkerClient;
   fencing: FencingRpcInput;
+  /** Contiguous verified cursor awal (seluruh 1..initialSequence sudah sah tanpa celah). */
   initialSequence?: number;
+  /** Daftar sequence individual valid yang sudah tersimpan lokal (termasuk di atas celah). */
+  knownProcessedSequences?: Iterable<number>;
+  /** Daftar sequence yang sudah diketahui gagal (tombstone) dari penyimpanan lokal. */
+  knownUnresolvedSequences?: Iterable<UnresolvedSequenceDetail>;
   batchLimit?: number;
   onSubscriptionStatusChange?: (status: SubscriptionState, detail?: string) => void;
   onSignalReceived?: (signal: BchatMessageSentSignal, isDuplicate: boolean) => void;
   onMessageDecrypted?: (message: DecryptedMessageItem) => void;
   onReconciled?: (reconciledCount: number, latestSequence: number) => void;
   onRecoveryRequired?: (failedSequence: number, error: string, category?: BchatInboundErrorCategory) => void;
+  onRecoveryStateChange?: (state: BchatRecoveryState) => void;
   onError?: (error: Error) => void;
 }
 
@@ -128,8 +147,15 @@ export function validateMessageSentSignal(data: unknown): BchatMessageSentSignal
 export class BchatRealtimeSubscriber {
   private readonly options: BchatRealtimeSubscriberOptions;
   private echoChannel: any = null;
-  private latestKnownSequence: number;
+  /** Contiguous verified cursor: seluruh sequence 1..contiguousSequence telah selesai sah tanpa celah. */
+  private contiguousSequence: number;
+  /** Sequence tertinggi yang pernah diamati dari server/WS/outbound untuk mendeteksi celah secara eksplisit. */
+  private highestObservedSequence: number;
+  /** Himpunan sequence individual yang benar-benar telah diproses secara valid (inbound/outbound). */
   private readonly processedSequences: Set<number> = new Set();
+  /** Peta sequence yang gagal secara kriptografis/integritas dan membutuhkan tindakan recovery. */
+  private readonly unresolvedSequences: Map<number, UnresolvedSequenceDetail> = new Map();
+  private readonly hasExplicitLocalKnowledge: boolean;
   private isReconciling: boolean = false;
   private hasPendingReconcileRequest: boolean = false;
   private isRecoveryRequired: boolean = false;
@@ -139,11 +165,60 @@ export class BchatRealtimeSubscriber {
 
   constructor(options: BchatRealtimeSubscriberOptions) {
     this.options = options;
-    this.latestKnownSequence = options.initialSequence ?? 0;
-    if (this.latestKnownSequence > 0) {
-      for (let s = 1; s <= this.latestKnownSequence; s++) {
+    const baseInitial =
+      typeof options.initialSequence === 'number' && options.initialSequence > 0
+        ? options.initialSequence
+        : 0;
+    this.contiguousSequence = baseInitial;
+    this.highestObservedSequence = baseInitial;
+    this.hasExplicitLocalKnowledge =
+      options.knownProcessedSequences !== undefined ||
+      options.knownUnresolvedSequences !== undefined;
+
+    if (baseInitial > 0) {
+      for (let s = 1; s <= baseInitial; s++) {
         this.processedSequences.add(s);
       }
+    }
+
+    if (options.knownProcessedSequences) {
+      for (const seq of Array.from(options.knownProcessedSequences)) {
+        if (typeof seq === 'number' && Number.isInteger(seq) && seq > 0) {
+          this.processedSequences.add(seq);
+          this.highestObservedSequence = Math.max(this.highestObservedSequence, seq);
+        }
+      }
+    }
+
+    if (options.knownUnresolvedSequences) {
+      for (const detail of Array.from(options.knownUnresolvedSequences)) {
+        if (
+          detail &&
+          typeof detail.server_sequence === 'number' &&
+          Number.isInteger(detail.server_sequence) &&
+          detail.server_sequence > 0
+        ) {
+          this.processedSequences.delete(detail.server_sequence);
+          this.unresolvedSequences.set(detail.server_sequence, detail);
+          this.highestObservedSequence = Math.max(
+            this.highestObservedSequence,
+            detail.server_sequence
+          );
+        }
+      }
+    }
+
+    this.contiguousSequence = computeContiguousResolvedSequence(
+      this.processedSequences,
+      this.contiguousSequence
+    );
+
+    if (this.unresolvedSequences.size > 0) {
+      const sortedUnresolved = this.getUnresolvedSequences();
+      const first = sortedUnresolved[0];
+      this.isRecoveryRequired = sortedUnresolved.some((u) => u.requiresRecovery);
+      this.lastFailedSequence = first?.server_sequence ?? null;
+      this.recoveryErrorDetail = first?.error ?? null;
     }
   }
 
@@ -151,28 +226,160 @@ export class BchatRealtimeSubscriber {
     return this.subscriptionState;
   }
 
+  /** Mengembalikan contiguous verified cursor (tidak pernah melompati celah/pesan gagal). */
   public getLatestSequence(): number {
-    return this.latestKnownSequence;
+    return this.contiguousSequence;
+  }
+
+  public getContiguousSequence(): number {
+    return this.contiguousSequence;
+  }
+
+  public getHighestObservedSequence(): number {
+    return this.highestObservedSequence;
   }
 
   public getProcessedSequences(): number[] {
     return Array.from(this.processedSequences).sort((a, b) => a - b);
   }
 
+  public getUnresolvedSequences(): UnresolvedSequenceDetail[] {
+    return Array.from(this.unresolvedSequences.values()).sort(
+      (a, b) => a.server_sequence - b.server_sequence
+    );
+  }
+
   /**
-   * Menandai sequence tertentu telah selesai diproses oleh klien (misalnya pesan outbound sendiri)
-   * agar tidak direkonsiliasi ulang oleh subscriber.
+   * Mendeteksi secara eksplisit seluruh sequence gap di rentang (contiguousSequence + 1 .. highestObservedSequence)
+   * yang belum berhasil diproses (mencakup pesan yang belum diterima maupun pesan gagal/unresolved).
+   */
+  public getSequenceGaps(): number[] {
+    const gaps: number[] = [];
+    for (let s = this.contiguousSequence + 1; s <= this.highestObservedSequence; s++) {
+      if (!this.processedSequences.has(s)) {
+        gaps.push(s);
+      }
+    }
+    return gaps;
+  }
+
+  public getRecoveryState(): BchatRecoveryState {
+    return {
+      isRecoveryRequired: this.isRecoveryRequired,
+      failedSequence: this.lastFailedSequence,
+      unresolvedSequences: this.getUnresolvedSequences(),
+      sequenceGaps: this.getSequenceGaps(),
+      contiguousSequence: this.contiguousSequence,
+      highestObservedSequence: this.highestObservedSequence,
+      detail: this.recoveryErrorDetail,
+    };
+  }
+
+  /**
+   * Menandai sequence tertentu (misalnya pesan outbound sendiri) telah selesai diproses oleh klien
+   * agar tidak direkonsiliasi/didekripsi ulang.
+   *
+   * INVARIAN KRITIS:
+   * Outbound message TIDAK BOLEH memajukan contiguousSequence atau persistent cursor melewati
+   * inbound sequence gap atau pesan yang belum terselesaikan!
    */
   public markSequenceProcessed(sequence: number): void {
-    if (typeof sequence === 'number' && sequence > 0) {
-      this.processedSequences.add(sequence);
-      this.latestKnownSequence = Math.max(this.latestKnownSequence, sequence);
+    if (typeof sequence !== 'number' || !Number.isInteger(sequence) || sequence <= 0) {
+      return;
     }
+
+    this.unresolvedSequences.delete(sequence);
+    this.processedSequences.add(sequence);
+    this.highestObservedSequence = Math.max(this.highestObservedSequence, sequence);
+
+    const prevContiguous = this.contiguousSequence;
+    this.contiguousSequence = computeContiguousResolvedSequence(
+      this.processedSequences,
+      this.contiguousSequence
+    );
+
+    if (this.contiguousSequence > prevContiguous) {
+      updateGroupStateCursor({
+        deviceUuid: this.options.deviceUuid,
+        roomUuid: this.options.roomUuid,
+        sequence: this.contiguousSequence,
+        fencing: {
+          ownerToken: this.options.fencing.ownerToken,
+          generation: this.options.fencing.generation,
+        },
+      }).catch((_err) => {
+        // noop: safe fail
+      });
+    }
+
+    // Jika outbound baru berada di atas contiguousSequence + 1 (ada celah inbound tertunda),
+    // picu rekonsiliasi REST secara aman agar pesan inbound yang tertinggal segera diproses.
+    if (
+      sequence > this.contiguousSequence + 1 &&
+      this.subscriptionState === 'SUBSCRIBED' &&
+      !this.isReconciling
+    ) {
+      this.reconcileFromRest().catch((_err) => {});
+    }
+
+    this.emitRecoveryState();
+  }
+
+  /**
+   * Menyinkronkan state subscriber dari daftar riwayat lokal yang baru diperbarui
+   * (misalnya pasca History Transfer yang sah), menutup celah yang sudah pulih,
+   * dan memajukan contiguous cursor secara atomik jika tidak ada lagi celah di bawahnya.
+   */
+  public async syncFromLocalHistory(items: DecryptedMessageItem[]): Promise<void> {
+    for (const item of items) {
+      const seq = item.server_sequence;
+      if (!Number.isInteger(seq) || seq <= 0) continue;
+      this.highestObservedSequence = Math.max(this.highestObservedSequence, seq);
+
+      if (isHistoryTombstonePlaintext(item.plaintext)) {
+        if (!this.processedSequences.has(seq) && !this.unresolvedSequences.has(seq)) {
+          this.unresolvedSequences.set(seq, {
+            server_sequence: seq,
+            message_uuid: item.message_uuid,
+            errorCategory:
+              item.plaintext === '[Integritas Gagal]' || item.plaintext === '[Format Corrupt]'
+                ? 'PAYLOAD_INTEGRITY_ERROR'
+                : 'MLS_CRYPTO_ERROR',
+            error: item.error || `Pesan urutan #${seq} belum dapat didekripsi secara kriptografis.`,
+            requiresRecovery: true,
+          });
+        }
+      } else {
+        this.unresolvedSequences.delete(seq);
+        this.processedSequences.add(seq);
+      }
+    }
+
+    const prevContiguous = this.contiguousSequence;
+    this.contiguousSequence = computeContiguousResolvedSequence(
+      this.processedSequences,
+      this.contiguousSequence
+    );
+
+    if (this.contiguousSequence > prevContiguous) {
+      await updateGroupStateCursor({
+        deviceUuid: this.options.deviceUuid,
+        roomUuid: this.options.roomUuid,
+        sequence: this.contiguousSequence,
+        fencing: {
+          ownerToken: this.options.fencing.ownerToken,
+          generation: this.options.fencing.generation,
+        },
+      }).catch(() => {});
+    }
+
+    this.refreshRecoveryFlags();
+    this.emitRecoveryState();
   }
 
   /**
    * Menginisialisasi kursor dari IndexedDB GroupState secara asinkron.
-   * Digunakan untuk memastikan kursor lokal sinkron dengan state terenkripsi pada disk.
+   * Tidak akan melompati sequence unresolved atau celah yang sudah terdeteksi dari riwayat lokal.
    */
   public async initializeFromPersistence(): Promise<number> {
     try {
@@ -180,15 +387,35 @@ export class BchatRealtimeSubscriber {
         this.options.deviceUuid,
         this.options.roomUuid
       );
-      if (persistentCursor > this.latestKnownSequence) {
-        this.latestKnownSequence = persistentCursor;
-        for (let s = 1; s <= persistentCursor; s++) {
-          this.processedSequences.add(s);
+      if (persistentCursor > this.contiguousSequence) {
+        const minUnresolved = this.getUnresolvedSequences()[0]?.server_sequence;
+        const hasBlockingUnresolved =
+          minUnresolved !== undefined && minUnresolved <= persistentCursor;
+
+        // Jika konstruktor membawa peta riwayat lokal secara eksplisit dan ada gap/unresolved
+        // di bawah persistentCursor (mis. akibat cursor jump sebelum perbaikan), jangan lompati gap!
+        if (!hasBlockingUnresolved && !this.hasExplicitLocalKnowledge) {
+          this.contiguousSequence = persistentCursor;
+          this.highestObservedSequence = Math.max(this.highestObservedSequence, persistentCursor);
+          for (let s = 1; s <= persistentCursor; s++) {
+            this.processedSequences.add(s);
+          }
+        } else if (!hasBlockingUnresolved && this.hasExplicitLocalKnowledge) {
+          // Hanya maju sejauh benar-benar tidak ada celah pada knownProcessedSequences
+          let safeTarget = this.contiguousSequence;
+          while (safeTarget < persistentCursor && this.processedSequences.has(safeTarget + 1)) {
+            safeTarget++;
+          }
+          this.contiguousSequence = safeTarget;
+          this.highestObservedSequence = Math.max(this.highestObservedSequence, persistentCursor);
+        } else {
+          this.highestObservedSequence = Math.max(this.highestObservedSequence, persistentCursor);
         }
       }
-      return this.latestKnownSequence;
+      this.emitRecoveryState();
+      return this.contiguousSequence;
     } catch (_err) {
-      return this.latestKnownSequence;
+      return this.contiguousSequence;
     }
   }
 
@@ -204,7 +431,7 @@ export class BchatRealtimeSubscriber {
       return;
     }
 
-    const echo = getEcho();
+    const echo = getEcho(this.options.deviceUuid);
     if (!echo) {
       this.updateStatus('ERROR', 'Instance Laravel Echo tidak tersedia.');
       this.options.onError?.(new Error('Instance Laravel Echo tidak tersedia.'));
@@ -253,6 +480,11 @@ export class BchatRealtimeSubscriber {
 
   /**
    * Menangani sinyal yang masuk dari WebSocket Reverb secara defensif.
+   *
+   * INVARIAN KRITIS:
+   * - Sinyal baru (mis. Seq #13) TIDAK BOLEH dibuang diam-diam hanya karena sequence lebih lama
+   *   (mis. Seq #11) sedang dalam status recovery!
+   * - Self-message echo TIDAK BOLEH memajukan persistent cursor melampaui celah inbound.
    */
   public handleSignal(rawPayload: unknown): void {
     if (this.subscriptionState === 'UNSUBSCRIBED') {
@@ -269,60 +501,69 @@ export class BchatRealtimeSubscriber {
       return;
     }
 
+    this.highestObservedSequence = Math.max(
+      this.highestObservedSequence,
+      signal.server_sequence
+    );
+
     // Deteksi duplikasi event:
+    // Sudah diproses secara valid, berada di <= contiguousSequence, atau merupakan sinyal ulang
+    // untuk sequence gagal permanen yang sudah tercatat di unresolvedSequences.
     const isDuplicate =
       this.processedSequences.has(signal.server_sequence) ||
-      signal.server_sequence <= this.latestKnownSequence;
+      signal.server_sequence <= this.contiguousSequence ||
+      this.unresolvedSequences.has(signal.server_sequence);
 
     this.options.onSignalReceived?.(signal, isDuplicate);
 
     if (isDuplicate) {
-      // Event duplikat: cegah double-fetch dan cegah re-enkripsi/dekripsi
+      // Jika ini self-message yang sudah diproses lokal, pastikan contiguous cursor ikut tersinkron
+      // HANYA bila tidak ada celah di bawahnya (TIDAK melompati gap!).
+      if (
+        signal.sender_id === this.options.currentUserId &&
+        this.processedSequences.has(signal.server_sequence)
+      ) {
+        const prevContiguous = this.contiguousSequence;
+        this.contiguousSequence = computeContiguousResolvedSequence(
+          this.processedSequences,
+          this.contiguousSequence
+        );
+        if (this.contiguousSequence > prevContiguous) {
+          updateGroupStateCursor({
+            deviceUuid: this.options.deviceUuid,
+            roomUuid: this.options.roomUuid,
+            sequence: this.contiguousSequence,
+            fencing: {
+              ownerToken: this.options.fencing.ownerToken,
+              generation: this.options.fencing.generation,
+            },
+          }).catch((_err) => {
+            // noop: safe fail
+          });
+        }
+      }
       return;
     }
 
-    // Jika sedang dalam status membutuhkan pemulihan permanen, jangan trigger loop rekonsiliasi tak terbatas
-    if (this.isRecoveryRequired) {
-      return;
-    }
-
-    // Jika pesan dikirim oleh diri sendiri: perbarui kursor tanpa memanggil Worker
-    if (signal.sender_id === this.options.currentUserId) {
-      this.processedSequences.add(signal.server_sequence);
-      this.latestKnownSequence = Math.max(this.latestKnownSequence, signal.server_sequence);
-      updateGroupStateCursor({
-        deviceUuid: this.options.deviceUuid,
-        roomUuid: this.options.roomUuid,
-        sequence: signal.server_sequence,
-        fencing: {
-          ownerToken: this.options.fencing.ownerToken,
-          generation: this.options.fencing.generation,
-        },
-      }).catch((_err) => {
-        // noop: safe fail
-      });
-      return;
-    }
-
-    // Sinyal sah dari peer: Pemicu untuk rekonsiliasi REST via coordinator
-    this.reconcileFromRest().catch((_err) => {
+    // Sinyal sah baru (termasuk ketika pesan sebelumnya sedang dalam status recovery):
+    // Pemicu untuk rekonsiliasi REST via coordinator agar pesan baru tidak hilang!
+    this.reconcileFromRest({ retryUnresolved: false }).catch((_err) => {
       // Error ditangani melalui onError callback di dalam reconcileFromRest
     });
   }
 
   /**
    * Mengambil pesan baru dari REST API (Single Source of Truth) dan memproses dekripsi inbound melalui coordinator.
-   * Dilengkapi pencegahan race condition konkurensi dan pemutusan infinite loop saat permanent error.
+   * - Tetap memproses pesan baru meskipun ada sequence lama di unresolvedSequences.
+   * - Mempertahankan contiguousSequence agar tidak pernah melompati pesan gagal/celah.
+   * - Dilengkapi pencegahan race condition konkurensi (single-flight + pending catch-up).
    */
-  public async reconcileFromRest(): Promise<number> {
+  public async reconcileFromRest(options?: { retryUnresolved?: boolean }): Promise<number> {
     if (this.subscriptionState === 'UNSUBSCRIBED') {
       return 0;
     }
 
-    if (this.isRecoveryRequired) {
-      // Pemulihan permanen dibutuhkan: jangan picu infinite reconcile loop
-      return 0;
-    }
+    const retryUnresolved = Boolean(options?.retryUnresolved);
 
     if (this.isReconciling) {
       // Hindari konkurensi ganda, tandai request tertunda untuk dieksekusi setelah batch selesai
@@ -338,25 +579,31 @@ export class BchatRealtimeSubscriber {
         currentUserId: this.options.currentUserId,
         workerRpc: this.options.workerRpc,
         fencing: this.options.fencing,
-        afterSequence: this.latestKnownSequence,
+        afterSequence: this.contiguousSequence,
         batchLimit: this.options.batchLimit,
         processedSequences: this.processedSequences,
+        unresolvedSequences: this.unresolvedSequences,
+        retryUnresolved,
         onMessageDecrypted: this.options.onMessageDecrypted,
       });
 
-      this.latestKnownSequence = reconcileRes.latestSequence;
+      this.contiguousSequence = reconcileRes.contiguousSequence;
+      this.highestObservedSequence = Math.max(
+        this.highestObservedSequence,
+        reconcileRes.highestSeenSequence
+      );
+
+      this.refreshRecoveryFlags();
 
       if (reconcileRes.hasErrors) {
         const errorMsg =
           reconcileRes.error ||
-          `Rekonsiliasi terhenti pada sequence ${reconcileRes.failedSequence} karena kegagalan pemrosesan.`;
+          `Sebagian pesan membutuhkan pemulihan pada sequence #${reconcileRes.failedSequence}.`;
 
-        if (reconcileRes.requiresRecovery) {
-          this.isRecoveryRequired = true;
+        if (this.isRecoveryRequired) {
           this.recoveryErrorDetail = errorMsg;
-          this.lastFailedSequence = reconcileRes.failedSequence ?? null;
           this.options.onRecoveryRequired?.(
-            reconcileRes.failedSequence ?? 0,
+            this.lastFailedSequence ?? reconcileRes.failedSequence ?? 0,
             errorMsg,
             reconcileRes.errorCategory
           );
@@ -365,7 +612,8 @@ export class BchatRealtimeSubscriber {
         this.options.onError?.(new Error(errorMsg));
       }
 
-      this.options.onReconciled?.(reconcileRes.reconciledCount, this.latestKnownSequence);
+      this.emitRecoveryState();
+      this.options.onReconciled?.(reconcileRes.reconciledCount, this.contiguousSequence);
       return reconcileRes.reconciledCount;
     } catch (err: any) {
       const errorObj = err instanceof Error ? err : new Error(String(err));
@@ -373,27 +621,54 @@ export class BchatRealtimeSubscriber {
       return 0;
     } finally {
       this.isReconciling = false;
-      // Jika ada request sinyal yang tiba di tengah rekonsiliasi dan tidak terblokir permanent error,
-      // jalankan catch-up untuk request tertunda tersebut
+      // Jika ada request sinyal baru yang tiba di tengah rekonsiliasi, jalankan catch-up
+      // (termasuk saat ada unresolved sequence lama, karena pesan baru tetap harus diproses!)
       if (
         this.hasPendingReconcileRequest &&
-        !this.isRecoveryRequired &&
-        this.subscriptionState === 'SUBSCRIBED'
+        this.getSubscriptionState() !== 'UNSUBSCRIBED'
       ) {
         this.hasPendingReconcileRequest = false;
-        this.reconcileFromRest().catch((_err) => {});
+        this.reconcileFromRest({ retryUnresolved: false }).catch((_err) => {});
       }
     }
   }
 
   /**
-   * Mengatur ulang status pemulihan (misalnya setelah rekonsiliasi manual atau re-onboarding).
+   * Mekanisme recovery eksplisit: memeriksa ulang sequence yang gagal secara aman
+   * (memulihkan jika riwayat lokal sudah terisi atau ratchet valid tersedia, tanpa memaksakan decrypt ilegal).
+   */
+  public async retryRecovery(): Promise<number> {
+    return this.reconcileFromRest({ retryUnresolved: true });
+  }
+
+  /**
+   * Mengatur ulang status pemulihan (misalnya setelah re-onboarding atau sesi baru).
    */
   public resetRecoveryState(): void {
+    this.unresolvedSequences.clear();
     this.isRecoveryRequired = false;
     this.recoveryErrorDetail = null;
     this.lastFailedSequence = null;
     this.hasPendingReconcileRequest = false;
+    this.emitRecoveryState();
+  }
+
+  private refreshRecoveryFlags(): void {
+    const unresolvedList = this.getUnresolvedSequences();
+    const blocking = unresolvedList.filter((u) => u.requiresRecovery);
+    if (blocking.length > 0) {
+      this.isRecoveryRequired = true;
+      this.lastFailedSequence = blocking[0].server_sequence;
+      this.recoveryErrorDetail = blocking[0].error;
+    } else {
+      this.isRecoveryRequired = false;
+      this.lastFailedSequence = null;
+      this.recoveryErrorDetail = null;
+    }
+  }
+
+  private emitRecoveryState(): void {
+    this.options.onRecoveryStateChange?.(this.getRecoveryState());
   }
 
   public getIsRecoveryRequired(): boolean {
@@ -421,7 +696,7 @@ export class BchatRealtimeSubscriber {
       } catch (_err) {
         // noop
       }
-      const echo = getEcho();
+      const echo = getEcho(this.options.deviceUuid);
       if (echo) {
         try {
           echo.leave(`bchat.rooms.${this.options.roomUuid}`);
