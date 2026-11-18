@@ -6,6 +6,7 @@ namespace App\Http\Resources\Bchat;
 
 use App\Models\BchatRoom;
 use App\Models\BchatRoomMember;
+use App\Models\BchatRoomSession;
 use App\Models\BchatWelcomeChallenge;
 use App\Models\User;
 use Illuminate\Http\Request;
@@ -19,12 +20,18 @@ class BchatRoomDetailResource extends JsonResource
 {
     protected User $user;
     protected bool $hasActiveDevice;
+    protected bool $hasPartnerKeyPackage;
 
-    public function __construct(BchatRoom $resource, User $user, bool $hasActiveDevice = false)
-    {
+    public function __construct(
+        BchatRoom $resource,
+        User $user,
+        bool $hasActiveDevice = false,
+        bool $hasPartnerKeyPackage = false
+    ) {
         parent::__construct($resource);
         $this->user = $user;
         $this->hasActiveDevice = $hasActiveDevice;
+        $this->hasPartnerKeyPackage = $hasPartnerKeyPackage;
     }
 
     public function toArray(Request $request): array
@@ -39,11 +46,30 @@ class BchatRoomDetailResource extends JsonResource
         $penugasan = $room->penugasanPembimbing;
 
         // Ambil welcome challenge aktif jika ada dari relasi yang sudah di-load
-        $activeChallenge = $room->welcomeChallenges
-            ? $room->welcomeChallenges->firstWhere('operation_status', 'ACTIVE')
-            : null;
+        $activeChallenges = $room->welcomeChallenges
+            ? $room->welcomeChallenges->where('operation_status', 'ACTIVE')
+            : collect();
+
+        $activeChallenge = $activeChallenges->first();
+
+        $pendingSession = $room->relationLoaded('pendingSession')
+            ? $room->pendingSession
+            : $room->pendingSession()->first();
+
+        $pendingSessionChallenge = null;
+        if ($pendingSession !== null) {
+            $pendingSessionChallenge = $activeChallenges->first(
+                fn ($c) => (int) $c->session_id === (int) $pendingSession->id
+            );
+        }
 
         $actionHint = $this->resolveActionHint($room, $currentMember, $activeChallenge);
+        $pendingSessionActionHint = $this->resolvePendingSessionActionHint(
+            $room,
+            $currentMember,
+            $pendingSession,
+            $pendingSessionChallenge
+        );
 
         // Group ID Hash hanya boleh tampil setelah Welcome dipublikasikan atau room aktif
         $groupIdHash = null;
@@ -70,6 +96,7 @@ class BchatRoomDetailResource extends JsonResource
                 'name'              => $partnerMember?->user?->name ?? 'Mitra Bimbingan',
                 'role'              => $partnerMember ? (string) $partnerMember->role : null,
                 'has_active_device' => $this->hasActiveDevice,
+                'has_key_package'   => $this->hasPartnerKeyPackage,
                 'is_active'         => $partnerMember ? (bool) $partnerMember->is_active : false,
             ],
             'assignment'    => [
@@ -98,8 +125,66 @@ class BchatRoomDetailResource extends JsonResource
                 'start_sequence'    => (int) $room->activeSession->start_sequence,
                 'current_sequence'  => (int) $room->activeSession->current_sequence,
             ] : null,
+            'pending_session' => $pendingSession ? [
+                'session_uuid'           => (string) $pendingSession->session_uuid,
+                'generation_number'      => (int) $pendingSession->generation_number,
+                'status'                 => (string) $pendingSession->status,
+                'start_sequence'         => (int) $pendingSession->start_sequence,
+                'current_sequence'       => (int) $pendingSession->current_sequence,
+                'created_by_user_id'     => $pendingSession->created_by_user_id !== null ? (int) $pendingSession->created_by_user_id : null,
+                'has_active_challenge'   => $pendingSessionChallenge !== null,
+                'welcome_operation_uuid' => $pendingSessionChallenge?->welcome_operation_uuid,
+                'recipient_device_uuid'  => $pendingSessionChallenge?->recipientDevice?->device_uuid,
+                'expires_at'             => $pendingSessionChallenge?->expires_at?->toIso8601String(),
+                'action_required'        => $pendingSessionActionHint['action_required'],
+                'action_type'            => $pendingSessionActionHint['action_type'],
+            ] : null,
             'created_at'    => $room->created_at?->toIso8601String(),
             'updated_at'    => $room->updated_at?->toIso8601String(),
+        ];
+    }
+
+    /**
+     * Menentukan action hint untuk sesi generasi baru berstatus PENDING pada room ACTIVE.
+     */
+    private function resolvePendingSessionActionHint(
+        BchatRoom $room,
+        ?BchatRoomMember $currentMember,
+        ?BchatRoomSession $pendingSession,
+        ?BchatWelcomeChallenge $pendingChallenge
+    ): array {
+        if (!$currentMember || !$pendingSession || $room->status !== 'ACTIVE') {
+            return [
+                'action_required' => false,
+                'action_type'     => 'NONE',
+            ];
+        }
+
+        if ($pendingChallenge === null) {
+            if ($currentMember->role === 'mahasiswa') {
+                return [
+                    'action_required' => true,
+                    'action_type'     => 'PUBLISH_SESSION_WELCOME',
+                ];
+            }
+
+            return [
+                'action_required' => false,
+                'action_type'     => 'AWAIT_PARTNER_SESSION_WELCOME',
+            ];
+        }
+
+        $isRecipient = (int) $pendingChallenge->recipient_user_id === (int) $currentMember->user_id;
+        if ($isRecipient) {
+            return [
+                'action_required' => true,
+                'action_type'     => 'FETCH_SESSION_CHALLENGE_AND_ACK',
+            ];
+        }
+
+        return [
+            'action_required' => false,
+            'action_type'     => 'AWAIT_PARTNER_SESSION_ACK',
         ];
     }
 

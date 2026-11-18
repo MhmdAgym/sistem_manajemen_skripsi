@@ -21,6 +21,9 @@ use Throwable;
 
 class BchatRoomSessionService
 {
+    public const CHALLENGE_TTL_MINUTES = 5;
+    public const MAX_GENERATION = 4294967295;
+
     public function __construct(
         protected readonly BchatWelcomeAckVerificationService $verifier
     ) {
@@ -194,6 +197,28 @@ class BchatRoomSessionService
                     );
                 }
 
+                if (!$recipientDevice->is_trusted) {
+                    throw new BchatRoomSessionException(
+                        'Perangkat penerima belum berstatus tepercaya.',
+                        'DEVICE_NOT_TRUSTED',
+                        403
+                    );
+                }
+
+                // Cek operasi Welcome aktif untuk sesi/room ini (anti-duplikasi)
+                $existingActiveChallenge = BchatWelcomeChallenge::where('room_id', $room->id)
+                    ->where('operation_status', 'ACTIVE')
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($existingActiveChallenge) {
+                    throw new BchatRoomSessionException(
+                        'Operasi Welcome aktif sudah ada untuk sesi atau ruang obrolan ini.',
+                        'ACTIVE_WELCOME_OPERATION_EXISTS',
+                        409
+                    );
+                }
+
                 // Cek KeyPackage
                 $keyPackage = BchatKeyPackage::where('key_package_hash', $keyPackageHash)
                     ->lockForUpdate()
@@ -363,6 +388,14 @@ class BchatRoomSessionService
                     throw new BchatRoomSessionException('Perangkat penerima tidak aktif.', 'DEVICE_NOT_ACTIVE', 422);
                 }
 
+                if (!$lockedDevice->is_trusted) {
+                    throw new BchatRoomSessionException(
+                        'Perangkat penerima belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                        'DEVICE_NOT_TRUSTED',
+                        403
+                    );
+                }
+
                 // Verifikasi kriptografis Ed25519 Zero-Trust
                 $publicKeyBinary = BchatWelcomeAckVerificationService::hexOrBinToBinary($lockedDevice->public_key, 32);
                 if ($publicKeyBinary === null) {
@@ -427,9 +460,12 @@ class BchatRoomSessionService
                 $lockedSession->current_sequence = (int) $lockedRoom->current_sequence;
                 $lockedSession->save();
 
-                // Pastikan Room status ACTIVE
+                // Pastikan Room status ACTIVE dan group_id_hash sinkron
                 $lockedRoom->status = 'ACTIVE';
                 $lockedRoom->current_epoch = 1;
+                if (!empty($lockedChallenge->group_id_hash)) {
+                    $lockedRoom->group_id_hash = $lockedChallenge->group_id_hash;
+                }
                 $lockedRoom->save();
 
                 return $lockedSession;
@@ -498,46 +534,107 @@ class BchatRoomSessionService
 
         $this->authorizeSessionAction($recipient, $room);
 
-        $challenge = BchatWelcomeChallenge::where('session_id', $session->id)
-            ->where('operation_status', 'ACTIVE')
-            ->where('challenge_status', 'ISSUED')
-            ->first();
+        $requestDeviceUuid = request()->header('X-Bchat-Device-Uuid');
+        $cleanRequestDeviceUuid = ($requestDeviceUuid !== null && trim($requestDeviceUuid) !== '')
+            ? strtolower(trim($requestDeviceUuid))
+            : null;
 
-        if (!$challenge) {
-            throw new BchatRoomSessionException(
-                'Tantangan Welcome belum dipublikasikan atau sudah tidak aktif untuk sesi ini.',
-                'NO_ACTIVE_WELCOME_OPERATION',
-                404
-            );
-        }
+        return DB::transaction(function () use ($session, $room, $recipient, $cleanRequestDeviceUuid) {
+            $lockedSession = BchatRoomSession::where('id', $session->id)->lockForUpdate()->firstOrFail();
+            if ($lockedSession->status !== 'PENDING') {
+                throw new BchatRoomSessionException(
+                    'Tantangan Welcome hanya tersedia untuk sesi berstatus PENDING.',
+                    'INVALID_SESSION_STATUS',
+                    409
+                );
+            }
 
-        if ((int) $challenge->recipient_user_id !== (int) $recipient->id) {
-            throw new BchatRoomSessionException(
-                'Pengguna bukan penerima sah dari tantangan Welcome ini.',
-                'FORBIDDEN',
-                403
-            );
-        }
+            $lockedChallenge = BchatWelcomeChallenge::where('session_id', $lockedSession->id)
+                ->where('operation_status', 'ACTIVE')
+                ->where('challenge_status', 'ISSUED')
+                ->lockForUpdate()
+                ->first();
 
-        if (now()->greaterThan($challenge->expires_at)) {
-            throw new BchatRoomSessionException('Tantangan Welcome telah kedaluwarsa.', 'CHALLENGE_EXPIRED', 409);
-        }
+            if (!$lockedChallenge) {
+                throw new BchatRoomSessionException(
+                    'Tantangan Welcome belum dipublikasikan atau sudah tidak aktif untuk sesi ini.',
+                    'NO_ACTIVE_WELCOME_OPERATION',
+                    404
+                );
+            }
 
-        $remainingTtl = max(0, (int) now()->diffInSeconds($challenge->expires_at, false));
+            if ((int) $lockedChallenge->recipient_user_id !== (int) $recipient->id) {
+                throw new BchatRoomSessionException(
+                    'Pengguna bukan penerima sah dari tantangan Welcome ini.',
+                    'FORBIDDEN',
+                    403
+                );
+            }
 
-        return [
-            'welcome_operation_uuid' => $challenge->welcome_operation_uuid,
-            'session_uuid'           => $session->session_uuid,
-            'room_uuid'              => $room->room_uuid,
-            'welcome_message'        => base64_encode($challenge->welcome_message),
-            'group_id_hash'          => $challenge->group_id_hash,
-            'epoch'                  => (string) $challenge->epoch,
-            'challenge_uuid'         => $challenge->challenge_uuid,
-            'challenge_nonce'        => $challenge->challenge_nonce,
-            'challenge_generation'   => (int) $challenge->challenge_generation,
-            'expires_at'             => $challenge->expires_at?->toIso8601String(),
-            'ttl_remaining_seconds'  => $remainingTtl,
-        ];
+            $lockedDevice = BchatUserDevice::where('id', $lockedChallenge->recipient_device_id)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$lockedDevice || $lockedDevice->status !== 'ACTIVE' || (int) $lockedDevice->user_id !== (int) $recipient->id) {
+                throw new BchatRoomSessionException(
+                    'Perangkat penerima tantangan tidak aktif atau tidak valid.',
+                    'RECIPIENT_DEVICE_NOT_ACTIVE',
+                    422
+                );
+            }
+
+            if (!$lockedDevice->is_trusted) {
+                throw new BchatRoomSessionException(
+                    'Perangkat penerima belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                    'DEVICE_NOT_TRUSTED',
+                    403
+                );
+            }
+
+            if ($cleanRequestDeviceUuid !== null && strtolower((string) $lockedDevice->device_uuid) !== $cleanRequestDeviceUuid) {
+                throw new BchatRoomSessionException(
+                    'Operasi Welcome aktif ditujukan untuk perangkat yang berbeda.',
+                    'RECIPIENT_DEVICE_MISMATCH',
+                    403
+                );
+            }
+
+            // Rotasi challenge in-place jika telah kedaluwarsa (konsisten dengan BchatWelcomeService)
+            $now = now();
+            if ($lockedChallenge->expires_at && $now->greaterThan($lockedChallenge->expires_at)) {
+                if ((int) $lockedChallenge->challenge_generation >= self::MAX_GENERATION) {
+                    throw new BchatRoomSessionException(
+                        'Batas maksimum generasi tantangan tercapai (overflow guard).',
+                        'CHALLENGE_GENERATION_OVERFLOW',
+                        409
+                    );
+                }
+
+                $lockedChallenge->challenge_generation = (int) $lockedChallenge->challenge_generation + 1;
+                $lockedChallenge->challenge_uuid = (string) Str::uuid();
+                $lockedChallenge->challenge_nonce = bin2hex(random_bytes(32));
+                $lockedChallenge->challenge_status = 'ISSUED';
+                $lockedChallenge->expires_at = $now->copy()->addMinutes(self::CHALLENGE_TTL_MINUTES);
+                $lockedChallenge->save();
+            }
+
+            $remainingTtl = max(0, (int) now()->diffInSeconds($lockedChallenge->expires_at, false));
+
+            return [
+                'welcome_operation_uuid' => $lockedChallenge->welcome_operation_uuid,
+                'session_uuid'           => $lockedSession->session_uuid,
+                'room_uuid'              => $room->room_uuid,
+                'recipient_device_uuid'  => (string) $lockedDevice->device_uuid,
+                'welcome_message'        => base64_encode($lockedChallenge->welcome_message),
+                'group_id_hash'          => $lockedChallenge->group_id_hash,
+                'epoch'                  => (string) $lockedChallenge->epoch,
+                'challenge_uuid'         => $lockedChallenge->challenge_uuid,
+                'challenge_nonce'        => $lockedChallenge->challenge_nonce,
+                'challenge_generation'   => (int) $lockedChallenge->challenge_generation,
+                'expires_at'             => $lockedChallenge->expires_at?->toIso8601String(),
+                'ttl_remaining_seconds'  => $remainingTtl,
+            ];
+        }, 3);
     }
 
     /**

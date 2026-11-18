@@ -57,13 +57,22 @@ import {
   type FencingRpcInput,
 } from '@/lib/bchat/bchat-poc-rpc';
 import {
-  findActiveLocalDevice,
+  resolveActiveLocalDeviceForUser,
 } from '@/lib/bchat/device/bchat-device-registration';
 import {
   publishWelcomeHandshakeFlow,
   fetchChallengeAndAckHandshakeFlow,
+  initiateNextSessionHandshakeFlow,
+  completePendingSessionHandshakeFlow,
+  evaluateActiveRoomFoundState,
+  shouldPollIncomingHistoryTransfers,
   BchatHandshakeCoordinatorError,
 } from '@/lib/bchat/handshake/bchat-handshake-coordinator';
+import type {
+  GetRoomOutboxPayload,
+  GetRoomOutboxResult,
+  OutboxItemSummary,
+} from '@/lib/bchat/bchat-poc-types';
 import {
   sendApplicationMessageFlow,
   getGroupStateCursor,
@@ -221,8 +230,23 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     message: string;
   } | null>(null);
   const [isUnrecoverableActiveRoom, setIsUnrecoverableActiveRoom] = useState<boolean>(false);
+  const [unrecoverableMode, setUnrecoverableMode] = useState<
+    'NONE' | 'HAS_TRANSFER_SOURCE' | 'FIRST_DEVICE_INIT_MAHASISWA' | 'PENDING_WELCOME_RECOVERY'
+  >('NONE');
+  const [pendingWelcomeRecoveryInfo, setPendingWelcomeRecoveryInfo] = useState<{
+    sessionUuid: string;
+    generationNumber: number;
+    outboxStatus: string;
+  } | null>(null);
+  const [hasLocalGroupState, setHasLocalGroupState] = useState<boolean>(false);
+  const [hasTransferSourceDevices, setHasTransferSourceDevices] = useState<boolean>(false);
+  const [isInitiatingSession, setIsInitiatingSession] = useState<boolean>(false);
+  const [sessionInitError, setSessionInitError] = useState<string | null>(null);
+  const [showNewSessionConfirm, setShowNewSessionConfirm] = useState<boolean>(false);
   const handshakeInProgressRef = useRef<boolean>(false);
   const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const historyTransferPollingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const historyTransferInFlightRef = useRef<boolean>(false);
 
   // Referensi Lifecycle & Scroll
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -291,35 +315,67 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     setInitError(null);
     setWaitingState(null);
     setIsUnrecoverableActiveRoom(false);
+    setUnrecoverableMode('NONE');
+    setPendingWelcomeRecoveryInfo(null);
+    setHasLocalGroupState(false);
+    setSessionInitError(null);
+    setShowNewSessionConfirm(false);
 
     try {
-      // 1. Deteksi Perangkat Aktif Lokal di IndexedDB Keystore
-      const localDevice = await findActiveLocalDevice();
+      // 1. Ambil status perangkat akun login dari backend & resolusi perangkat lokal terikat user_id
+      let activeList: import('@/lib/bchat/api/bchat-api-types').BchatActiveDeviceInfo[] = [];
+      let backendStatusAvailable = false;
+      try {
+        const devStatusRes = await getDeviceStatus();
+        if (sessionIdRef.current !== currentSessionId) return;
+        activeList =
+          devStatusRes.data.active_devices ??
+          (devStatusRes.data.active_device ? [devStatusRes.data.active_device] : []);
+        backendStatusAvailable = true;
+      } catch {
+        // Jika backend tidak terjangkau sementara, gunakan fallback resolusi lokal berbasis user_id
+      }
+
+      const localDevice = await resolveActiveLocalDeviceForUser({
+        userId: currentUser.id,
+        backendActiveDeviceUuids: backendStatusAvailable
+          ? activeList.map((d) => d.device_uuid)
+          : undefined,
+      });
       if (sessionIdRef.current !== currentSessionId) return;
 
       if (!localDevice) {
-        // Perangkat belum terdaftar — alihkan ke onboarding gate
+        // Perangkat belum terdaftar untuk akun ini — alihkan ke onboarding gate
         setOnboardingGate('ONBOARDING');
         return;
       }
       const activeDevUuid = localDevice.deviceUuid;
       setDeviceUuid(activeDevUuid);
 
-      // 1b. Periksa status kepercayaan perangkat aktif di backend (Tahap 2A)
-      try {
-        const devStatusRes = await getDeviceStatus({ device_uuid: activeDevUuid });
-        if (sessionIdRef.current !== currentSessionId) return;
-        const matched = devStatusRes.data.active_devices?.find(
+      // 1b. Verifikasi kecocokan eksak & status kepercayaan perangkat aktif di backend (tanpa fallback UUID lain)
+      if (backendStatusAvailable) {
+        const matched = activeList.find(
           (d) => d.device_uuid.toLowerCase() === activeDevUuid.toLowerCase()
-        ) || devStatusRes.data.active_device;
+        );
 
-        if (matched && matched.is_trusted === false) {
+        if (!matched) {
+          setOnboardingGate('ONBOARDING');
+          return;
+        }
+
+        if (matched.is_trusted === false) {
           setOnboardingGate('PAIRING');
           return;
         }
-      } catch {
-        // Jika status perangkat tidak dapat dijangkau, biarkan alur berlanjut
       }
+
+      const eligibleSources = activeList.filter(
+        (d) =>
+          d.device_uuid.toLowerCase() !== activeDevUuid.toLowerCase() &&
+          d.status === 'ACTIVE' &&
+          d.is_trusted === true
+      );
+      setHasTransferSourceDevices(eligibleSources.length > 0);
 
       setOnboardingGate('PASSED');
 
@@ -454,9 +510,16 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       });
       if (sessionIdRef.current !== currentSessionId) return;
 
-      // Helper untuk polling otomatis saat menunggu status/rekan chat
+      // Helper untuk polling otomatis saat menunggu status/rekan chat (TIDAK PERNAH membuat sesi baru)
       const startWaitingPolling = (
-        waitingType: 'AWAIT_PARTNER_ACK' | 'AWAIT_PARTNER_WELCOME' | 'AWAIT_PARTNER_DEVICE'
+        waitingType:
+          | 'AWAIT_PARTNER_ACK'
+          | 'AWAIT_PARTNER_WELCOME'
+          | 'AWAIT_PARTNER_DEVICE'
+          | 'AWAIT_SESSION_ACK'
+          | 'AWAIT_SESSION_WELCOME'
+          | 'AWAIT_SESSION_PARTNER_DEVICE',
+        watchedPendingSessionUuid?: string | null
       ) => {
         if (pollingTimerRef.current) {
           clearInterval(pollingTimerRef.current);
@@ -471,12 +534,28 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             const checkRes = await fetchRoomDetail(roomUuid);
             if (sessionIdRef.current !== currentSessionId) return;
             const updated = checkRes.data;
-            if (
-              updated.status === 'ACTIVE' ||
-              (updated.action_hint?.action_required === true &&
-                updated.action_hint?.action_type !== 'NONE') ||
-              (waitingType === 'AWAIT_PARTNER_DEVICE' && updated.partner?.has_active_device === true)
-            ) {
+
+            const shouldReinitialize =
+              (waitingType === 'AWAIT_PARTNER_ACK' && updated.status === 'ACTIVE') ||
+              (waitingType === 'AWAIT_PARTNER_WELCOME' &&
+                (updated.status === 'ACTIVE' ||
+                  (updated.action_hint?.action_required === true &&
+                    updated.action_hint?.action_type !== 'NONE'))) ||
+              (waitingType === 'AWAIT_PARTNER_DEVICE' &&
+                updated.partner?.has_active_device === true &&
+                updated.partner?.has_key_package !== false) ||
+              (waitingType === 'AWAIT_SESSION_ACK' &&
+                (updated.pending_session === null ||
+                  (watchedPendingSessionUuid &&
+                    updated.active_session?.session_uuid === watchedPendingSessionUuid))) ||
+              (waitingType === 'AWAIT_SESSION_WELCOME' &&
+                updated.pending_session?.action_type === 'FETCH_SESSION_CHALLENGE_AND_ACK' &&
+                updated.pending_session?.has_active_challenge === true) ||
+              (waitingType === 'AWAIT_SESSION_PARTNER_DEVICE' &&
+                updated.partner?.has_active_device === true &&
+                updated.partner?.has_key_package === true);
+
+            if (shouldReinitialize) {
               if (pollingTimerRef.current) {
                 clearInterval(pollingTimerRef.current);
                 pollingTimerRef.current = null;
@@ -501,13 +580,16 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           actionHint?.action_required === true &&
           canHandshake
         ) {
-          // Periksa apakah dosen pembimbing sudah memiliki perangkat aktif terdaftar
-          if (currentDetail.partner?.has_active_device === false) {
+          // Periksa apakah dosen pembimbing sudah memiliki perangkat aktif tepercaya + KeyPackage
+          if (
+            currentDetail.partner?.has_active_device === false ||
+            currentDetail.partner?.has_key_package === false
+          ) {
             setWaitingState({
               type: 'AWAIT_PARTNER_DEVICE',
               title: 'Menunggu Perangkat Dosen',
               message:
-                'Dosen pembimbing belum mendaftarkan perangkat aman B-CHAT. Ruang percakapan akan otomatis disiapkan setelah dosen membuka aplikasi dan mengaktifkan perangkat.',
+                'Dosen pembimbing belum mengaktifkan perangkat aman B-CHAT beserta paket kuncinya. Ruang percakapan akan otomatis disiapkan setelah dosen membuka aplikasi dan mengaktifkan perangkat.',
             });
             startWaitingPolling('AWAIT_PARTNER_DEVICE');
             return;
@@ -674,35 +756,219 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
 
       // 7. Restore GroupState MLS (Room berstatus ACTIVE)
       setStatusDetail('Memulihkan status kriptografi room...');
-      const restoreRes = await workerClient.restoreGroupState({
+      let restoreRes = await workerClient.restoreGroupState({
         deviceUuid: activeDevUuid,
         roomUuid,
         fencing,
       });
       if (sessionIdRef.current !== currentSessionId) return;
 
-      if (restoreRes.status !== 'FOUND') {
-        if (restoreRes.status === 'NOT_FOUND') {
-          // Jika sudah ada riwayat lokal yang diimpor, tampilkan riwayat dan aktifkan mode baca
-          if (localHistoryItems.length > 0) {
-            setConnectionStatus('CONNECTED');
-            setStatusDetail('Riwayat obrolan aman dimuat dari penyimpanan lokal');
-            // Tetap lanjutkan inisialisasi subscriber agar multi-device realtime sync bekerja
-          } else {
-            // Room ACTIVE namun GroupState tidak ada di IndexedDB perangkat ini
+      const pendingSession = currentDetail.pending_session ?? null;
+
+      // KONDISI A: GroupState FOUND -> Lindungi perangkat operasional aktif (mis. Device3/Device4)
+      // sekaligus blokir partial state inisiator ketika pending_session belum selesai dipublikasikan
+      // atau masih menunggu ACK dosen.
+      if (restoreRes.status === 'FOUND') {
+        let outboxMessages: OutboxItemSummary[] | undefined;
+        if (
+          pendingSession !== null &&
+          pendingSession.status === 'PENDING' &&
+          pendingSession.action_type === 'PUBLISH_SESSION_WELCOME' &&
+          pendingSession.has_active_challenge === false &&
+          restoreRes.epoch === '1' &&
+          (restoreRes.lastProcessedSequence ?? 0) === 0 &&
+          localHistoryItems.length === 0
+        ) {
+          try {
+            const outboxRes = await workerClient.sendRequest<
+              GetRoomOutboxPayload,
+              GetRoomOutboxResult
+            >('GET_ROOM_OUTBOX', { roomUuid });
+            if (sessionIdRef.current !== currentSessionId) return;
+            outboxMessages = outboxRes?.messages ?? [];
+          } catch {
+            outboxMessages = [];
+          }
+        }
+
+        const foundDecision = evaluateActiveRoomFoundState({
+          roomUuid,
+          myRole: currentDetail.my_membership?.role,
+          pendingSession,
+          restoreRes,
+          localHistoryCount: localHistoryItems.length,
+          outboxMessages,
+        });
+
+        if (foundDecision.action === 'AWAIT_PARTNER_SESSION_ACK') {
+          setHasLocalGroupState(false);
+          setWaitingState({
+            type: 'AWAIT_PARTNER_ACK',
+            title: 'Menunggu Konfirmasi Pembimbing',
+            message:
+              'Sesi aman E2EE baru telah diinisiasi dan dikirim ke server. Ruang obrolan akan aktif segera setelah dosen pembimbing mengonfirmasi dari perangkatnya.',
+          });
+          startWaitingPolling('AWAIT_SESSION_ACK', foundDecision.sessionUuid);
+          return;
+        }
+
+        if (foundDecision.action === 'RECOVER_PENDING_SESSION_WELCOME') {
+          setHasLocalGroupState(false);
+          setIsUnrecoverableActiveRoom(true);
+          setUnrecoverableMode('PENDING_WELCOME_RECOVERY');
+          setPendingWelcomeRecoveryInfo({
+            sessionUuid: foundDecision.sessionUuid,
+            generationNumber: foundDecision.generationNumber,
+            outboxStatus: foundDecision.welcomeItem.status,
+          });
+          setInitError(null);
+          setConnectionStatus('CONNECTED');
+          return;
+        }
+
+        if (foundDecision.action === 'FAIL_CLOSED_MISSING_PENDING_WELCOME') {
+          setHasLocalGroupState(false);
+          setIsUnrecoverableActiveRoom(false);
+          setUnrecoverableMode('NONE');
+          setPendingWelcomeRecoveryInfo(null);
+          setConnectionStatus('ERROR');
+          setInitError(
+            `${foundDecision.reason} Akses ruang obrolan diblokir secara aman (fail-closed) dan sistem tidak membuat sesi pengganti otomatis.`
+          );
+          return;
+        }
+
+        setHasLocalGroupState(true);
+      } else if (restoreRes.status === 'NOT_FOUND') {
+        // Jika sudah ada riwayat lokal yang diimpor, tampilkan riwayat dan aktifkan mode baca
+        if (localHistoryItems.length > 0) {
+          setConnectionStatus('CONNECTED');
+          setStatusDetail('Riwayat obrolan aman dimuat dari penyimpanan lokal');
+          // Tetap lanjutkan inisialisasi subscriber agar multi-device realtime sync bekerja
+        } else {
+          // 7a. Jika ada pending_session untuk perangkat dosen (FETCH_SESSION_CHALLENGE_AND_ACK):
+          // jalankan penerimaan Welcome, JOIN_WELCOME, persistensi GroupState, tanda tangan & publikasi ACK.
+          if (
+            pendingSession &&
+            pendingSession.has_active_challenge === true &&
+            pendingSession.action_type === 'FETCH_SESSION_CHALLENGE_AND_ACK' &&
+            (!pendingSession.recipient_device_uuid ||
+              pendingSession.recipient_device_uuid.toLowerCase() === activeDevUuid.toLowerCase())
+          ) {
+            if (handshakeInProgressRef.current) return;
+            handshakeInProgressRef.current = true;
+            try {
+              setStatusDetail('Bergabung ke sesi aman baru (MLS Join & ACK)...');
+              await completePendingSessionHandshakeFlow(
+                workerClient,
+                roomUuid,
+                activeDevUuid,
+                {
+                  fencing,
+                  userId: currentUser.id,
+                  expectedSessionUuid: pendingSession.session_uuid,
+                }
+              );
+              if (sessionIdRef.current !== currentSessionId) return;
+
+              // Refresh detail room dan restore GroupState yang baru dipersistensikan
+              const refreshed = await fetchRoomDetail(roomUuid);
+              if (sessionIdRef.current !== currentSessionId) return;
+              currentDetail = refreshed.data;
+              setRoomDetail(currentDetail);
+
+              restoreRes = await workerClient.restoreGroupState({
+                deviceUuid: activeDevUuid,
+                roomUuid,
+                fencing,
+              });
+              if (sessionIdRef.current !== currentSessionId) return;
+              if (restoreRes.status !== 'FOUND') {
+                throw new Error(
+                  `GroupState sesi baru tidak ditemukan setelah ACK berhasil (${restoreRes.status}).`
+                );
+              }
+              setHasLocalGroupState(true);
+            } catch (sessionAckErr: any) {
+              if (sessionIdRef.current !== currentSessionId) return;
+              setConnectionStatus('ERROR');
+              setInitError(
+                sessionAckErr?.message || 'Gagal mengonfirmasi sesi aman baru dari mahasiswa.'
+              );
+              return;
+            } finally {
+              handshakeInProgressRef.current = false;
+            }
+          }
+          // 7b. Mahasiswa sudah mempublikasikan Welcome sesi baru dan menunggu ACK dosen
+          else if (
+            pendingSession &&
+            pendingSession.has_active_challenge === true &&
+            pendingSession.action_type === 'AWAIT_PARTNER_SESSION_ACK'
+          ) {
+            setWaitingState({
+              type: 'AWAIT_PARTNER_ACK',
+              title: 'Menunggu Konfirmasi Pembimbing',
+              message:
+                'Sesi aman E2EE baru telah dikirim ke server. Menunggu dosen pembimbing mengonfirmasi dari perangkatnya.',
+            });
+            startWaitingPolling('AWAIT_SESSION_ACK', pendingSession.session_uuid);
+            return;
+          }
+          // 7c. KONDISI B: GroupState NOT_FOUND + perangkat sumber ACTIVE/TRUSTED tersedia
+          else if (eligibleSources.length > 0) {
             setIsUnrecoverableActiveRoom(true);
+            setUnrecoverableMode('HAS_TRANSFER_SOURCE');
             setInitError(
-              'Ruang obrolan ini sudah aktif pada perangkat lain, namun kunci sesi lokal (GroupState) tidak ditemukan pada browser ini. Harap gunakan perangkat yang sebelumnya digunakan atau sinkronkan riwayat dari perangkat tepercaya Anda.'
+              'Ruang obrolan ini sudah aktif pada perangkat tepercaya Anda yang lain, namun kunci sesi lokal (GroupState) tidak ditemukan pada browser ini. Anda dapat menyinkronkan riwayat dari perangkat tepercaya tersebut.'
             );
             setConnectionStatus('ERROR');
             return;
           }
-        } else {
-          // Fail-closed untuk status abnormal lainnya (QUARANTINED, FENCING_STALE, RESTORE_ERROR)
-          throw new Error(
-            `Sesi GroupState tidak dapat dipulihkan (${restoreRes.status}: ${restoreRes.message || 'Kegagalan keystore lokal'}).`
-          );
+          // 7d. KONDISI C: GroupState NOT_FOUND + TIDAK ada perangkat sumber History Transfer
+          else {
+            const myRole = currentDetail.my_membership?.role;
+
+            if (myRole === 'mahasiswa') {
+              // Pastikan dosen sudah memiliki perangkat tepercaya dan KeyPackage sebelum inisiasi sesi baru
+              if (
+                currentDetail.partner?.has_active_device === false ||
+                currentDetail.partner?.has_key_package === false
+              ) {
+                setWaitingState({
+                  type: 'AWAIT_PARTNER_DEVICE',
+                  title: 'Menunggu Perangkat Dosen',
+                  message:
+                    'Dosen pembimbing belum mengaktifkan perangkat aman B-CHAT beserta paket kuncinya. Tombol inisiasi sesi aman baru akan tersedia otomatis setelah perangkat dosen siap.',
+                });
+                startWaitingPolling('AWAIT_SESSION_PARTNER_DEVICE');
+                return;
+              }
+
+              // Tampilkan layar aksi eksplisit 'Inisiasi Sesi Aman Baru' (BUKAN History Transfer)
+              setIsUnrecoverableActiveRoom(true);
+              setUnrecoverableMode('FIRST_DEVICE_INIT_MAHASISWA');
+              setInitError(null);
+              setConnectionStatus('CONNECTED');
+              return;
+            }
+
+            // Peran dosen: tampilkan status 'Menunggu Inisiasi Sesi Aman Mahasiswa' & poll terkendali
+            setWaitingState({
+              type: 'AWAIT_PARTNER_WELCOME',
+              title: 'Menunggu Inisiasi Sesi Aman Mahasiswa',
+              message:
+                'Perangkat ini belum memiliki sesi kriptografi lokal untuk ruang bimbingan ini. Menunggu mahasiswa menginisiasi sesi aman baru dari perangkatnya. Ruang obrolan akan terhubung otomatis setelah mahasiswa memulai inisiasi.',
+            });
+            startWaitingPolling('AWAIT_SESSION_WELCOME');
+            return;
+          }
         }
+      } else {
+        // Fail-closed untuk status abnormal lainnya (QUARANTINED, FENCING_STALE, RESTORE_ERROR)
+        throw new Error(
+          `Sesi GroupState tidak dapat dipulihkan (${restoreRes.status}: ${restoreRes.message || 'Kegagalan keystore lokal'}).`
+        );
       }
 
       // 8. Muat Riwayat Pesan Terenkripsi dari IndexedDB (AES-256-GCM via KEK)
@@ -749,9 +1015,17 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             (seq) => !validHistorySet.has(seq)
           ));
 
+      const sessionStartBaseline =
+        historyItems.length === 0 &&
+        persistentCursor === 0 &&
+        currentDetail.active_session &&
+        currentDetail.active_session.start_sequence > 1
+          ? currentDetail.active_session.start_sequence - 1
+          : 0;
+
       const startingCursor = hasGapBelowPersistent
         ? contiguousHistorySeq
-        : Math.max(persistentCursor, contiguousHistorySeq);
+        : Math.max(persistentCursor, contiguousHistorySeq, sessionStartBaseline);
 
       // Sinkronkan kursor GroupState ke disk HANYA jika contiguousHistorySeq yang terverifikasi lebih tinggi
       if (contiguousHistorySeq > persistentCursor) {
@@ -915,14 +1189,42 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     };
   }, [user?.id, onboardingGate, initializeChatSession]);
 
-  // Polling deteksi transfer riwayat masuk untuk perangkat ini (Perangkat Sumber - Tahap 2B)
+  // Polling deteksi transfer riwayat masuk untuk perangkat sumber yang eligible (Tahap 2B)
+  // HANYA berjalan bila perangkat sudah lulus onboarding, terhubung dengan GroupState lokal valid,
+  // tidak berada pada alur First Device Initialization / recovery / waiting, dan memiliki peer tepercaya lain.
   useEffect(() => {
-    if (!deviceUuid || !user?.id) return;
+    if (historyTransferPollingTimerRef.current) {
+      clearInterval(historyTransferPollingTimerRef.current);
+      historyTransferPollingTimerRef.current = null;
+    }
+
+    const canPoll = shouldPollIncomingHistoryTransfers({
+      deviceUuid,
+      userId: user?.id ? Number(user.id) : null,
+      onboardingGate,
+      connectionStatus,
+      hasTransferSourceDevices,
+      hasLocalGroupState,
+      isUnrecoverableActiveRoom,
+      hasWaitingState: Boolean(waitingState),
+      isHistoryTransferModalOpen,
+      hasIncomingTransferRequest: Boolean(incomingTransferRequest),
+    });
+
+    if (!canPoll || !deviceUuid) {
+      return;
+    }
 
     let isMounted = true;
+    const activePollDeviceUuid = deviceUuid;
+
     const checkIncomingTransfers = async () => {
+      if (!isMounted || historyTransferInFlightRef.current) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+
+      historyTransferInFlightRef.current = true;
       try {
-        const res = await fetchPendingHistoryTransfers(deviceUuid);
+        const res = await fetchPendingHistoryTransfers(activePollDeviceUuid);
         if (!isMounted) return;
         const pending = res.data || [];
         if (pending.length > 0) {
@@ -933,17 +1235,33 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         }
       } catch (_e) {
         // Abaikan kegagalan jaringan berkala saat polling
+      } finally {
+        historyTransferInFlightRef.current = false;
       }
     };
 
     checkIncomingTransfers();
-    const timer = setInterval(checkIncomingTransfers, 3500);
+    historyTransferPollingTimerRef.current = setInterval(checkIncomingTransfers, 10000);
 
     return () => {
       isMounted = false;
-      clearInterval(timer);
+      if (historyTransferPollingTimerRef.current) {
+        clearInterval(historyTransferPollingTimerRef.current);
+        historyTransferPollingTimerRef.current = null;
+      }
     };
-  }, [deviceUuid, user?.id]);
+  }, [
+    deviceUuid,
+    user?.id,
+    onboardingGate,
+    connectionStatus,
+    hasTransferSourceDevices,
+    hasLocalGroupState,
+    isUnrecoverableActiveRoom,
+    waitingState,
+    isHistoryTransferModalOpen,
+    incomingTransferRequest,
+  ]);
 
   // ---------------------------------------------------------------------------
   // MANAJEMEN LAMPIRAN E2EE (STAGE 4)
@@ -1242,6 +1560,59 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     }
   };
 
+  // Handler eksplisit pengguna untuk menginisiasi sesi aman generasi baru (Multi-Generation Session)
+  const handleInitiateNewSession = async () => {
+    if (
+      isInitiatingSession ||
+      handshakeInProgressRef.current ||
+      !workerClientRef.current ||
+      !fencingRef.current ||
+      !deviceUuid ||
+      !roomSummary
+    ) {
+      return;
+    }
+
+    setIsInitiatingSession(true);
+    setSessionInitError(null);
+    handshakeInProgressRef.current = true;
+
+    try {
+      await initiateNextSessionHandshakeFlow(
+        workerClientRef.current,
+        roomSummary.room_uuid,
+        deviceUuid,
+        { fencing: fencingRef.current }
+      );
+
+      setIsUnrecoverableActiveRoom(false);
+      setUnrecoverableMode('NONE');
+      setPendingWelcomeRecoveryInfo(null);
+      setShowNewSessionConfirm(false);
+      initializeChatSession();
+    } catch (err: any) {
+      let msg = 'Gagal menginisiasi sesi aman baru.';
+      if (err instanceof BchatHandshakeCoordinatorError) {
+        if (err.errorCode === 'FETCH_PARTNER_KEY_PACKAGE_FAILED') {
+          msg =
+            'Dosen pembimbing belum memiliki paket kunci aktif di server. Pastikan dosen sudah membuka halaman B-CHAT dan mengaktifkan perangkatnya.';
+        } else if (err.errorCode === 'SESSION_WELCOME_RATE_LIMITED') {
+          msg = err.message;
+        } else if (err.errorCode === 'PENDING_WELCOME_OUTBOX_MISSING') {
+          msg = err.message;
+        } else {
+          msg = err.message;
+        }
+      } else if (err?.message) {
+        msg = err.message;
+      }
+      setSessionInitError(msg);
+    } finally {
+      setIsInitiatingSession(false);
+      handshakeInProgressRef.current = false;
+    }
+  };
+
   const handleRetryRecovery = async () => {
     if (!subscriberRef.current || isRetryingRecovery) return;
     setIsRetryingRecovery(true);
@@ -1276,7 +1647,6 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         onDeviceReady={(devUuid) => {
           setDeviceUuid(devUuid);
           setOnboardingGate('PASSED');
-          initializeChatSession();
         }}
         onCancel={onBack}
         workerRpc={workerClientRef.current}
@@ -1290,8 +1660,8 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       <BchatDevicePairingGate
         deviceUuid={deviceUuid}
         onPairingApproved={() => {
-          setOnboardingGate('PASSED');
-          initializeChatSession();
+          // Kembali ke ONBOARDING agar KeyPackage langsung dipublikasikan setelah perangkat tepercaya
+          setOnboardingGate('ONBOARDING');
         }}
         onCancel={onBack}
       />
@@ -1413,8 +1783,181 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     );
   }
 
-  // Layar Room ACTIVE namun GroupState NOT_FOUND (Fail-Closed, dilarang handshake ulang)
+  // Layar Pemulihan Partial State: Room ACTIVE + GroupState lokal FOUND + Pending Session (PUBLISH_SESSION_WELCOME)
+  // Memblokir masuk ke ruang chat normal hingga publikasi Welcome sesi tertunda selesai dan dikonfirmasi dosen.
+  if (
+    isUnrecoverableActiveRoom &&
+    unrecoverableMode === 'PENDING_WELCOME_RECOVERY' &&
+    messages.length === 0
+  ) {
+    const targetGen =
+      pendingWelcomeRecoveryInfo?.generationNumber ??
+      roomDetail?.pending_session?.generation_number;
+    const targetSessionUuid =
+      pendingWelcomeRecoveryInfo?.sessionUuid ??
+      roomDetail?.pending_session?.session_uuid ??
+      '';
+
+    return (
+      <div className="p-8 text-center bg-white rounded-3xl border border-amber-200 shadow-sm space-y-5 max-w-lg mx-auto my-12 font-sans">
+        <div className="w-14 h-14 mx-auto rounded-3xl bg-amber-50 border border-amber-200 flex items-center justify-center text-amber-600">
+          <ShieldAlert className="w-7 h-7" />
+        </div>
+        <div>
+          <h3 className="font-bold text-slate-800 text-base">
+            Pemulihan Publikasi Welcome Sesi Tertunda
+          </h3>
+          <p className="text-xs text-slate-600 mt-2 leading-relaxed">
+            Sesi aman E2EE{targetGen ? ` Generasi #${targetGen}` : ''} sudah terbentuk secara lokal
+            pada perangkat ini, namun publikasi pesan Welcome ke server belum selesai (misalnya
+            akibat pembatasan sementara server). Ruang obrolan belum dapat digunakan hingga
+            publikasi Welcome selesai dan dikonfirmasi oleh dosen pembimbing.
+          </p>
+          <div className="mt-3 p-3 bg-slate-50 border border-slate-200 rounded-xl text-left text-[11px] text-slate-600 space-y-1">
+            <p className="font-semibold text-slate-700 flex items-center gap-1">
+              <Lock className="w-3.5 h-3.5 text-amber-600" /> Pemulihan Idempoten &amp; Aman:
+            </p>
+            <p>
+              Sistem akan menggunakan kembali sesi tertunda yang sama beserta payload Welcome asli
+              dari outbox lokal tanpa membuat generasi sesi baru dan tanpa meregenerasi GroupState
+              maupun kunci enkripsi.
+            </p>
+            {targetSessionUuid && (
+              <p className="text-[10px] text-slate-500 font-mono break-all pt-1">
+                Sesi tertunda: {targetSessionUuid}
+              </p>
+            )}
+          </div>
+        </div>
+
+        {sessionInitError && (
+          <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 text-left flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <span>{sessionInitError}</span>
+          </div>
+        )}
+
+        <div className="pt-1 flex flex-col sm:flex-row justify-center gap-3">
+          <button
+            type="button"
+            onClick={handleInitiateNewSession}
+            disabled={isInitiatingSession}
+            className="px-5 py-2.5 bg-amber-600 text-white text-xs font-bold rounded-xl hover:bg-amber-700 disabled:opacity-60 transition shadow-sm flex items-center justify-center gap-2 cursor-pointer"
+          >
+            {isInitiatingSession ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>Mempublikasikan Ulang Welcome...</span>
+              </>
+            ) : (
+              <>
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Publikasikan Ulang Welcome Sesi</span>
+              </>
+            )}
+          </button>
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              disabled={isInitiatingSession}
+              className="px-5 py-2.5 bg-slate-100 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 transition shadow-sm"
+            >
+              Kembali ke Menu Bimbingan
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Layar Kondisi C (Mahasiswa perangkat pertama tanpa perangkat sumber): Inisiasi Sesi Aman Baru
+  if (
+    isUnrecoverableActiveRoom &&
+    unrecoverableMode === 'FIRST_DEVICE_INIT_MAHASISWA' &&
+    messages.length === 0
+  ) {
+    const hasPendingWithoutChallenge =
+      roomDetail?.pending_session?.action_type === 'PUBLISH_SESSION_WELCOME';
+
+    return (
+      <div className="p-8 text-center bg-white rounded-3xl border border-emerald-200 shadow-sm space-y-5 max-w-lg mx-auto my-12 font-sans">
+        <div className="w-14 h-14 mx-auto rounded-3xl bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-600">
+          <ShieldCheck className="w-7 h-7" />
+        </div>
+        <div>
+          <h3 className="font-bold text-slate-800 text-base">
+            Inisiasi Sesi Kriptografi Perangkat Pertama
+          </h3>
+          <p className="text-xs text-slate-600 mt-2 leading-relaxed">
+            Browser ini adalah perangkat aktif pertama Anda dan belum memiliki sesi kriptografi
+            lokal (GroupState) untuk ruang bimbingan ini. Mulai sesi E2EE baru agar Anda dan dosen
+            pembimbing dapat langsung berkomunikasi secara aman.
+          </p>
+          <div className="mt-3 p-3 bg-slate-50 border border-slate-200 rounded-xl text-left text-[11px] text-slate-600 space-y-1">
+            <p className="font-semibold text-slate-700 flex items-center gap-1">
+              <Lock className="w-3.5 h-3.5 text-emerald-600" /> Perlindungan Forward Secrecy MLS:
+            </p>
+            <p>
+              Sistem akan membentuk generasi sesi enkripsi MLS baru yang diverifikasi oleh perangkat
+              dosen pembimbing melalui Welcome ACK kriptografis, tanpa menyalin atau membuka kunci
+              sesi lama.
+            </p>
+          </div>
+        </div>
+
+        {sessionInitError && (
+          <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 text-left flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <span>{sessionInitError}</span>
+          </div>
+        )}
+
+        <div className="pt-1 flex flex-col sm:flex-row justify-center gap-3">
+          <button
+            type="button"
+            onClick={handleInitiateNewSession}
+            disabled={isInitiatingSession}
+            className="px-5 py-2.5 bg-emerald-600 text-white text-xs font-bold rounded-xl hover:bg-emerald-700 disabled:opacity-60 transition shadow-sm flex items-center justify-center gap-2 cursor-pointer"
+          >
+            {isInitiatingSession ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>Menginisiasi Sesi Aman...</span>
+              </>
+            ) : (
+              <>
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>
+                  {hasPendingWithoutChallenge
+                    ? 'Lanjutkan Inisiasi Sesi Aman'
+                    : 'Inisiasi Sesi Aman Baru'}
+                </span>
+              </>
+            )}
+          </button>
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              disabled={isInitiatingSession}
+              className="px-5 py-2.5 bg-slate-100 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 transition shadow-sm"
+            >
+              Kembali ke Menu Bimbingan
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Layar Kondisi B: Room ACTIVE namun GroupState NOT_FOUND + perangkat sumber ACTIVE/TRUSTED tersedia
   if (isUnrecoverableActiveRoom && messages.length === 0) {
+    const canExplicitlyInitiateNewSession =
+      roomDetail?.my_membership?.role === 'mahasiswa' &&
+      roomDetail?.partner?.has_active_device !== false &&
+      roomDetail?.partner?.has_key_package !== false;
+
     return (
       <div className="p-8 text-center bg-white rounded-3xl border border-amber-200 shadow-sm space-y-4 max-w-lg mx-auto my-12 font-sans">
         <div className="w-14 h-14 mx-auto rounded-3xl bg-amber-50 border border-amber-200 flex items-center justify-center text-amber-600">
@@ -1430,16 +1973,26 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
               <ShieldAlert className="w-3.5 h-3.5 text-amber-600" /> Perlindungan Forward Secrecy MLS:
             </p>
             <p>
-              Untuk mencegah penyadapan, protokol enkripsi E2EE tidak mengizinkan pembuatan ulang grup secara sepihak saat percakapan telah aktif. Anda dapat memindahkan riwayat obrolan aman dari perangkat tepercaya Anda yang lain.
+              Untuk mencegah penyadapan, protokol enkripsi E2EE tidak menyalin kunci sesi aktif
+              antarperangkat. Anda dapat memindahkan riwayat obrolan aman dari perangkat tepercaya
+              Anda yang lain tanpa mengarsipkan sesi yang sedang aktif.
             </p>
           </div>
         </div>
+
+        {sessionInitError && (
+          <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-700 text-left flex items-start gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <span>{sessionInitError}</span>
+          </div>
+        )}
+
         <div className="pt-2 flex flex-col sm:flex-row justify-center gap-3">
-          {roomSummary && deviceUuid && user && (
+          {hasTransferSourceDevices && roomSummary && deviceUuid && user && (
             <button
               type="button"
               onClick={() => setIsHistoryTransferModalOpen(true)}
-              className="px-5 py-2.5 bg-emerald-600 text-white text-xs font-bold rounded-xl hover:bg-emerald-700 transition shadow-sm flex items-center justify-center gap-2"
+              className="px-5 py-2.5 bg-emerald-600 text-white text-xs font-bold rounded-xl hover:bg-emerald-700 transition shadow-sm flex items-center justify-center gap-2 cursor-pointer"
             >
               <History className="w-3.5 h-3.5" />
               Sinkronkan Riwayat Chat
@@ -1447,6 +2000,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           )}
           {onBack && (
             <button
+              type="button"
               onClick={onBack}
               className="px-5 py-2.5 bg-slate-100 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 transition shadow-sm"
             >
@@ -1454,6 +2008,57 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             </button>
           )}
         </div>
+
+        {/* Opsi eksplisit (dengan peringatan konsekuensi) bila pengguna benar-benar butuh sesi baru */}
+        {canExplicitlyInitiateNewSession && (
+          <div className="pt-3 border-t border-slate-100 space-y-2.5">
+            {!showNewSessionConfirm ? (
+              <button
+                type="button"
+                onClick={() => setShowNewSessionConfirm(true)}
+                className="text-[11px] font-semibold text-amber-700 hover:text-amber-800 underline cursor-pointer"
+              >
+                Perangkat lama tidak dapat diakses? Mulai sesi aman generasi baru
+              </button>
+            ) : (
+              <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-2xl text-left space-y-2.5">
+                <p className="text-[11px] font-bold text-amber-900">
+                  Konfirmasi Pembuatan Sesi Generasi Baru
+                </p>
+                <p className="text-[11px] text-amber-800 leading-relaxed">
+                  Setelah dosen pembimbing menyetujui sesi baru ini, sesi aktif pada perangkat lama
+                  akan <strong>diarsipkan (ARCHIVED)</strong>. Pesan lama tetap tersimpan aman dan
+                  tidak dihapus, namun percakapan baru akan berjalan pada sesi baru ini.
+                </p>
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowNewSessionConfirm(false)}
+                    disabled={isInitiatingSession}
+                    className="px-3 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-white rounded-lg border border-slate-200 transition cursor-pointer"
+                  >
+                    Batal
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleInitiateNewSession}
+                    disabled={isInitiatingSession}
+                    className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-bold rounded-lg transition flex items-center gap-1.5 disabled:opacity-60 cursor-pointer"
+                  >
+                    {isInitiatingSession ? (
+                      <>
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <span>Memulai Sesi...</span>
+                      </>
+                    ) : (
+                      <span>Ya, Inisiasi Sesi Aman Baru</span>
+                    )}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Modal Transfer Riwayat saat di layar Sesi Kriptografi Tidak Ditemukan */}
         {roomSummary && deviceUuid && user && (
@@ -1473,6 +2078,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
                 const freshHistory = await loadEncryptedHistory(deviceUuid, roomSummary.room_uuid);
                 setMessages(freshHistory);
                 setIsUnrecoverableActiveRoom(false);
+                setUnrecoverableMode('NONE');
                 setConnectionStatus('CONNECTED');
                 setTimeout(() => scrollToBottom(true), 100);
                 initializeChatSession();

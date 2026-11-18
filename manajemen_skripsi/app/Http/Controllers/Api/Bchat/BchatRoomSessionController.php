@@ -227,11 +227,13 @@ class BchatRoomSessionController extends Controller
             return $deviceError;
         }
 
-        $session = BchatRoomSession::where('session_uuid', strtolower(trim($sessionUuid)))->first();
-        if (!$session) {
+        $session = BchatRoomSession::with('room')
+            ->where('session_uuid', strtolower(trim($sessionUuid)))
+            ->first();
+        if (!$session || !$session->room || strtolower((string) $session->room->room_uuid) !== strtolower(trim($roomUuid))) {
             return response()->json([
                 'status'     => 'error',
-                'message'    => 'Sesi kriptografi tidak ditemukan.',
+                'message'    => 'Sesi kriptografi tidak ditemukan pada ruang obrolan ini.',
                 'error_code' => 'SESSION_NOT_FOUND',
             ], 404);
         }
@@ -283,11 +285,13 @@ class BchatRoomSessionController extends Controller
             return $deviceError;
         }
 
-        $session = BchatRoomSession::where('session_uuid', strtolower(trim($sessionUuid)))->first();
-        if (!$session) {
+        $session = BchatRoomSession::with('room')
+            ->where('session_uuid', strtolower(trim($sessionUuid)))
+            ->first();
+        if (!$session || !$session->room || strtolower((string) $session->room->room_uuid) !== strtolower(trim($roomUuid))) {
             return response()->json([
                 'status'     => 'error',
-                'message'    => 'Sesi kriptografi tidak ditemukan.',
+                'message'    => 'Sesi kriptografi tidak ditemukan pada ruang obrolan ini.',
                 'error_code' => 'SESSION_NOT_FOUND',
             ], 404);
         }
@@ -352,11 +356,13 @@ class BchatRoomSessionController extends Controller
             return $deviceError;
         }
 
-        $session = BchatRoomSession::where('session_uuid', strtolower(trim($sessionUuid)))->first();
-        if (!$session) {
+        $session = BchatRoomSession::with('room')
+            ->where('session_uuid', strtolower(trim($sessionUuid)))
+            ->first();
+        if (!$session || !$session->room || strtolower((string) $session->room->room_uuid) !== strtolower(trim($roomUuid))) {
             return response()->json([
                 'status'     => 'error',
-                'message'    => 'Sesi kriptografi tidak ditemukan.',
+                'message'    => 'Sesi kriptografi tidak ditemukan pada ruang obrolan ini.',
                 'error_code' => 'SESSION_NOT_FOUND',
             ], 404);
         }

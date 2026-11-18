@@ -37,10 +37,25 @@ import type {
     BchatWelcomeChallengeResponseData,
     BchatWelcomeAckRequest,
     BchatWelcomeAckResponseData,
+    BchatRoomSessionData,
+    BchatCreateNextSessionRequest,
+    BchatSessionWelcomePublishRequest,
+    BchatSessionWelcomePublishResponseData,
+    BchatSessionWelcomeChallengeResponseData,
+    BchatSessionWelcomeAckRequest,
     BchatSendMessageRequest,
     BchatMessageData,
     BchatFetchMessagesQuery,
 } from './bchat-api-types'
+
+function buildDeviceHeaders(deviceUuid?: string): Record<string, string> | undefined {
+    if (!deviceUuid || typeof deviceUuid !== 'string' || deviceUuid.trim() === '') {
+        return undefined
+    }
+    return {
+        'X-Bchat-Device-Uuid': deviceUuid.trim().toLowerCase(),
+    }
+}
 
 // -----------------------------------------------------------------------------
 // STANDARDIZED B-CHAT API ERROR
@@ -51,18 +66,21 @@ export class BchatApiError extends Error {
     readonly status: number
     readonly errorCode?: string
     readonly errors?: Record<string, string[]>
+    readonly retryAfterSeconds?: number
 
     constructor(
         message: string,
         status = 0,
         errorCode?: string,
-        errors?: Record<string, string[]>
+        errors?: Record<string, string[]>,
+        retryAfterSeconds?: number
     ) {
         super(message)
         this.name = 'BchatApiError'
         this.status = status
         this.errorCode = errorCode
         this.errors = errors
+        this.retryAfterSeconds = retryAfterSeconds
 
         // Restore prototype chain for instanceof checks across transpile targets
         Object.setPrototypeOf(this, BchatApiError.prototype)
@@ -82,6 +100,7 @@ export function parseBchatApiError(error: unknown): BchatApiError {
         const axiosErr = error as {
             response?: {
                 status?: number
+                headers?: Record<string, unknown>
                 data?: {
                     status?: string
                     message?: string
@@ -94,6 +113,19 @@ export function parseBchatApiError(error: unknown): BchatApiError {
 
         const httpStatus = axiosErr.response?.status ?? 0
         const resData = axiosErr.response?.data
+        const rawHeaders = axiosErr.response?.headers
+        let retryAfterSeconds: number | undefined
+        if (rawHeaders && typeof rawHeaders === 'object') {
+            const rawRetryAfter =
+                rawHeaders['retry-after'] ??
+                rawHeaders['Retry-After']
+            if (rawRetryAfter !== undefined && rawRetryAfter !== null) {
+                const parsed = Number.parseInt(String(rawRetryAfter).trim(), 10)
+                if (Number.isFinite(parsed) && parsed > 0) {
+                    retryAfterSeconds = parsed
+                }
+            }
+        }
         const message =
             resData?.message ||
             axiosErr.message ||
@@ -101,7 +133,7 @@ export function parseBchatApiError(error: unknown): BchatApiError {
         const errorCode = resData?.error_code
         const errors = resData?.errors
 
-        return new BchatApiError(message, httpStatus, errorCode, errors)
+        return new BchatApiError(message, httpStatus, errorCode, errors, retryAfterSeconds)
     }
 
     if (error instanceof Error) {
@@ -278,13 +310,16 @@ export async function fetchRoomDetail(
  * Endpoint: GET /api/bchat/rooms/{roomUuid}/partner-key-package
  */
 export async function fetchPartnerKeyPackage(
-    roomUuid: string
+    roomUuid: string,
+    deviceUuid?: string
 ): Promise<BchatSuccessResponse<BchatPartnerKeyPackageResponseData>> {
     try {
+        const headers = buildDeviceHeaders(deviceUuid)
         const res = await axios.get<
             BchatSuccessResponse<BchatPartnerKeyPackageResponseData>
         >(
-            `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/partner-key-package`
+            `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/partner-key-package`,
+            headers ? { headers } : undefined
         )
         return res.data
     } catch (err) {
@@ -298,14 +333,17 @@ export async function fetchPartnerKeyPackage(
  */
 export async function publishWelcome(
     roomUuid: string,
-    payload: BchatWelcomePublishRequest
+    payload: BchatWelcomePublishRequest,
+    deviceUuid?: string
 ): Promise<BchatSuccessResponse<BchatWelcomePublishResponseData>> {
     try {
+        const headers = buildDeviceHeaders(deviceUuid)
         const res = await axios.post<
             BchatSuccessResponse<BchatWelcomePublishResponseData>
         >(
             `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/welcome`,
-            payload
+            payload,
+            headers ? { headers } : undefined
         )
         return res.data
     } catch (err) {
@@ -318,14 +356,17 @@ export async function publishWelcome(
  * Endpoint: POST /api/bchat/rooms/{roomUuid}/welcome-challenge
  */
 export async function fetchOrRotateWelcomeChallenge(
-    roomUuid: string
+    roomUuid: string,
+    deviceUuid?: string
 ): Promise<BchatSuccessResponse<BchatWelcomeChallengeResponseData>> {
     try {
+        const headers = buildDeviceHeaders(deviceUuid)
         const res = await axios.post<
             BchatSuccessResponse<BchatWelcomeChallengeResponseData>
         >(
             `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/welcome-challenge`,
-            {}
+            {},
+            headers ? { headers } : undefined
         )
         return res.data
     } catch (err) {
@@ -339,14 +380,130 @@ export async function fetchOrRotateWelcomeChallenge(
  */
 export async function submitWelcomeAck(
     roomUuid: string,
-    payload: BchatWelcomeAckRequest
+    payload: BchatWelcomeAckRequest,
+    deviceUuid?: string
 ): Promise<BchatSuccessResponse<BchatWelcomeAckResponseData>> {
     try {
+        const headers = buildDeviceHeaders(deviceUuid)
         const res = await axios.post<
             BchatSuccessResponse<BchatWelcomeAckResponseData>
         >(
             `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/welcome-ack`,
-            payload
+            payload,
+            headers ? { headers } : undefined
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+/**
+ * 10b. Create next E2EE room session generation (PENDING).
+ * Endpoint: POST /api/bchat/rooms/{roomUuid}/sessions/next
+ */
+export async function createNextRoomSession(
+    roomUuid: string,
+    payload: BchatCreateNextSessionRequest = {},
+    deviceUuid?: string
+): Promise<BchatSuccessResponse<BchatRoomSessionData>> {
+    try {
+        const headers = buildDeviceHeaders(deviceUuid)
+        const res = await axios.post<BchatSuccessResponse<BchatRoomSessionData>>(
+            `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/sessions/next`,
+            payload,
+            headers ? { headers } : undefined
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+/**
+ * 10c. Fetch currently PENDING session generation for a room.
+ * Endpoint: GET /api/bchat/rooms/{roomUuid}/sessions/pending
+ */
+export async function fetchPendingRoomSession(
+    roomUuid: string,
+    deviceUuid?: string
+): Promise<BchatSuccessResponse<BchatRoomSessionData>> {
+    try {
+        const headers = buildDeviceHeaders(deviceUuid)
+        const res = await axios.get<BchatSuccessResponse<BchatRoomSessionData>>(
+            `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/sessions/pending`,
+            headers ? { headers } : undefined
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+/**
+ * 10d. Publish MLS Welcome message for a PENDING session generation.
+ * Endpoint: POST /api/bchat/rooms/{roomUuid}/sessions/{sessionUuid}/welcome
+ */
+export async function publishSessionWelcome(
+    roomUuid: string,
+    sessionUuid: string,
+    payload: BchatSessionWelcomePublishRequest,
+    deviceUuid?: string
+): Promise<BchatSuccessResponse<BchatSessionWelcomePublishResponseData>> {
+    try {
+        const headers = buildDeviceHeaders(deviceUuid)
+        const res = await axios.post<
+            BchatSuccessResponse<BchatSessionWelcomePublishResponseData>
+        >(
+            `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/sessions/${encodeURIComponent(sessionUuid)}/welcome`,
+            payload,
+            headers ? { headers } : undefined
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+/**
+ * 10e. Fetch active Welcome challenge (rotating in-place if expired) for a PENDING session.
+ * Endpoint: GET /api/bchat/rooms/{roomUuid}/sessions/{sessionUuid}/welcome-challenge
+ */
+export async function fetchSessionWelcomeChallenge(
+    roomUuid: string,
+    sessionUuid: string,
+    deviceUuid?: string
+): Promise<BchatSuccessResponse<BchatSessionWelcomeChallengeResponseData>> {
+    try {
+        const headers = buildDeviceHeaders(deviceUuid)
+        const res = await axios.get<
+            BchatSuccessResponse<BchatSessionWelcomeChallengeResponseData>
+        >(
+            `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/sessions/${encodeURIComponent(sessionUuid)}/welcome-challenge`,
+            headers ? { headers } : undefined
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+/**
+ * 10f. Submit Canonical Welcome ACK signature to activate a PENDING session generation.
+ * Endpoint: POST /api/bchat/rooms/{roomUuid}/sessions/{sessionUuid}/ack
+ */
+export async function submitSessionWelcomeAck(
+    roomUuid: string,
+    sessionUuid: string,
+    payload: BchatSessionWelcomeAckRequest,
+    deviceUuid?: string
+): Promise<BchatSuccessResponse<BchatRoomSessionData>> {
+    try {
+        const headers = buildDeviceHeaders(deviceUuid)
+        const res = await axios.post<BchatSuccessResponse<BchatRoomSessionData>>(
+            `/api/bchat/rooms/${encodeURIComponent(roomUuid)}/sessions/${encodeURIComponent(sessionUuid)}/ack`,
+            payload,
+            headers ? { headers } : undefined
         )
         return res.data
     } catch (err) {
@@ -411,6 +568,11 @@ export const bchatApiClient = {
     publishWelcome,
     fetchOrRotateWelcomeChallenge,
     submitWelcomeAck,
+    createNextRoomSession,
+    fetchPendingRoomSession,
+    publishSessionWelcome,
+    fetchSessionWelcomeChallenge,
+    submitSessionWelcomeAck,
     sendMessage,
     fetchMessages,
 }

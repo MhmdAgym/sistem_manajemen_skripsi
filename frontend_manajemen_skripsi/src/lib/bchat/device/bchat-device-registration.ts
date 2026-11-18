@@ -463,9 +463,14 @@ export async function saveStagedDeviceIdentityKey(
   deviceUuid: string,
   privateKey: CryptoKey,
   publicKeyHex: string,
-  fingerprintHex: string
+  fingerprintHex: string,
+  userId?: string | number | null
 ): Promise<void> {
   const keyId = makeDeviceIdentityKeyId(deviceUuid)
+  const normalizedUserId =
+    userId !== undefined && userId !== null && String(userId).trim() !== ''
+      ? String(userId).trim()
+      : undefined
   const stagedRecord: KeystoreRecord = {
     key_id: keyId,
     key_version: 1,
@@ -476,6 +481,7 @@ export async function saveStagedDeviceIdentityKey(
     metadata: {
       key_type: 'DEVICE_IDENTITY',
       device_uuid: deviceUuid.toLowerCase().trim(),
+      ...(normalizedUserId ? { user_id: normalizedUserId } : {}),
       public_key_hex: publicKeyHex,
       public_key_fingerprint: fingerprintHex,
       staged_at: Date.now(),
@@ -497,9 +503,14 @@ export async function promoteStagedIdentityKeyToActive(
   deviceUuid: string,
   keyVersion: number,
   backendStatus: string,
-  registeredAt: string
+  registeredAt: string,
+  userId?: string | number | null
 ): Promise<void> {
   const keyId = makeDeviceIdentityKeyId(deviceUuid)
+  const normalizedUserId =
+    userId !== undefined && userId !== null && String(userId).trim() !== ''
+      ? String(userId).trim()
+      : undefined
 
   await withReadwriteTransaction([BCAT_STORES.KEYSTORE], (_tx, getStore) => {
     return new Promise<void>((resolve, reject) => {
@@ -530,6 +541,7 @@ export async function promoteStagedIdentityKeyToActive(
         record.key_version = keyVersion
         record.metadata = {
           ...record.metadata,
+          ...(normalizedUserId ? { user_id: normalizedUserId } : {}),
           backend_status: backendStatus,
           registered_at: registeredAt,
           activated_at: Date.now(),
@@ -578,34 +590,35 @@ export async function getActiveDeviceIdentityKey(
   }
 }
 
-/**
- * Mencari identitas perangkat aktif yang tersimpan secara lokal pada Keystore IndexedDB.
- * Mengembalikan objek memuat canonical deviceUuid dan KeystoreRecord, atau null jika belum ada.
- */
-export async function findActiveLocalDevice(): Promise<{
+export interface LocalActiveDeviceEntry {
   deviceUuid: string
   record: KeystoreRecord
-} | null> {
+}
+
+/**
+ * Mengambil seluruh identitas perangkat aktif lokal pada Keystore IndexedDB.
+ */
+export async function findAllActiveLocalDevices(): Promise<LocalActiveDeviceEntry[]> {
   return withReadonlyTransaction([BCAT_STORES.KEYSTORE], (_tx, getStore) => {
     return new Promise((resolve, reject) => {
       const store = getStore(BCAT_STORES.KEYSTORE)
       const req = store.getAll()
       req.onsuccess = () => {
         const records = (req.result as KeystoreRecord[]) || []
-        const activeIdentity = records.find(
-          (r) =>
-            r.algorithm === 'Ed25519' &&
-            r.status === 'active' &&
-            r.metadata?.key_type === 'DEVICE_IDENTITY'
-        )
-        if (activeIdentity && activeIdentity.metadata?.device_uuid) {
-          resolve({
-            deviceUuid: activeIdentity.metadata.device_uuid as string,
-            record: activeIdentity,
-          })
-        } else {
-          resolve(null)
-        }
+        const activeIdentities = records
+          .filter(
+            (r) =>
+              r.algorithm === 'Ed25519' &&
+              r.status === 'active' &&
+              r.metadata?.key_type === 'DEVICE_IDENTITY' &&
+              typeof r.metadata?.device_uuid === 'string'
+          )
+          .map((r) => ({
+            deviceUuid: (r.metadata!.device_uuid as string).toLowerCase().trim(),
+            record: r,
+          }))
+          .sort((a, b) => (b.record.created_at ?? 0) - (a.record.created_at ?? 0))
+        resolve(activeIdentities)
       }
       req.onerror = () =>
         reject(
@@ -617,6 +630,135 @@ export async function findActiveLocalDevice(): Promise<{
         )
     })
   })
+}
+
+/**
+ * Memilih identitas perangkat lokal yang valid untuk akun yang sedang login (fungsi murni untuk unit test & runtime).
+ *
+ * Aturan keamanan & backward compatibility:
+ * 1. Jika daftar `backendActiveDeviceUuids` tersedia (dari GET /api/bchat/devices/status):
+ *    - Kandidat WAJIB cocok dengan salah satu device_uuid ACTIVE milik user di backend.
+ *    - Jika record memiliki metadata `user_id`, nilainya WAJIB cocok dengan `userId` yang login.
+ *    - Record legacy (mis. Device3/Device4) yang belum memiliki `metadata.user_id` tetap diterima
+ *      selama `device_uuid`-nya terverifikasi sebagai perangkat ACTIVE milik user tersebut di backend.
+ * 2. Jika `backendActiveDeviceUuids` tidak tersedia (offline / fallback murni lokal):
+ *    - Prioritaskan record dengan `metadata.user_id === String(userId)`.
+ *    - Jika tidak ada yang bertag `user_id`, hanya terima record legacy tanpa `user_id` bila tepat 1 record.
+ */
+export function selectActiveLocalDeviceForUser(
+  localDevices: LocalActiveDeviceEntry[],
+  options?: {
+    userId?: string | number | null
+    backendActiveDeviceUuids?: string[]
+  }
+): LocalActiveDeviceEntry | null {
+  if (!localDevices || localDevices.length === 0) {
+    return null
+  }
+
+  const normalizedUserId =
+    options?.userId !== undefined && options?.userId !== null && String(options.userId).trim() !== ''
+      ? String(options.userId).trim()
+      : null
+
+  if (options?.backendActiveDeviceUuids !== undefined) {
+    const backendSet = new Set(
+      options.backendActiveDeviceUuids
+        .filter((u) => typeof u === 'string' && u.trim() !== '')
+        .map((u) => u.toLowerCase().trim())
+    )
+
+    if (backendSet.size === 0) {
+      return null
+    }
+
+    const backendMatched = localDevices.filter((entry) => {
+      const entryUuid = entry.deviceUuid.toLowerCase().trim()
+      if (!backendSet.has(entryUuid)) {
+        return false
+      }
+      const metaUserId = entry.record.metadata?.user_id
+      if (
+        normalizedUserId !== null &&
+        metaUserId !== undefined &&
+        metaUserId !== null &&
+        String(metaUserId).trim() !== ''
+      ) {
+        return String(metaUserId).trim() === normalizedUserId
+      }
+      // Backward-compatible: record legacy tanpa metadata.user_id tetap sah jika terdaftar ACTIVE di backend milik user ini
+      return true
+    })
+
+    if (backendMatched.length === 0) {
+      return null
+    }
+
+    // Prioritaskan record yang memiliki user_id eksplisit cocok, lalu paling baru
+    if (normalizedUserId !== null) {
+      const exactUserMatch = backendMatched.find(
+        (e) =>
+          e.record.metadata?.user_id !== undefined &&
+          String(e.record.metadata.user_id).trim() === normalizedUserId
+      )
+      if (exactUserMatch) {
+        return exactUserMatch
+      }
+    }
+
+    return backendMatched[0]
+  }
+
+  // Tanpa daftar backend: filter berbasis user_id
+  if (normalizedUserId !== null) {
+    const exactUserMatch = localDevices.find(
+      (e) =>
+        e.record.metadata?.user_id !== undefined &&
+        String(e.record.metadata.user_id).trim() === normalizedUserId
+    )
+    if (exactUserMatch) {
+      return exactUserMatch
+    }
+
+    // Backward-compatible untuk profil legacy tunggal tanpa metadata.user_id
+    const legacyWithoutUserId = localDevices.filter(
+      (e) =>
+        e.record.metadata?.user_id === undefined ||
+        e.record.metadata?.user_id === null ||
+        String(e.record.metadata.user_id).trim() === ''
+    )
+    if (legacyWithoutUserId.length === 1 && localDevices.length === 1) {
+      return legacyWithoutUserId[0]
+    }
+    return null
+  }
+
+  return localDevices[0]
+}
+
+/**
+ * Mencari identitas perangkat aktif lokal yang terverifikasi untuk pengguna yang sedang login.
+ */
+export async function resolveActiveLocalDeviceForUser(options?: {
+  userId?: string | number | null
+  backendActiveDeviceUuids?: string[]
+}): Promise<LocalActiveDeviceEntry | null> {
+  const allActive = await findAllActiveLocalDevices()
+  return selectActiveLocalDeviceForUser(allActive, options)
+}
+
+/**
+ * Mencari identitas perangkat aktif yang tersimpan secara lokal pada Keystore IndexedDB.
+ * Mengembalikan objek memuat canonical deviceUuid dan KeystoreRecord, atau null jika belum ada.
+ */
+export async function findActiveLocalDevice(
+  userId?: string | number | null
+): Promise<LocalActiveDeviceEntry | null> {
+  const allActive = await findAllActiveLocalDevices()
+  if (userId !== undefined && userId !== null) {
+    return selectActiveLocalDeviceForUser(allActive, { userId })
+  }
+  return allActive[0] ?? null
 }
 
 // -----------------------------------------------------------------------------
@@ -640,9 +782,12 @@ export interface DeviceRegistrationResult {
   deviceName: string
   keyVersion: number
   status: string
+  isTrusted: boolean
+  trustedAt: string | null
   publicKeyHex: string
   registeredAt: string
   isReplacement: boolean
+  userId: string
 }
 
 /**
@@ -823,13 +968,14 @@ export async function registerDeviceFlow(
     )
   }
 
-  // 9. Promosikan status kunci 'staged' -> 'active' di IndexedDB
+  // 9. Promosikan status kunci 'staged' -> 'active' di IndexedDB beserta metadata user_id
   try {
     await promoteStagedIdentityKeyToActive(
       deviceUuid,
       registerRes.data.key_version,
       registerRes.data.status,
-      registerRes.data.registered_at
+      registerRes.data.registered_at,
+      serverUserId
     )
   } catch (err) {
     // Registrasi di server sudah sukses, tetapi pembaruan lokal gagal.
@@ -846,8 +992,11 @@ export async function registerDeviceFlow(
     deviceName: registerRes.data.device_name,
     keyVersion: registerRes.data.key_version,
     status: registerRes.data.status,
+    isTrusted: Boolean(registerRes.data.is_trusted),
+    trustedAt: registerRes.data.trusted_at ?? null,
     publicKeyHex: registerRes.data.public_key,
     registeredAt: registerRes.data.registered_at,
     isReplacement: registerRes.data.is_replacement,
+    userId: serverUserId,
   }
 }

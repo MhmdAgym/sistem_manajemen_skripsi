@@ -152,8 +152,12 @@ class BchatRoomController extends Controller
             $room = BchatRoom::with([
                 'penugasanPembimbing.skripsi',
                 'members.user',
+                'activeSession',
+                'pendingSession',
                 'welcomeChallenges' => function ($query) {
-                    $query->where('operation_status', 'ACTIVE')->orderBy('id', 'asc');
+                    $query->where('operation_status', 'ACTIVE')
+                        ->with('recipientDevice:id,device_uuid')
+                        ->orderBy('id', 'asc');
                 },
             ])
             ->where('room_uuid', $cleanUuid)
@@ -204,12 +208,18 @@ class BchatRoomController extends Controller
                 ], 422);
             }
 
-            // Periksa ketersediaan perangkat aktif partner secara terisolasi
+            // Periksa ketersediaan perangkat aktif dan kesiapan KeyPackage partner secara terisolasi
             $hasActiveDevice = BchatUserDevice::where('user_id', $partnerMember->user_id)
                 ->where('status', 'ACTIVE')
                 ->exists();
 
-            $data = (new BchatRoomDetailResource($room, $user, $hasActiveDevice))->resolve();
+            $hasPartnerKeyPackage = BchatUserDevice::where('user_id', $partnerMember->user_id)
+                ->where('status', 'ACTIVE')
+                ->where('is_trusted', true)
+                ->whereHas('keyPackages', fn ($q) => $q->where('is_consumed', false))
+                ->exists();
+
+            $data = (new BchatRoomDetailResource($room, $user, $hasActiveDevice, $hasPartnerKeyPackage))->resolve();
 
             return response()->json([
                 'status'  => 'success',

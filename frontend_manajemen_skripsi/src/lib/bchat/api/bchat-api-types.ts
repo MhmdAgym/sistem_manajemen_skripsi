@@ -81,6 +81,8 @@ export interface BchatDeviceRegisterResponseData {
     device_name: string
     key_version: number
     status: string // e.g. 'ACTIVE'
+    is_trusted?: boolean
+    trusted_at?: string | null
     public_key: string // 64-character hex
     registered_at: string
     is_replacement: boolean
@@ -173,6 +175,7 @@ export interface BchatPartnerDetail {
     name: string
     role: string | null
     has_active_device: boolean
+    has_key_package?: boolean
     is_active: boolean
 }
 
@@ -197,6 +200,36 @@ export interface BchatRoomCapabilities {
     can_handshake: boolean
 }
 
+export type BchatPendingSessionActionType =
+    | 'NONE'
+    | 'PUBLISH_SESSION_WELCOME'
+    | 'AWAIT_PARTNER_SESSION_WELCOME'
+    | 'FETCH_SESSION_CHALLENGE_AND_ACK'
+    | 'AWAIT_PARTNER_SESSION_ACK'
+
+export interface BchatRoomActiveSessionInfo {
+    session_uuid: string
+    generation_number: number
+    status: string
+    start_sequence: number
+    current_sequence: number
+}
+
+export interface BchatRoomPendingSessionInfo {
+    session_uuid: string
+    generation_number: number
+    status: string
+    start_sequence: number
+    current_sequence: number
+    created_by_user_id: number | null
+    has_active_challenge: boolean
+    welcome_operation_uuid: string | null
+    recipient_device_uuid: string | null
+    expires_at: string | null
+    action_required: boolean
+    action_type: BchatPendingSessionActionType
+}
+
 export interface BchatRoomDetail {
     room_uuid: string
     status: BchatRoomStatus | string
@@ -210,8 +243,72 @@ export interface BchatRoomDetail {
     action_hint: BchatActionHint
     handshake_context: BchatHandshakeContext
     capabilities: BchatRoomCapabilities
+    active_session?: BchatRoomActiveSessionInfo | null
+    pending_session?: BchatRoomPendingSessionInfo | null
     created_at?: string | null
     updated_at?: string | null
+}
+
+// -----------------------------------------------------------------------------
+// 7b. MULTI-GENERATION ROOM SESSION API CONTRACTS (/sessions/*)
+// -----------------------------------------------------------------------------
+
+export interface BchatRoomSessionData {
+    session_uuid: string
+    room_uuid: string
+    generation_number: number
+    status: 'PENDING' | 'ACTIVE' | 'ARCHIVED' | 'FAILED' | string
+    group_id_hash: string | null
+    start_epoch: number
+    end_epoch: number | null
+    start_sequence: number
+    end_sequence: number | null
+    current_sequence: number
+    created_by_user_id: number | null
+    activated_at: string | null
+    archived_at: string | null
+    failed_at: string | null
+    failure_reason: string | null
+    created_at: string | null
+    updated_at: string | null
+}
+
+export interface BchatCreateNextSessionRequest {
+    group_id_hash?: string | null
+}
+
+export interface BchatSessionWelcomePublishRequest {
+    recipient_device_uuid: string
+    key_package_hash: string
+    group_id_hash?: string | null
+    welcome_message: string
+}
+
+export interface BchatSessionWelcomePublishResponseData {
+    session_uuid: string
+    welcome_operation_uuid: string
+    challenge_uuid: string
+    expires_at: string | null
+}
+
+export interface BchatSessionWelcomeChallengeResponseData {
+    welcome_operation_uuid: string
+    session_uuid: string
+    room_uuid: string
+    recipient_device_uuid?: string | null
+    welcome_message: string
+    group_id_hash: string
+    epoch: string
+    challenge_uuid: string
+    challenge_nonce: string
+    challenge_generation: number
+    expires_at: string | null
+    ttl_remaining_seconds: number
+}
+
+export interface BchatSessionWelcomeAckRequest {
+    challenge_uuid: string
+    signature: string
 }
 
 // -----------------------------------------------------------------------------

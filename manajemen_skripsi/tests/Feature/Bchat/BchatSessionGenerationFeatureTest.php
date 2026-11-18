@@ -2314,4 +2314,480 @@ class BchatSessionGenerationFeatureTest extends TestCase
         $response->assertStatus(403)
             ->assertJsonPath('error_code', 'DEVICE_NOT_ACTIVE');
     }
+
+    /**
+     * Skenario 21: Room detail mengekspos partner.has_key_package dan pending_session secara backward-compatible.
+     */
+    public function test_scenario_21_room_detail_exposes_partner_key_package_and_pending_session_lifecycle(): void
+    {
+        $initiator = $this->createTestUser('mahasiswa');
+        $recipient = $this->createTestUser('dosen');
+        $initDev = $this->createTestDevice($initiator);
+        $recipDev = $this->createTestDevice($recipient);
+        $room = $this->createTestRoomWithMembers($initiator, $recipient);
+
+        $session1 = BchatRoomSession::create([
+            'session_uuid'       => (string) Str::uuid(),
+            'room_id'            => $room->id,
+            'generation_number'  => 1,
+            'status'             => 'ACTIVE',
+            'group_id_hash'      => $room->group_id_hash,
+            'start_epoch'        => 1,
+            'start_sequence'     => 1,
+            'current_sequence'   => 0,
+            'activated_at'       => now(),
+        ]);
+
+        // 1. Sebelum dosen mengunggah KeyPackage: partner.has_key_package = false, pending_session = null
+        Sanctum::actingAs($initiator);
+        $detailBeforeKp = $this->getJson("/api/bchat/rooms/{$room->room_uuid}");
+        $detailBeforeKp->assertStatus(200)
+            ->assertJsonPath('data.status', 'ACTIVE')
+            ->assertJsonPath('data.action_hint.action_type', 'NONE')
+            ->assertJsonPath('data.partner.has_active_device', true)
+            ->assertJsonPath('data.partner.has_key_package', false)
+            ->assertJsonPath('data.active_session.session_uuid', $session1->session_uuid)
+            ->assertJsonPath('data.pending_session', null);
+
+        // 2. Setelah dosen punya KeyPackage belum dikonsumsi: partner.has_key_package = true
+        $kp = $this->createTestKeyPackage($recipient, $recipDev['device']);
+        $detailAfterKp = $this->getJson("/api/bchat/rooms/{$room->room_uuid}");
+        $detailAfterKp->assertStatus(200)
+            ->assertJsonPath('data.partner.has_key_package', true);
+
+        // 3. Mahasiswa membuat sesi generasi 2 (PENDING, belum ada Welcome)
+        $nextRes = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/next");
+        $nextRes->assertStatus(201);
+        $session2Uuid = $nextRes->json('data.session_uuid');
+
+        // Mahasiswa melihat pending_session: PUBLISH_SESSION_WELCOME
+        $this->getJson("/api/bchat/rooms/{$room->room_uuid}")
+            ->assertStatus(200)
+            ->assertJsonPath('data.pending_session.session_uuid', $session2Uuid)
+            ->assertJsonPath('data.pending_session.has_active_challenge', false)
+            ->assertJsonPath('data.pending_session.action_required', true)
+            ->assertJsonPath('data.pending_session.action_type', 'PUBLISH_SESSION_WELCOME');
+
+        // Dosen melihat pending_session: AWAIT_PARTNER_SESSION_WELCOME
+        Sanctum::actingAs($recipient);
+        $this->getJson("/api/bchat/rooms/{$room->room_uuid}")
+            ->assertStatus(200)
+            ->assertJsonPath('data.pending_session.session_uuid', $session2Uuid)
+            ->assertJsonPath('data.pending_session.has_active_challenge', false)
+            ->assertJsonPath('data.pending_session.action_required', false)
+            ->assertJsonPath('data.pending_session.action_type', 'AWAIT_PARTNER_SESSION_WELCOME');
+
+        // 4. Mahasiswa mempublikasikan Welcome untuk sesi generasi 2
+        Sanctum::actingAs($initiator);
+        $groupIdHash = hash('sha256', $room->room_uuid);
+        $pubRes = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$session2Uuid}/welcome", [
+                'recipient_device_uuid' => $recipDev['device']->device_uuid,
+                'key_package_hash'      => $kp->key_package_hash,
+                'group_id_hash'         => $groupIdHash,
+                'welcome_message'       => base64_encode('encrypted_welcome_gen2'),
+            ]);
+        $pubRes->assertStatus(200);
+
+        // Publikasi ulang Welcome pada sesi yang sama ditolak 409 ACTIVE_WELCOME_OPERATION_EXISTS
+        $dupPubRes = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$session2Uuid}/welcome", [
+                'recipient_device_uuid' => $recipDev['device']->device_uuid,
+                'key_package_hash'      => $kp->key_package_hash,
+                'group_id_hash'         => $groupIdHash,
+                'welcome_message'       => base64_encode('encrypted_welcome_gen2'),
+            ]);
+        $dupPubRes->assertStatus(409)
+            ->assertJsonPath('error_code', 'ACTIVE_WELCOME_OPERATION_EXISTS');
+
+        // Mahasiswa melihat pending_session: AWAIT_PARTNER_SESSION_ACK
+        $this->getJson("/api/bchat/rooms/{$room->room_uuid}")
+            ->assertStatus(200)
+            ->assertJsonPath('data.pending_session.has_active_challenge', true)
+            ->assertJsonPath('data.pending_session.action_type', 'AWAIT_PARTNER_SESSION_ACK')
+            ->assertJsonPath('data.pending_session.recipient_device_uuid', $recipDev['device']->device_uuid);
+
+        // Dosen melihat pending_session: FETCH_SESSION_CHALLENGE_AND_ACK
+        Sanctum::actingAs($recipient);
+        $this->getJson("/api/bchat/rooms/{$room->room_uuid}")
+            ->assertStatus(200)
+            ->assertJsonPath('data.pending_session.has_active_challenge', true)
+            ->assertJsonPath('data.pending_session.action_required', true)
+            ->assertJsonPath('data.pending_session.action_type', 'FETCH_SESSION_CHALLENGE_AND_ACK')
+            ->assertJsonPath('data.pending_session.recipient_device_uuid', $recipDev['device']->device_uuid);
+    }
+
+    /**
+     * Skenario 22: Rotasi otomatis challenge kedaluwarsa, binding room-session & device header, lalu ACK sukses.
+     */
+    public function test_scenario_22_expired_session_challenge_rotates_on_fetch_and_enforces_bindings(): void
+    {
+        $initiator = $this->createTestUser('mahasiswa');
+        $recipient = $this->createTestUser('dosen');
+        $initDev = $this->createTestDevice($initiator);
+        $recipDev = $this->createTestDevice($recipient);
+        $otherRecipDev = $this->createTestDevice($recipient);
+
+        $room = $this->createTestRoomWithMembers($initiator, $recipient);
+        $otherInitiator = $this->createTestUser('mahasiswa');
+        $otherRecipient = $this->createTestUser('dosen');
+        $otherRoom = $this->createTestRoomWithMembers($otherInitiator, $otherRecipient);
+
+        $session1 = BchatRoomSession::create([
+            'session_uuid'       => (string) Str::uuid(),
+            'room_id'            => $room->id,
+            'generation_number'  => 1,
+            'status'             => 'ACTIVE',
+            'group_id_hash'      => $room->group_id_hash,
+            'start_epoch'        => 1,
+            'start_sequence'     => 1,
+            'current_sequence'   => 0,
+            'activated_at'       => now(),
+        ]);
+
+        $sessionService = app(BchatRoomSessionService::class);
+        $session2 = $sessionService->createNextSession($initiator, $room);
+        $kp = $this->createTestKeyPackage($recipient, $recipDev['device']);
+        $groupIdHash = hash('sha256', $room->room_uuid);
+
+        $challenge = $sessionService->publishSessionWelcome($initiator, $session2, [
+            'recipient_device_uuid' => $recipDev['device']->device_uuid,
+            'key_package_hash'      => $kp->key_package_hash,
+            'group_id_hash'         => $groupIdHash,
+            'welcome_message'       => base64_encode('welcome_payload_rotate_test'),
+        ]);
+
+        $originalChallengeUuid = $challenge->challenge_uuid;
+        $originalNonce = $challenge->challenge_nonce;
+
+        // Paksa challenge kedaluwarsa
+        $challenge->expires_at = now()->subMinutes(10);
+        $challenge->save();
+
+        Sanctum::actingAs($recipient);
+
+        // 1. Akses sessionUuid dengan roomUuid berbeda ditolak 404 SESSION_NOT_FOUND
+        $this->withHeader('X-Bchat-Device-Uuid', $recipDev['device']->device_uuid)
+            ->getJson("/api/bchat/rooms/{$otherRoom->room_uuid}/sessions/{$session2->session_uuid}/welcome-challenge")
+            ->assertStatus(404)
+            ->assertJsonPath('error_code', 'SESSION_NOT_FOUND');
+
+        // 2. Header X-Bchat-Device-Uuid milik perangkat lain dari user yang sama ditolak 403 RECIPIENT_DEVICE_MISMATCH
+        $this->withHeader('X-Bchat-Device-Uuid', $otherRecipDev['device']->device_uuid)
+            ->getJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$session2->session_uuid}/welcome-challenge")
+            ->assertStatus(403)
+            ->assertJsonPath('error_code', 'RECIPIENT_DEVICE_MISMATCH');
+
+        // 3. Fetch challenge dengan perangkat penerima sah merotasi challenge in-place
+        $rotatedRes = $this->withHeader('X-Bchat-Device-Uuid', $recipDev['device']->device_uuid)
+            ->getJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$session2->session_uuid}/welcome-challenge");
+
+        $rotatedRes->assertStatus(200)
+            ->assertJsonPath('data.challenge_generation', 2)
+            ->assertJsonPath('data.recipient_device_uuid', $recipDev['device']->device_uuid);
+
+        $rotatedChallengeUuid = $rotatedRes->json('data.challenge_uuid');
+        $rotatedNonce = $rotatedRes->json('data.challenge_nonce');
+        $this->assertNotEquals($originalChallengeUuid, $rotatedChallengeUuid);
+        $this->assertNotEquals($originalNonce, $rotatedNonce);
+        $this->assertGreaterThan(0, (int) $rotatedRes->json('data.ttl_remaining_seconds'));
+
+        // 4. Tanda tangani & kirim ACK dengan challenge hasil rotasi -> Gen 2 ACTIVE, Gen 1 ARCHIVED
+        $canonicalPayload = BchatWelcomeAckVerificationService::buildPayload(
+            roomUuid: $room->room_uuid,
+            recipientUserId: (int) $recipient->id,
+            welcomeOperationUuid: $rotatedRes->json('data.welcome_operation_uuid'),
+            challengeUuid: $rotatedChallengeUuid,
+            challengeGeneration: 2,
+            groupIdHashHexOrBin: $groupIdHash,
+            epoch: 1,
+            challengeNonceHexOrBin: $rotatedNonce
+        );
+        $validSig = base64_encode(sodium_crypto_sign_detached($canonicalPayload, $recipDev['secretKey']));
+
+        $ackRes = $this->withHeader('X-Bchat-Device-Uuid', $recipDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$session2->session_uuid}/ack", [
+                'challenge_uuid' => $rotatedChallengeUuid,
+                'signature'      => $validSig,
+            ]);
+
+        $ackRes->assertStatus(200)
+            ->assertJsonPath('data.status', 'ACTIVE')
+            ->assertJsonPath('data.generation_number', 2);
+
+        $this->assertEquals('ARCHIVED', $session1->fresh()->status);
+        $this->assertEquals('ACTIVE', $session2->fresh()->status);
+
+        // 5. Setelah ACK sukses, pending_session kembali null dan active_session menjadi Gen 2
+        $this->getJson("/api/bchat/rooms/{$room->room_uuid}")
+            ->assertStatus(200)
+            ->assertJsonPath('data.pending_session', null)
+            ->assertJsonPath('data.active_session.session_uuid', $session2->session_uuid)
+            ->assertJsonPath('data.active_session.generation_number', 2);
+    }
+
+    /**
+     * Skenario 23: Komunikasi dua arah berjalan lancar pada sesi baru yang baru diaktifkan.
+     */
+    public function test_scenario_23_two_way_messages_work_after_new_session_activation(): void
+    {
+        $initiator = $this->createTestUser('mahasiswa');
+        $recipient = $this->createTestUser('dosen');
+        $initDev = $this->createTestDevice($initiator);
+        $recipDev = $this->createTestDevice($recipient);
+        $room = $this->createTestRoomWithMembers($initiator, $recipient);
+
+        $session1 = BchatRoomSession::create([
+            'session_uuid'       => (string) Str::uuid(),
+            'room_id'            => $room->id,
+            'generation_number'  => 1,
+            'status'             => 'ACTIVE',
+            'group_id_hash'      => $room->group_id_hash,
+            'start_epoch'        => 1,
+            'start_sequence'     => 1,
+            'current_sequence'   => 0,
+            'activated_at'       => now(),
+        ]);
+
+        // Inisiasi & aktifkan sesi generasi 2
+        $sessionService = app(BchatRoomSessionService::class);
+        $session2 = $sessionService->createNextSession($initiator, $room);
+        $kp = $this->createTestKeyPackage($recipient, $recipDev['device']);
+        $groupIdHash = hash('sha256', $room->room_uuid);
+
+        $challenge = $sessionService->publishSessionWelcome($initiator, $session2, [
+            'recipient_device_uuid' => $recipDev['device']->device_uuid,
+            'key_package_hash'      => $kp->key_package_hash,
+            'group_id_hash'         => $groupIdHash,
+            'welcome_message'       => base64_encode('welcome_gen2_two_way'),
+        ]);
+
+        $canonicalPayload = BchatWelcomeAckVerificationService::buildPayload(
+            roomUuid: $room->room_uuid,
+            recipientUserId: (int) $recipient->id,
+            welcomeOperationUuid: $challenge->welcome_operation_uuid,
+            challengeUuid: $challenge->challenge_uuid,
+            challengeGeneration: (int) $challenge->challenge_generation,
+            groupIdHashHexOrBin: $groupIdHash,
+            epoch: 1,
+            challengeNonceHexOrBin: $challenge->challenge_nonce
+        );
+        $validSig = base64_encode(sodium_crypto_sign_detached($canonicalPayload, $recipDev['secretKey']));
+        $sessionService->processSessionWelcomeAck($recipient, $session2, [
+            'challenge_uuid' => $challenge->challenge_uuid,
+            'signature'      => $validSig,
+        ]);
+
+        // Mahasiswa mengirim pesan pertama pada sesi baru (Seq #1)
+        Sanctum::actingAs($initiator);
+        $ct1 = 'ciphertext_from_mahasiswa_gen2';
+        $send1 = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/messages", [
+                'message_uuid'        => (string) Str::uuid(),
+                'epoch'               => 1,
+                'generation'          => 0,
+                'content_type'        => 1,
+                'ciphertext_payload'  => base64_encode($ct1),
+                'payload_hash_sha256' => hash('sha256', $ct1),
+                'client_sent_at'      => now()->toIso8601String(),
+            ]);
+        $send1->assertStatus(201)
+            ->assertJsonPath('data.server_sequence', 1);
+
+        // Dosen membalas pada sesi baru (Seq #2)
+        Sanctum::actingAs($recipient);
+        $ct2 = 'ciphertext_from_dosen_gen2';
+        $send2 = $this->withHeader('X-Bchat-Device-Uuid', $recipDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/messages", [
+                'message_uuid'        => (string) Str::uuid(),
+                'epoch'               => 1,
+                'generation'          => 0,
+                'content_type'        => 1,
+                'ciphertext_payload'  => base64_encode($ct2),
+                'payload_hash_sha256' => hash('sha256', $ct2),
+                'client_sent_at'      => now()->toIso8601String(),
+            ]);
+        $send2->assertStatus(201)
+            ->assertJsonPath('data.server_sequence', 2);
+
+        // Verifikasi kedua pesan terikat pada session2 (bukan session1 yang ARCHIVED)
+        $this->assertEquals('ARCHIVED', $session1->fresh()->status);
+        $this->assertEquals(2, BchatMessage::where('room_id', $room->id)->where('session_id', $session2->id)->count());
+        $this->assertEquals(2, (int) $session2->fresh()->current_sequence);
+    }
+
+    /**
+     * Skenario 24: Polling history-transfers/pending & read room tidak mengonsumsi bucket
+     * rate limiter handshake (sessions/next, sessions/{uuid}/welcome, dan sessions/{uuid}/ack).
+     */
+    public function test_scenario_24_polling_history_transfers_and_room_reads_do_not_exhaust_handshake_rate_limit(): void
+    {
+        $initiator = $this->createTestUser('mahasiswa');
+        $recipient = $this->createTestUser('dosen');
+        $initDev = $this->createTestDevice($initiator);
+        $recipDev = $this->createTestDevice($recipient);
+        $room = $this->createTestRoomWithMembers($initiator, $recipient);
+        $kp = $this->createTestKeyPackage($recipient, $recipDev['device']);
+
+        BchatRoomSession::create([
+            'session_uuid'     => (string) Str::uuid(),
+            'room_id'          => $room->id,
+            'generation_number'=> 1,
+            'status'           => 'ACTIVE',
+            'group_id_hash'    => $room->group_id_hash,
+            'start_epoch'      => 1,
+            'start_sequence'   => 1,
+            'current_sequence' => 0,
+            'activated_at'     => now(),
+        ]);
+
+        // 1. Mahasiswa melakukan 15x polling history-transfers/pending + 5x GET room + 5x partner-key-package (25 hits > batas 10/menit handshake)
+        Sanctum::actingAs($initiator);
+        for ($i = 0; $i < 15; $i++) {
+            $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+                ->getJson('/api/bchat/history-transfers/pending')
+                ->assertStatus(200);
+        }
+        for ($i = 0; $i < 5; $i++) {
+            $this->getJson("/api/bchat/rooms/{$room->room_uuid}")
+                ->assertStatus(200);
+        }
+
+        // 2. Buat sesi generasi baru -> WAJIB lolos (201, bukan 429)
+        $nextRes = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/next");
+        $nextRes->assertStatus(201);
+        $sessionUuid = $nextRes->json('data.session_uuid');
+
+        for ($i = 0; $i < 5; $i++) {
+            $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+                ->getJson("/api/bchat/rooms/{$room->room_uuid}/partner-key-package")
+                ->assertStatus(200);
+        }
+
+        // 3. Publikasi Welcome sesi baru -> WAJIB lolos (200, bukan 429)
+        $groupIdHash = hash('sha256', 'isolated_bucket_gen2_' . $room->room_uuid);
+        $pubRes = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$sessionUuid}/welcome", [
+                'recipient_device_uuid' => $recipDev['device']->device_uuid,
+                'key_package_hash'      => $kp->key_package_hash,
+                'group_id_hash'         => $groupIdHash,
+                'welcome_message'       => base64_encode('welcome_isolated_bucket_payload_32bytes_ok'),
+            ]);
+        $pubRes->assertStatus(200);
+
+        // 4. Dosen juga melakukan 15x polling history-transfers/pending + 5x GET room sebelum ACK -> ACK WAJIB lolos (200)
+        Sanctum::actingAs($recipient);
+        for ($i = 0; $i < 15; $i++) {
+            $this->withHeader('X-Bchat-Device-Uuid', $recipDev['device']->device_uuid)
+                ->getJson('/api/bchat/history-transfers/pending')
+                ->assertStatus(200);
+        }
+        for ($i = 0; $i < 5; $i++) {
+            $this->getJson("/api/bchat/rooms/{$room->room_uuid}")
+                ->assertStatus(200);
+        }
+
+        $chalRes = $this->withHeader('X-Bchat-Device-Uuid', $recipDev['device']->device_uuid)
+            ->getJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$sessionUuid}/welcome-challenge");
+        $chalRes->assertStatus(200);
+        $chal = $chalRes->json('data');
+
+        $canonicalPayload = BchatWelcomeAckVerificationService::buildPayload(
+            roomUuid: $room->room_uuid,
+            recipientUserId: (int) $recipient->id,
+            welcomeOperationUuid: $chal['welcome_operation_uuid'],
+            challengeUuid: $chal['challenge_uuid'],
+            challengeGeneration: (int) $chal['challenge_generation'],
+            groupIdHashHexOrBin: $chal['group_id_hash'],
+            epoch: 1,
+            challengeNonceHexOrBin: $chal['challenge_nonce']
+        );
+        $validSig = base64_encode(sodium_crypto_sign_detached($canonicalPayload, $recipDev['secretKey']));
+
+        $ackRes = $this->withHeader('X-Bchat-Device-Uuid', $recipDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$sessionUuid}/ack", [
+                'challenge_uuid' => $chal['challenge_uuid'],
+                'signature'      => $validSig,
+            ]);
+        $ackRes->assertStatus(200)
+            ->assertJsonPath('data.status', 'ACTIVE');
+    }
+
+    /**
+     * Skenario 25: Endpoint handshake (welcome & sessions/next) tetap menegakkan batas rate limiter 10/menit
+     * terhadap brute-force / spam pada bucket-nya sendiri.
+     */
+    public function test_scenario_25_handshake_endpoints_still_enforce_rate_limiter_protection(): void
+    {
+        $initiator = $this->createTestUser('mahasiswa');
+        $recipient = $this->createTestUser('dosen');
+        $initDev = $this->createTestDevice($initiator);
+        $recipDev = $this->createTestDevice($recipient);
+        $room = $this->createTestRoomWithMembers($initiator, $recipient);
+
+        BchatRoomSession::create([
+            'session_uuid'     => (string) Str::uuid(),
+            'room_id'          => $room->id,
+            'generation_number'=> 1,
+            'status'           => 'ACTIVE',
+            'group_id_hash'    => $room->group_id_hash,
+            'start_epoch'      => 1,
+            'start_sequence'   => 1,
+            'current_sequence' => 0,
+            'activated_at'     => now(),
+        ]);
+
+        $pendingSession = BchatRoomSession::create([
+            'session_uuid'       => (string) Str::uuid(),
+            'room_id'            => $room->id,
+            'generation_number'  => 2,
+            'status'             => 'PENDING',
+            'group_id_hash'      => $room->group_id_hash,
+            'start_epoch'        => 1,
+            'start_sequence'     => 1,
+            'current_sequence'   => 0,
+            'created_by_user_id' => $initiator->id,
+        ]);
+
+        Sanctum::actingAs($initiator);
+
+        // 10 request pertama ke /sessions/{uuid}/welcome menembus middleware throttle (ditolak validasi/404, BUKAN 429)
+        for ($i = 1; $i <= 10; $i++) {
+            $res = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+                ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$pendingSession->session_uuid}/welcome", [
+                    'recipient_device_uuid' => $recipDev['device']->device_uuid,
+                    'key_package_hash'      => hash('sha256', 'nonexistent_kp_' . $i),
+                    'group_id_hash'         => hash('sha256', 'group_' . $i),
+                    'welcome_message'       => base64_encode('dummy_welcome_payload_attempt_' . $i),
+                ]);
+            $this->assertNotEquals(429, $res->getStatusCode(), "Percobaan ke-{$i} seharusnya belum kena 429.");
+        }
+
+        // Request ke-11 ke /sessions/{uuid}/welcome WAJIB ditolak HTTP 429
+        $throttledWelcome = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/{$pendingSession->session_uuid}/welcome", [
+                'recipient_device_uuid' => $recipDev['device']->device_uuid,
+                'key_package_hash'      => hash('sha256', 'nonexistent_kp_11'),
+                'group_id_hash'         => hash('sha256', 'group_11'),
+                'welcome_message'       => base64_encode('dummy_welcome_payload_attempt_11'),
+            ]);
+        $throttledWelcome->assertStatus(429);
+
+        // Bucket /history-transfers/pending tetap tidak terdampak meskipun bucket welcome sudah 429
+        $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->getJson('/api/bchat/history-transfers/pending')
+            ->assertStatus(200);
+
+        // Bucket /sessions/next juga memiliki proteksi 10/menit sendiri
+        for ($i = 1; $i <= 10; $i++) {
+            $res = $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+                ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/next");
+            $this->assertNotEquals(429, $res->getStatusCode(), "sessions/next ke-{$i} seharusnya belum kena 429.");
+        }
+        $this->withHeader('X-Bchat-Device-Uuid', $initDev['device']->device_uuid)
+            ->postJson("/api/bchat/rooms/{$room->room_uuid}/sessions/next")
+            ->assertStatus(429);
+    }
 }

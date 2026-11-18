@@ -36,11 +36,10 @@ import {
   WifiOff,
 } from 'lucide-react';
 import {
-  findActiveLocalDevice,
+  findAllActiveLocalDevices,
+  selectActiveLocalDeviceForUser,
   registerDeviceFlow,
   promoteStagedIdentityKeyToActive,
-  generateSecureDeviceUuid,
-  makeDeviceIdentityKeyId,
   BchatDeviceRegistrationError,
 } from '@/lib/bchat/device/bchat-device-registration';
 import {
@@ -231,6 +230,21 @@ export function BchatDeviceOnboarding({
   const isSubmittingRef = useRef(false);
   const sessionRef = useRef(0);
   const internalWorkerRef = useRef<BchatWorkerClient | null>(null);
+  const notifiedReadyDeviceRef = useRef<string | null>(null);
+
+  const notifyDeviceReadyOnce = useCallback(
+    (devUuid: string) => {
+      const normalized = devUuid.trim().toLowerCase();
+      if (notifiedReadyDeviceRef.current === normalized) {
+        return;
+      }
+      notifiedReadyDeviceRef.current = normalized;
+      setRegisteredDeviceUuid(devUuid);
+      setPhase('DEVICE_READY');
+      onDeviceReady(devUuid);
+    },
+    [onDeviceReady]
+  );
 
   // Bersihkan worker saat unmount
   useEffect(() => {
@@ -255,9 +269,7 @@ export function BchatDeviceOnboarding({
       const existingCount = await countActiveKeyPackagesInStorage(devUuid);
       if (existingCount >= 1) {
         if (session !== sessionRef.current) return;
-        setRegisteredDeviceUuid(devUuid);
-        setPhase('DEVICE_READY');
-        onDeviceReady(devUuid);
+        notifyDeviceReadyOnce(devUuid);
         return;
       }
 
@@ -339,9 +351,7 @@ export function BchatDeviceOnboarding({
           internalWorkerRef.current = null;
         }
 
-        setRegisteredDeviceUuid(devUuid);
-        setPhase('DEVICE_READY');
-        onDeviceReady(devUuid);
+        notifyDeviceReadyOnce(devUuid);
       } catch (err) {
         if (session !== sessionRef.current) return;
         if (internalWorkerRef.current && !workerRpc) {
@@ -357,7 +367,7 @@ export function BchatDeviceOnboarding({
         );
       }
     },
-    [currentUser, onDeviceReady, workerRpc]
+    [currentUser, notifyDeviceReadyOnce, workerRpc]
   );
 
   // ---------------------------------------------------------------------------
@@ -373,18 +383,16 @@ export function BchatDeviceOnboarding({
     setErrorMessage(null);
 
     try {
-      // 1. Cek lokal IndexedDB
+      // 1. Baca seluruh identitas perangkat aktif lokal di IndexedDB
       setStatusMessage('Membaca identitas lokal...');
-      const localDevice = await findActiveLocalDevice();
+      const allLocalDevices = await findAllActiveLocalDevices();
       if (session !== sessionRef.current) return;
 
-      // 2. Ambil status dari backend
+      // 2. Ambil status perangkat akun yang sedang login dari backend
       setStatusMessage('Memeriksa status backend...');
       let backendRes: BchatDeviceStatusData;
       try {
-        const statusRes = await getDeviceStatus(
-          localDevice ? { device_uuid: localDevice.deviceUuid } : undefined
-        );
+        const statusRes = await getDeviceStatus();
         backendRes = statusRes.data;
       } catch (err) {
         if (session !== sessionRef.current) return;
@@ -402,28 +410,34 @@ export function BchatDeviceOnboarding({
       if (session !== sessionRef.current) return;
       setBackendStatus(backendRes);
 
-      // 3. Analisis kondisi
+      // 3. Resolusi perangkat lokal yang terverifikasi milik akun login & ACTIVE di backend
+      const activeList = backendRes.active_devices ?? (backendRes.active_device ? [backendRes.active_device] : []);
+      const backendActiveUuids = activeList.map((d) => d.device_uuid);
+      const localDevice = selectActiveLocalDeviceForUser(allLocalDevices, {
+        userId: currentUser?.id ?? null,
+        backendActiveDeviceUuids: backendActiveUuids,
+      });
+
       if (localDevice) {
         const localUuid = localDevice.deviceUuid.toLowerCase();
-        const activeList = backendRes.active_devices ?? (backendRes.active_device ? [backendRes.active_device] : []);
         const matchingActiveDevice = activeList.find(
           (d) => d.device_uuid.toLowerCase() === localUuid
         );
 
         if (matchingActiveDevice) {
-          // ✅ Kondisi A: lokal ACTIVE cocok dengan salah satu perangkat ACTIVE di backend (Multi-Device)
+          // Perangkat ACTIVE cocok dengan akun yang login.
+          // Pastikan KeyPackage HANYA dipublikasikan jika perangkat sudah berstatus tepercaya (is_trusted === true).
+          if (matchingActiveDevice.is_trusted === false) {
+            notifyDeviceReadyOnce(localDevice.deviceUuid);
+            return;
+          }
           setRegisteredDeviceUuid(localDevice.deviceUuid);
           await runKeyPackagePublish(localDevice.deviceUuid, session);
-          return;
-        } else {
-          // Kunci lokal ada namun tidak lagi terdaftar aktif di backend (misal telah dicabut)
-          setPhase('NEEDS_REGISTRATION');
-          setStatusMessage('');
           return;
         }
       }
 
-      // Tidak ada lokal device — cek apakah ada staged key yang bisa direkonsiliasi
+      // Tidak ada lokal device milik user ini — cek apakah ada staged key yang bisa direkonsiliasi
       const staged = await findStagedDeviceInKeystore();
       if (session !== sessionRef.current) return;
 
@@ -432,29 +446,40 @@ export function BchatDeviceOnboarding({
         setStatusMessage('Memeriksa registrasi sebelumnya...');
         setPhase('RECONCILING');
 
-        // Cek apakah staged UUID sudah ACTIVE di backend
+        // Cek apakah staged UUID sudah ACTIVE di backend untuk akun ini
         try {
           const reconRes = await getDeviceStatus({ device_uuid: staged.deviceUuid });
           if (session !== sessionRef.current) return;
 
           const queried = reconRes.data.queried_device;
-          if (queried?.is_active) {
-            // ✅ Kondisi D: staged UUID sudah ACTIVE → promosikan lokal
+          const reconActiveList =
+            reconRes.data.active_devices ??
+            (reconRes.data.active_device ? [reconRes.data.active_device] : []);
+          const matchedStaged = reconActiveList.find(
+            (d) => d.device_uuid.toLowerCase() === staged.deviceUuid.toLowerCase()
+          );
+
+          if (queried?.is_active && matchedStaged) {
+            // ✅ Kondisi D: staged UUID sudah ACTIVE milik akun ini → promosikan lokal beserta user_id
             setStatusMessage('Merekonsiliasi registrasi sebelumnya...');
-            const activeInfo = reconRes.data.active_device;
             await promoteStagedIdentityKeyToActive(
               staged.deviceUuid,
-              activeInfo?.key_version ?? 1,
-              activeInfo?.status ?? 'ACTIVE',
-              activeInfo?.registered_at ?? new Date().toISOString()
+              matchedStaged.key_version ?? 1,
+              matchedStaged.status ?? 'ACTIVE',
+              matchedStaged.registered_at ?? new Date().toISOString(),
+              currentUser?.id ?? null
             );
             if (session !== sessionRef.current) return;
-            setRegisteredDeviceUuid(staged.deviceUuid);
             setStagedKey(null);
+            if (matchedStaged.is_trusted === false) {
+              notifyDeviceReadyOnce(staged.deviceUuid);
+              return;
+            }
+            setRegisteredDeviceUuid(staged.deviceUuid);
             await runKeyPackagePublish(staged.deviceUuid, session);
             return;
           } else {
-            // Staged belum terdaftar aktif → arahkan ke registrasi baru
+            // Staged belum terdaftar aktif pada akun ini → arahkan ke registrasi baru
             setPhase('NEEDS_REGISTRATION');
             setStatusMessage('');
             return;
@@ -470,7 +495,7 @@ export function BchatDeviceOnboarding({
         }
       }
 
-      // Tidak ada lokal, tidak ada staged → registrasi perangkat baru (Multi-Device ADD_DEVICE)
+      // Tidak ada lokal milik akun ini, tidak ada staged → registrasi perangkat baru (Multi-Device ADD_DEVICE)
       setPhase('NEEDS_REGISTRATION');
       setStatusMessage('');
     } catch (err) {
@@ -480,19 +505,12 @@ export function BchatDeviceOnboarding({
         (err instanceof Error ? err.message : 'Terjadi kesalahan tidak terduga saat pemeriksaan awal.')
       );
     }
-  }, [onDeviceReady, runKeyPackagePublish]);
+  }, [currentUser?.id, notifyDeviceReadyOnce, runKeyPackagePublish]);
 
-  // Jalankan pemeriksaan saat mount
+  // Jalankan pemeriksaan saat mount (1x)
   useEffect(() => {
     runInitialCheck();
   }, []);
-
-  // Saat phase DEVICE_READY, trigger callback
-  useEffect(() => {
-    if (phase === 'DEVICE_READY' && registeredDeviceUuid) {
-      onDeviceReady(registeredDeviceUuid);
-    }
-  }, [phase, registeredDeviceUuid, onDeviceReady]);
 
   // ---------------------------------------------------------------------------
   // SUBMIT REGISTRASI BARU
@@ -531,6 +549,15 @@ export function BchatDeviceOnboarding({
       if (session !== sessionRef.current) return;
 
       setRegisteredDeviceUuid(result.deviceUuid);
+
+      // Pastikan KeyPackage HANYA dipublikasikan jika perangkat telah berstatus tepercaya (is_trusted === true).
+      // Jika perangkat baru belum tepercaya (misal perangkat tambahan), serahkan ke pairing/trust gate terlebih dahulu.
+      if (!result.isTrusted) {
+        setStatusMessage('Perangkat terdaftar. Menuju tahap verifikasi kepercayaan perangkat...');
+        notifyDeviceReadyOnce(result.deviceUuid);
+        return;
+      }
+
       setStatusMessage('Perangkat berhasil didaftarkan. Mempublikasikan paket kunci...');
       setPhase('PUBLISHING_KEYPACKAGES');
 
@@ -542,7 +569,7 @@ export function BchatDeviceOnboarding({
     } finally {
       isSubmittingRef.current = false;
     }
-  }, [password, deviceName, runKeyPackagePublish]);
+  }, [password, deviceName, notifyDeviceReadyOnce, runKeyPackagePublish]);
 
   // ---------------------------------------------------------------------------
   // SUBMIT REPLACEMENT
@@ -582,6 +609,13 @@ export function BchatDeviceOnboarding({
 
       setRegisteredDeviceUuid(result.deviceUuid);
       setExistingActiveDevice(null);
+
+      if (!result.isTrusted) {
+        setStatusMessage('Perangkat terdaftar. Menuju tahap verifikasi kepercayaan perangkat...');
+        notifyDeviceReadyOnce(result.deviceUuid);
+        return;
+      }
+
       setStatusMessage('Perangkat berhasil didaftarkan. Mempublikasikan paket kunci...');
       setPhase('PUBLISHING_KEYPACKAGES');
 
@@ -611,7 +645,7 @@ export function BchatDeviceOnboarding({
     } finally {
       isSubmittingRef.current = false;
     }
-  }, [password, deviceName, existingActiveDevice, runInitialCheck, runKeyPackagePublish]);
+  }, [password, deviceName, existingActiveDevice, notifyDeviceReadyOnce, runInitialCheck, runKeyPackagePublish]);
 
   // ---------------------------------------------------------------------------
   // HELPER: Retry publikasi KeyPackage saja
@@ -983,8 +1017,7 @@ export function BchatDeviceOnboarding({
               onClick={() => {
                 // Lewati keypackage dan lanjutkan
                 if (registeredDeviceUuid) {
-                  setPhase('DEVICE_READY');
-                  onDeviceReady(registeredDeviceUuid);
+                  notifyDeviceReadyOnce(registeredDeviceUuid);
                 }
               }}
               className="py-2 px-4 bg-white border border-slate-200 text-slate-600 text-sm font-medium rounded-lg hover:bg-slate-50 transition"

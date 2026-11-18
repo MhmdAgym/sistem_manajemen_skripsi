@@ -31,6 +31,11 @@ import {
   publishWelcome,
   fetchOrRotateWelcomeChallenge,
   submitWelcomeAck,
+  createNextRoomSession,
+  fetchPendingRoomSession,
+  publishSessionWelcome,
+  fetchSessionWelcomeChallenge,
+  submitSessionWelcomeAck,
   BchatApiError,
 } from '@/lib/bchat/api/bchat-api-client';
 import type {
@@ -41,6 +46,10 @@ import type {
   BchatWelcomeChallengeResponseData,
   BchatWelcomeAckRequest,
   BchatWelcomeAckResponseData,
+  BchatRoomSessionData,
+  BchatSessionWelcomePublishRequest,
+  BchatSessionWelcomeChallengeResponseData,
+  BchatSessionWelcomeAckRequest,
 } from '@/lib/bchat/api/bchat-api-types';
 import type { BchatWorkerClient } from '@/lib/bchat/bchat-poc-rpc';
 import type {
@@ -206,6 +215,14 @@ function validateFencing(
 }
 
 /**
+ * Mengklasifikasikan error HTTP 429 (Rate Limit) secara eksplisit sebagai error transient
+ * yang dapat dicoba ulang secara idempoten tanpa menganggap payload Welcome gagal permanen.
+ */
+export function isRateLimitPublishError(err: unknown): boolean {
+  return err instanceof BchatApiError && err.status === 429;
+}
+
+/**
  * Mengklasifikasikan error jaringan / HTTP menjadi Ambigu (transient / indeterminate)
  * vs Definitif (permanent failure).
  */
@@ -227,6 +244,187 @@ export function isAmbiguousPublishError(err: unknown): boolean {
     msg.includes('network') ||
     msg.includes('aborterror') ||
     msg.includes('econnrefused')
+  );
+}
+
+const BASE64_WIRE_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/**
+ * Memverifikasi dan memilih entri outbox Welcome lokal yang valid dan dapat dipublikasikan ulang
+ * untuk room tertentu (menerima status 'pending', 'in_transit', maupun 'failed' akibat HTTP 429 sebelumnya).
+ * Mengembalikan null (fail-closed) jika tidak ada Welcome valid atau payload korup/kosong.
+ */
+export function findRecoverablePendingWelcomeOutbox(
+  messages: OutboxItemSummary[] | undefined | null,
+  roomUuid: string
+): OutboxItemSummary | null {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return null;
+  }
+  const normalizedRoomUuid = roomUuid.trim().toLowerCase();
+
+  const validCandidates = messages.filter((m) => {
+    if (!m || m.messageType !== 'welcome') return false;
+    if (m.status !== 'pending' && m.status !== 'in_transit' && m.status !== 'failed') {
+      return false;
+    }
+    if (typeof m.clientMessageUuid !== 'string' || m.clientMessageUuid.trim() === '') {
+      return false;
+    }
+    if (typeof m.roomUuid !== 'string' || m.roomUuid.trim().toLowerCase() !== normalizedRoomUuid) {
+      return false;
+    }
+    if (typeof m.ciphertextWireBase64 !== 'string') return false;
+    const wire = m.ciphertextWireBase64.trim();
+    if (wire.length < 44 || wire.length % 4 !== 0 || !BASE64_WIRE_REGEX.test(wire)) {
+      return false;
+    }
+    return true;
+  });
+
+  if (validCandidates.length === 0) {
+    return null;
+  }
+
+  validCandidates.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+  return validCandidates[0];
+}
+
+export type ActiveRoomFoundDecision =
+  | { action: 'PROCEED_NORMAL_CHAT' }
+  | {
+      action: 'AWAIT_PARTNER_SESSION_ACK';
+      sessionUuid: string;
+      generationNumber: number;
+    }
+  | {
+      action: 'RECOVER_PENDING_SESSION_WELCOME';
+      sessionUuid: string;
+      generationNumber: number;
+      welcomeItem: OutboxItemSummary;
+    }
+  | {
+      action: 'FAIL_CLOSED_MISSING_PENDING_WELCOME';
+      sessionUuid: string;
+      generationNumber: number;
+      reason: string;
+    };
+
+/**
+ * Mengevaluasi secara deterministik langkah aman ketika room berstatus ACTIVE
+ * dan GroupState lokal ditemukan (FOUND).
+ *
+ * Invarian keamanan:
+ * - Sesi normal yang sudah memiliki riwayat / cursor > 0 atau tanpa pending_session
+ *   selalu masuk chat normal (PROCEED_NORMAL_CHAT) tanpa memicu inisiasi sesi baru.
+ * - Sesi PENDING dengan action_type = PUBLISH_SESSION_WELCOME dan has_active_challenge = false
+ *   pada perangkat inisiator (epoch 1, seq 0, tanpa riwayat lokal) DILARANG masuk chat normal:
+ *   - Jika Welcome lokal valid tersedia di outbox -> RECOVER_PENDING_SESSION_WELCOME.
+ *   - Jika Welcome lokal tidak tersedia / tidak valid -> FAIL_CLOSED_MISSING_PENDING_WELCOME.
+ */
+export function evaluateActiveRoomFoundState(params: {
+  roomUuid: string;
+  myRole?: string | null;
+  pendingSession: BchatRoomDetail['pending_session'] | null | undefined;
+  restoreRes: Pick<RestoreGroupStateResult, 'status' | 'epoch' | 'groupIdHash' | 'lastProcessedSequence'>;
+  localHistoryCount: number;
+  outboxMessages?: OutboxItemSummary[] | null;
+}): ActiveRoomFoundDecision {
+  const { roomUuid, myRole, pendingSession, restoreRes, localHistoryCount, outboxMessages } = params;
+
+  if (
+    restoreRes.status !== 'FOUND' ||
+    !pendingSession ||
+    pendingSession.status !== 'PENDING'
+  ) {
+    return { action: 'PROCEED_NORMAL_CHAT' };
+  }
+
+  const isFreshInitiatorGroupState =
+    restoreRes.epoch === '1' &&
+    (restoreRes.lastProcessedSequence ?? 0) === 0 &&
+    localHistoryCount === 0;
+
+  if (!isFreshInitiatorGroupState) {
+    return { action: 'PROCEED_NORMAL_CHAT' };
+  }
+
+  if (
+    pendingSession.action_type === 'AWAIT_PARTNER_SESSION_ACK' &&
+    pendingSession.has_active_challenge === true
+  ) {
+    return {
+      action: 'AWAIT_PARTNER_SESSION_ACK',
+      sessionUuid: pendingSession.session_uuid,
+      generationNumber: pendingSession.generation_number,
+    };
+  }
+
+  if (
+    pendingSession.action_type === 'PUBLISH_SESSION_WELCOME' &&
+    pendingSession.has_active_challenge === false &&
+    myRole === 'mahasiswa'
+  ) {
+    const hasValidGroupIdHash =
+      typeof restoreRes.groupIdHash === 'string' &&
+      SHA256_HEX_REGEX.test(restoreRes.groupIdHash.trim().toLowerCase());
+    const recoverableWelcome = findRecoverablePendingWelcomeOutbox(outboxMessages, roomUuid);
+
+    if (hasValidGroupIdHash && recoverableWelcome) {
+      return {
+        action: 'RECOVER_PENDING_SESSION_WELCOME',
+        sessionUuid: pendingSession.session_uuid,
+        generationNumber: pendingSession.generation_number,
+        welcomeItem: recoverableWelcome,
+      };
+    }
+
+    return {
+      action: 'FAIL_CLOSED_MISSING_PENDING_WELCOME',
+      sessionUuid: pendingSession.session_uuid,
+      generationNumber: pendingSession.generation_number,
+      reason: !hasValidGroupIdHash
+        ? `GroupState lokal untuk sesi tertunda Generasi #${pendingSession.generation_number} tidak memiliki group_id_hash yang valid.`
+        : `Sesi tertunda Generasi #${pendingSession.generation_number} belum menyelesaikan publikasi Welcome di server dan payload Welcome lokal yang valid tidak ditemukan di outbox perangkat ini.`,
+    };
+  }
+
+  return { action: 'PROCEED_NORMAL_CHAT' };
+}
+
+export interface HistoryTransferPollingEligibility {
+  deviceUuid: string | null;
+  userId?: number | null;
+  onboardingGate: 'PENDING' | 'CHECKING' | 'ONBOARDING' | 'PAIRING' | 'PASSED';
+  connectionStatus: 'INITIALIZING' | 'CONNECTED' | 'RECONNECTING' | 'OFFLINE' | 'ERROR';
+  hasTransferSourceDevices: boolean;
+  hasLocalGroupState: boolean;
+  isUnrecoverableActiveRoom: boolean;
+  hasWaitingState: boolean;
+  isHistoryTransferModalOpen: boolean;
+  hasIncomingTransferRequest: boolean;
+}
+
+/**
+ * Menentukan secara ketat apakah polling GET /api/bchat/history-transfers/pending boleh berjalan.
+ * Polling HANYA aktif untuk perangkat sumber yang sudah terhubung dengan GroupState valid
+ * dan benar-benar memiliki perangkat tepercaya lain (eligible peer) untuk History Transfer.
+ */
+export function shouldPollIncomingHistoryTransfers(
+  ctx: HistoryTransferPollingEligibility
+): boolean {
+  return (
+    Boolean(ctx.deviceUuid && ctx.deviceUuid.trim() !== '') &&
+    typeof ctx.userId === 'number' &&
+    ctx.userId > 0 &&
+    ctx.onboardingGate === 'PASSED' &&
+    ctx.connectionStatus === 'CONNECTED' &&
+    ctx.hasTransferSourceDevices === true &&
+    ctx.hasLocalGroupState === true &&
+    ctx.isUnrecoverableActiveRoom === false &&
+    ctx.hasWaitingState === false &&
+    ctx.isHistoryTransferModalOpen === false &&
+    ctx.hasIncomingTransferRequest === false
   );
 }
 
@@ -326,7 +524,7 @@ export async function publishWelcomeHandshakeFlow(
     let recipientUserId = '';
     let recipientDeviceUuid = '';
     try {
-      const partnerRes = await fetchPartnerKeyPackage(canonicalRoomUuid);
+      const partnerRes = await fetchPartnerKeyPackage(canonicalRoomUuid, canonicalDeviceUuid);
       recipientUserId = partnerRes?.data?.recipient_user_id ?? '';
       recipientDeviceUuid = partnerRes?.data?.recipient_device_uuid ?? '';
     } catch {
@@ -393,7 +591,7 @@ export async function publishWelcomeHandshakeFlow(
     let recipientUserId = '';
     let recipientDeviceUuid = '';
     try {
-      const partnerRes = await fetchPartnerKeyPackage(canonicalRoomUuid);
+      const partnerRes = await fetchPartnerKeyPackage(canonicalRoomUuid, canonicalDeviceUuid);
       recipientUserId = partnerRes?.data?.recipient_user_id ?? '';
       recipientDeviceUuid = partnerRes?.data?.recipient_device_uuid ?? '';
     } catch {
@@ -451,7 +649,7 @@ export async function publishWelcomeHandshakeFlow(
   // 3. Ambil partner KeyPackage dosen
   let partnerPkg: BchatPartnerKeyPackageResponseData;
   try {
-    const pkgRes = await fetchPartnerKeyPackage(canonicalRoomUuid);
+    const pkgRes = await fetchPartnerKeyPackage(canonicalRoomUuid, canonicalDeviceUuid);
     partnerPkg = pkgRes.data;
   } catch (apiErr) {
     throw new BchatHandshakeCoordinatorError(
@@ -665,7 +863,7 @@ export async function publishWelcomeHandshakeFlow(
 
   let publishRes: BchatWelcomePublishResponseData;
   try {
-    const res = await publishWelcome(canonicalRoomUuid, publishPayload);
+    const res = await publishWelcome(canonicalRoomUuid, publishPayload, canonicalDeviceUuid);
     publishRes = res.data;
   } catch (publishErr) {
     // 7. KLASIFIKASI ERROR PUBLIKASI: AMBIGU vs DEFINITIF
@@ -1101,7 +1299,7 @@ export async function fetchChallengeAndAckHandshakeFlow(
   // 4. Ambil Welcome challenge melalui endpoint POST /api/bchat/rooms/{roomUuid}/welcome-challenge
   let challengeData: BchatWelcomeChallengeResponseData;
   try {
-    const challengeRes = await fetchOrRotateWelcomeChallenge(canonicalRoomUuid);
+    const challengeRes = await fetchOrRotateWelcomeChallenge(canonicalRoomUuid, canonicalDeviceUuid);
     challengeData = challengeRes.data;
   } catch (apiErr) {
     throw new BchatHandshakeCoordinatorError(
@@ -1369,7 +1567,7 @@ export async function fetchChallengeAndAckHandshakeFlow(
 
   let ackResponse: BchatWelcomeAckResponseData;
   try {
-    const res = await submitWelcomeAck(canonicalRoomUuid, ackPayloadReq);
+    const res = await submitWelcomeAck(canonicalRoomUuid, ackPayloadReq, canonicalDeviceUuid);
     ackResponse = res.data;
   } catch (ackErr) {
     // Jika pengiriman ACK menghasilkan error ambigu, periksa apakah room sudah aktif di backend
@@ -1426,4 +1624,952 @@ export async function fetchChallengeAndAckHandshakeFlow(
     signatureBase64: signedAck.signatureBase64,
     groupIdHash: normalizedTargetGroupIdHash,
   };
+}
+
+// -----------------------------------------------------------------------------
+// MULTI-GENERATION ROOM SESSION HANDSHAKE (ROOM ACTIVE TANPA GROUPSTATE LOKAL)
+// -----------------------------------------------------------------------------
+
+export interface InitiateNextSessionOptions {
+  fencing: FencingRpcInput;
+  timeoutMs?: number;
+}
+
+export interface InitiateNextSessionResult {
+  status: 'AWAITING_ACK' | 'ALREADY_ACTIVE';
+  roomUuid: string;
+  sessionUuid: string;
+  generationNumber: number;
+  welcomeOperationUuid: string;
+  challengeUuid: string;
+  expiresAt: string | null;
+  groupIdHash: string;
+  recipientDeviceUuid: string;
+}
+
+export interface CompletePendingSessionOptions {
+  fencing: FencingRpcInput;
+  userId?: string | number | bigint;
+  expectedSessionUuid?: string;
+  timeoutMs?: number;
+}
+
+export interface CompletePendingSessionResult {
+  roomUuid: string;
+  sessionUuid: string;
+  generationNumber: number;
+  sessionStatus: string; // 'ACTIVE'
+  startSequence: number;
+  activatedAt: string;
+  welcomeOperationUuid: string;
+  challengeUuid: string;
+  signatureBase64: string;
+  groupIdHash: string;
+}
+
+/**
+ * Mengorkestrasikan inisiasi sesi generasi baru (BchatRoomSession) oleh mahasiswa
+ * pada room berstatus ACTIVE ketika perangkat belum memiliki GroupState lokal.
+ *
+ * Invarian:
+ * - TIDAK membuat sesi baru bila sudah ada pending_session pada room.
+ * - TIDAK menimpa GroupState aktif yang sudah ada (fail-closed jika epoch != '0').
+ * - Menggunakan operasi MLS Worker yang sudah ada (GENERATE_KEY_PACKAGE, CREATE_GROUP, COMMIT_ADD_MEMBER).
+ * - Mengirim header X-Bchat-Device-Uuid pada seluruh request handshake.
+ */
+export async function initiateNextSessionHandshakeFlow(
+  workerRpc: BchatWorkerClient,
+  roomUuid: string,
+  deviceUuid: string,
+  options: InitiateNextSessionOptions
+): Promise<InitiateNextSessionResult> {
+  const canonicalRoomUuid = validateCanonicalUuid(roomUuid, 'roomUuid');
+  const canonicalDeviceUuid = validateCanonicalUuid(deviceUuid, 'deviceUuid');
+  const cleanFencing = validateFencing(options?.fencing, 'initiateNextSessionHandshakeFlow');
+
+  if (!workerRpc || typeof workerRpc.sendRequest !== 'function') {
+    throw new BchatHandshakeCoordinatorError(
+      'Worker RPC client tidak valid atau belum diinisialisasi.',
+      'INVALID_WORKER_CLIENT'
+    );
+  }
+
+  const timeoutMs = options.timeoutMs ?? 25000;
+
+  // 1. Ambil detail room aktual
+  let roomDetail: BchatRoomDetail;
+  try {
+    const roomRes = await fetchRoomDetail(canonicalRoomUuid);
+    roomDetail = roomRes.data;
+  } catch (apiErr) {
+    throw new BchatHandshakeCoordinatorError(
+      `Gagal mengambil detail room [${canonicalRoomUuid}]: ${(apiErr as Error)?.message}`,
+      'FETCH_ROOM_DETAIL_FAILED',
+      apiErr
+    );
+  }
+
+  if (roomDetail.status !== 'ACTIVE') {
+    throw new BchatHandshakeCoordinatorError(
+      `Inisiasi sesi generasi baru hanya diizinkan pada room ACTIVE (status saat ini: ${roomDetail.status}).`,
+      'INVALID_ROOM_STATUS',
+      undefined,
+      { roomStatus: roomDetail.status }
+    );
+  }
+
+  if (roomDetail.my_membership?.role !== 'mahasiswa') {
+    throw new BchatHandshakeCoordinatorError(
+      'Hanya mahasiswa yang dapat menginisiasi sesi aman baru pada ruang bimbingan ini.',
+      'MEMBERSHIP_ROLE_MISMATCH'
+    );
+  }
+
+  // 2. Cek apakah sudah ada sesi PENDING pada room yang Welcome-nya SUDAH terpublikasi (idempoten)
+  const existingPendingSession =
+    roomDetail.pending_session && roomDetail.pending_session.status === 'PENDING'
+      ? roomDetail.pending_session
+      : null;
+
+  if (existingPendingSession && existingPendingSession.has_active_challenge) {
+    const existingSessionUuid = validateCanonicalUuid(
+      existingPendingSession.session_uuid,
+      'session_uuid'
+    );
+    const existingGenerationNumber = existingPendingSession.generation_number;
+    try {
+      const outboxRes = await workerRpc.sendRequest<GetRoomOutboxPayload, GetRoomOutboxResult>(
+        'GET_ROOM_OUTBOX',
+        { roomUuid: canonicalRoomUuid }
+      );
+      const welcomeItem = outboxRes?.messages?.find((m) => m.messageType === 'welcome');
+      if (welcomeItem && welcomeItem.status !== 'acked') {
+        await workerRpc.sendRequest<UpdateOutboxStatusPayload, UpdateOutboxStatusResult>(
+          'UPDATE_OUTBOX_STATUS',
+          {
+            clientMessageUuid: welcomeItem.clientMessageUuid,
+            status: 'acked',
+            deviceUuid: canonicalDeviceUuid,
+            fencing: cleanFencing,
+          },
+          5000
+        );
+      }
+    } catch {
+      // Abaikan kegagalan lookup outbox sekunder
+    }
+
+    return {
+      status: 'AWAITING_ACK',
+      roomUuid: canonicalRoomUuid,
+      sessionUuid: existingSessionUuid,
+      generationNumber: existingGenerationNumber,
+      welcomeOperationUuid: existingPendingSession.welcome_operation_uuid ?? '',
+      challengeUuid: '',
+      expiresAt: existingPendingSession.expires_at ?? null,
+      groupIdHash: roomDetail.group_id_hash ?? '',
+      recipientDeviceUuid: existingPendingSession.recipient_device_uuid ?? '',
+    };
+  }
+
+  // 3. Evaluasi state lokal (Outbox Welcome & GroupState) SEBELUM membuat sesi baru di server
+  //    agar kondisi fail-closed tidak pernah menciptakan sesi PENDING liar maupun meregenerasi GroupState/Commit/Welcome.
+  let existingWelcomeItem: OutboxItemSummary | null = null;
+  try {
+    const outboxRes = await workerRpc.sendRequest<GetRoomOutboxPayload, GetRoomOutboxResult>(
+      'GET_ROOM_OUTBOX',
+      { roomUuid: canonicalRoomUuid }
+    );
+    existingWelcomeItem = findRecoverablePendingWelcomeOutbox(
+      outboxRes?.messages,
+      canonicalRoomUuid
+    );
+  } catch {
+    existingWelcomeItem = null;
+  }
+
+  const preRestoreRes = await workerRpc.sendRequest<RestoreGroupStatePayload, RestoreGroupStateResult>(
+    'RESTORE_GROUP_STATE',
+    {
+      roomUuid: canonicalRoomUuid,
+      deviceUuid: canonicalDeviceUuid,
+      fencing: cleanFencing,
+    },
+    timeoutMs
+  );
+
+  if (existingWelcomeItem) {
+    const hasValidHash =
+      typeof preRestoreRes.groupIdHash === 'string' &&
+      SHA256_HEX_REGEX.test(preRestoreRes.groupIdHash.trim().toLowerCase());
+    if (
+      preRestoreRes.status !== 'FOUND' ||
+      !hasValidHash ||
+      preRestoreRes.epoch !== '1' ||
+      (preRestoreRes.lastProcessedSequence ?? 0) !== 0
+    ) {
+      throw new BchatHandshakeCoordinatorError(
+        `GroupState lokal tidak valid untuk publikasi ulang Welcome sesi (status: ${preRestoreRes?.status}, epoch: ${preRestoreRes?.epoch}, seq: ${preRestoreRes?.lastProcessedSequence ?? 0}).`,
+        'INVALID_RESTORED_GROUP_STATE'
+      );
+    }
+  } else if (preRestoreRes.status === 'FOUND') {
+    if (
+      existingPendingSession &&
+      existingPendingSession.has_active_challenge === false &&
+      preRestoreRes.epoch === '1' &&
+      (preRestoreRes.lastProcessedSequence ?? 0) === 0
+    ) {
+      throw new BchatHandshakeCoordinatorError(
+        `Sesi tertunda Generasi #${existingPendingSession.generation_number} belum menyelesaikan publikasi Welcome dan payload Welcome lokal yang valid tidak ditemukan di outbox. Publikasi dibatalkan secara aman (fail-closed) tanpa membuat sesi pengganti.`,
+        'PENDING_WELCOME_OUTBOX_MISSING',
+        undefined,
+        {
+          sessionUuid: existingPendingSession.session_uuid,
+          generationNumber: existingPendingSession.generation_number,
+        }
+      );
+    }
+
+    if (!(preRestoreRes.epoch === '0' && preRestoreRes.groupIdHash)) {
+      throw new BchatHandshakeCoordinatorError(
+        'Perangkat ini sudah memiliki GroupState MLS aktif. Inisiasi sesi baru dibatalkan secara aman (fail-closed).',
+        'ACTIVE_GROUP_STATE_ALREADY_EXISTS'
+      );
+    }
+  } else if (preRestoreRes.status !== 'NOT_FOUND') {
+    throw new BchatHandshakeCoordinatorError(
+      `Status GroupState lokal tidak mengizinkan inisiasi sesi baru (${preRestoreRes.status}).`,
+      `RESTORE_STATUS_${preRestoreRes.status}`
+    );
+  }
+
+  // 4. Resolusi target session UUID (gunakan ulang pending_session jika sudah ada — JANGAN buat sesi duplikat!)
+  let targetSessionUuid: string;
+  let targetGenerationNumber: number;
+
+  if (existingPendingSession) {
+    targetSessionUuid = validateCanonicalUuid(existingPendingSession.session_uuid, 'session_uuid');
+    targetGenerationNumber = existingPendingSession.generation_number;
+  } else {
+    // Belum ada pending_session -> buat generasi sesi baru (PENDING)
+    let createdSession: BchatRoomSessionData;
+    try {
+      const nextRes = await createNextRoomSession(canonicalRoomUuid, {}, canonicalDeviceUuid);
+      createdSession = nextRes.data;
+    } catch (createErr) {
+      // Tangani konkurensi: jika sesi PENDING ternyata baru saja dibuat, gunakan sesi yang ada
+      if (
+        createErr instanceof BchatApiError &&
+        createErr.status === 409 &&
+        createErr.errorCode === 'SESSION_ALREADY_PENDING'
+      ) {
+        try {
+          const pendingRes = await fetchPendingRoomSession(canonicalRoomUuid, canonicalDeviceUuid);
+          createdSession = pendingRes.data;
+        } catch (pendingErr) {
+          throw new BchatHandshakeCoordinatorError(
+            `Sesi PENDING sudah ada namun gagal diambil ulang: ${(pendingErr as Error)?.message}`,
+            'FETCH_PENDING_SESSION_FAILED',
+            pendingErr
+          );
+        }
+      } else {
+        throw new BchatHandshakeCoordinatorError(
+          `Gagal membuat generasi sesi baru untuk room [${canonicalRoomUuid}]: ${(createErr as Error)?.message}`,
+          'CREATE_NEXT_SESSION_FAILED',
+          createErr
+        );
+      }
+    }
+
+    targetSessionUuid = validateCanonicalUuid(createdSession.session_uuid, 'session_uuid');
+    targetGenerationNumber = createdSession.generation_number;
+  }
+
+  // 5. Ambil partner KeyPackage dosen (diizinkan backend saat ACTIVE + pendingSession)
+  let partnerPkg: BchatPartnerKeyPackageResponseData;
+  try {
+    const pkgRes = await fetchPartnerKeyPackage(canonicalRoomUuid, canonicalDeviceUuid);
+    partnerPkg = pkgRes.data;
+  } catch (apiErr) {
+    throw new BchatHandshakeCoordinatorError(
+      `Gagal mengambil KeyPackage dosen pembimbing untuk sesi baru: ${(apiErr as Error)?.message}`,
+      'FETCH_PARTNER_KEY_PACKAGE_FAILED',
+      apiErr
+    );
+  }
+
+  if (!partnerPkg?.key_package_data || !partnerPkg?.recipient_device_uuid) {
+    throw new BchatHandshakeCoordinatorError(
+      'Data KeyPackage partner untuk inisiasi sesi baru tidak lengkap.',
+      'INVALID_PARTNER_KEY_PACKAGE'
+    );
+  }
+
+  const partnerDeviceUuid = validateCanonicalUuid(
+    partnerPkg.recipient_device_uuid,
+    'recipient_device_uuid'
+  );
+  const partnerPkgHash = partnerPkg.key_package_hash?.trim().toLowerCase();
+  if (!SHA256_HEX_REGEX.test(partnerPkgHash)) {
+    throw new BchatHandshakeCoordinatorError(
+      'Hash KeyPackage partner tidak valid (wajib SHA-256 64 karakter hex).',
+      'INVALID_PARTNER_KEY_PACKAGE_HASH'
+    );
+  }
+
+  // 6. Siapkan payload Welcome (recovery dari outbox lokal jika ada; JANGAN regenerasi GroupState/Commit/Welcome)
+  let targetGroupIdHash: string;
+  let targetWelcomeWire: string;
+  let targetClientMessageUuidWelcome: string;
+
+  if (existingWelcomeItem) {
+    targetGroupIdHash = preRestoreRes.groupIdHash!.trim().toLowerCase();
+    targetWelcomeWire = existingWelcomeItem.ciphertextWireBase64;
+    targetClientMessageUuidWelcome = existingWelcomeItem.clientMessageUuid;
+  } else {
+    let createdGroupIdHash: string;
+
+    if (preRestoreRes.status === 'FOUND' && preRestoreRes.epoch === '0' && preRestoreRes.groupIdHash) {
+      // Sisa CREATE_GROUP epoch 0 yang belum sempat COMMIT_ADD_MEMBER -> lanjutkan commit
+      createdGroupIdHash = preRestoreRes.groupIdHash;
+    } else {
+      // Bentuk MLS Group baru (epoch 0) menggunakan Worker MLS yang sudah ada
+      try {
+        await workerRpc.sendRequest<GenerateKeyPackagePayload, GenerateKeyPackageResult>(
+          'GENERATE_KEY_PACKAGE',
+          {
+            deviceUuid: canonicalDeviceUuid,
+            fencing: cleanFencing,
+          },
+          timeoutMs
+        );
+      } catch (genErr) {
+        throw new BchatHandshakeCoordinatorError(
+          `Worker gagal menyiapkan KeyPackage lokal mahasiswa: ${(genErr as Error)?.message}`,
+          'WORKER_GENERATE_KEY_PACKAGE_FAILED',
+          genErr
+        );
+      }
+
+      let createGroupRes: CreateGroupResult;
+      try {
+        createGroupRes = await workerRpc.sendRequest<CreateGroupPayload, CreateGroupResult>(
+          'CREATE_GROUP',
+          {
+            roomUuid: canonicalRoomUuid,
+            deviceUuid: canonicalDeviceUuid,
+            fencing: cleanFencing,
+          },
+          timeoutMs
+        );
+      } catch (workerErr) {
+        throw new BchatHandshakeCoordinatorError(
+          `Worker gagal membuat grup MLS awal untuk sesi baru: ${(workerErr as Error)?.message}`,
+          'WORKER_CREATE_GROUP_FAILED',
+          workerErr
+        );
+      }
+
+      if (!createGroupRes || createGroupRes.epoch !== '0' || !createGroupRes.groupIdHash) {
+        throw new BchatHandshakeCoordinatorError(
+          `Hasil CREATE_GROUP tidak valid (epoch: ${createGroupRes?.epoch}).`,
+          'INVALID_CREATE_GROUP_RESULT'
+        );
+      }
+      createdGroupIdHash = createGroupRes.groupIdHash;
+    }
+
+    // Commit Add Member (epoch 1) dan hasilkan Welcome message
+    let commitRes: CommitAddMemberResult;
+    try {
+      commitRes = await workerRpc.sendRequest<CommitAddMemberPayload, CommitAddMemberResult>(
+        'COMMIT_ADD_MEMBER',
+        {
+          partnerKeyPackageBase64: partnerPkg.key_package_data,
+          roomUuid: canonicalRoomUuid,
+          deviceUuid: canonicalDeviceUuid,
+          fencing: cleanFencing,
+        },
+        timeoutMs
+      );
+    } catch (workerErr) {
+      throw new BchatHandshakeCoordinatorError(
+        `Worker gagal membuat Commit Add Member untuk sesi baru: ${(workerErr as Error)?.message}`,
+        'WORKER_COMMIT_ADD_MEMBER_FAILED',
+        workerErr
+      );
+    }
+
+    if (
+      !commitRes?.welcomeWireBase64 ||
+      !commitRes?.clientMessageUuidCommit ||
+      !commitRes?.clientMessageUuidWelcome ||
+      commitRes.epoch !== '1'
+    ) {
+      throw new BchatHandshakeCoordinatorError(
+        'Worker mengembalikan hasil COMMIT_ADD_MEMBER yang tidak valid untuk sesi baru.',
+        'INVALID_COMMIT_RESULT'
+      );
+    }
+
+    // Tandai Commit lokal sebagai acked di outbox (Commit tidak dikirim ke backend)
+    try {
+      await workerRpc.sendRequest<UpdateOutboxStatusPayload, UpdateOutboxStatusResult>(
+        'UPDATE_OUTBOX_STATUS',
+        {
+          clientMessageUuid: commitRes.clientMessageUuidCommit,
+          status: 'acked',
+          deviceUuid: canonicalDeviceUuid,
+          fencing: cleanFencing,
+        },
+        timeoutMs
+      );
+    } catch {
+      // Abaikan error sekunder outbox commit
+    }
+
+    targetGroupIdHash = createdGroupIdHash;
+    targetWelcomeWire = commitRes.welcomeWireBase64;
+    targetClientMessageUuidWelcome = commitRes.clientMessageUuidWelcome;
+  }
+
+  // 7. Publikasikan Welcome ke POST /api/bchat/rooms/{roomUuid}/sessions/{sessionUuid}/welcome
+  const publishPayload: BchatSessionWelcomePublishRequest = {
+    recipient_device_uuid: partnerDeviceUuid,
+    key_package_hash: partnerPkgHash,
+    group_id_hash: targetGroupIdHash,
+    welcome_message: targetWelcomeWire,
+  };
+
+  try {
+    const pubRes = await publishSessionWelcome(
+      canonicalRoomUuid,
+      targetSessionUuid,
+      publishPayload,
+      canonicalDeviceUuid
+    );
+
+    try {
+      await workerRpc.sendRequest<UpdateOutboxStatusPayload, UpdateOutboxStatusResult>(
+        'UPDATE_OUTBOX_STATUS',
+        {
+          clientMessageUuid: targetClientMessageUuidWelcome,
+          status: 'acked',
+          deviceUuid: canonicalDeviceUuid,
+          fencing: cleanFencing,
+        },
+        5000
+      );
+    } catch {
+      // Abaikan error sekunder outbox
+    }
+
+    return {
+      status: 'AWAITING_ACK',
+      roomUuid: canonicalRoomUuid,
+      sessionUuid: pubRes.data.session_uuid || targetSessionUuid,
+      generationNumber: targetGenerationNumber,
+      welcomeOperationUuid: pubRes.data.welcome_operation_uuid,
+      challengeUuid: pubRes.data.challenge_uuid,
+      expiresAt: pubRes.data.expires_at ?? null,
+      groupIdHash: targetGroupIdHash,
+      recipientDeviceUuid: partnerDeviceUuid,
+    };
+  } catch (publishErr) {
+    // Error transient HTTP 429 (Rate Limit): pertahankan payload Welcome tetap 'pending' (bukan permanent failed)
+    if (isRateLimitPublishError(publishErr)) {
+      const retryAfterSeconds =
+        publishErr instanceof BchatApiError ? publishErr.retryAfterSeconds : undefined;
+      try {
+        await workerRpc.sendRequest<UpdateOutboxStatusPayload, UpdateOutboxStatusResult>(
+          'UPDATE_OUTBOX_STATUS',
+          {
+            clientMessageUuid: targetClientMessageUuidWelcome,
+            status: 'pending',
+            errorMessage: (publishErr as Error)?.message ?? 'Rate limited (HTTP 429)',
+            deviceUuid: canonicalDeviceUuid,
+            fencing: cleanFencing,
+          },
+          5000
+        );
+      } catch {
+        // Abaikan error sekunder outbox
+      }
+
+      const waitNote = retryAfterSeconds
+        ? `Silakan tunggu sekitar ${retryAfterSeconds} detik lalu klik publikasi ulang.`
+        : 'Silakan tunggu beberapa saat lalu klik publikasi ulang.';
+
+      throw new BchatHandshakeCoordinatorError(
+        `Publikasi Welcome sesi Generasi #${targetGenerationNumber} dibatasi sementara oleh server (HTTP 429: Too Many Attempts). GroupState dan Welcome lokal tetap aman tersimpan. ${waitNote}`,
+        'SESSION_WELCOME_RATE_LIMITED',
+        publishErr,
+        {
+          status: 429,
+          retryAfterSeconds: retryAfterSeconds ?? null,
+          sessionUuid: targetSessionUuid,
+          generationNumber: targetGenerationNumber,
+        }
+      );
+    }
+
+    if (isAmbiguousPublishError(publishErr)) {
+      try {
+        await workerRpc.sendRequest<UpdateOutboxStatusPayload, UpdateOutboxStatusResult>(
+          'UPDATE_OUTBOX_STATUS',
+          {
+            clientMessageUuid: targetClientMessageUuidWelcome,
+            status: 'in_transit',
+            errorMessage: (publishErr as Error)?.message ?? 'Session welcome publish indeterminate',
+            deviceUuid: canonicalDeviceUuid,
+            fencing: cleanFencing,
+          },
+          5000
+        );
+      } catch {
+        // Abaikan error sekunder outbox
+      }
+
+      // Rekonsiliasi ke backend sebelum gagal
+      try {
+        const reconRes = await fetchRoomDetail(canonicalRoomUuid);
+        const reconRoom = reconRes.data;
+        if (reconRoom.active_session?.session_uuid === targetSessionUuid) {
+          return {
+            status: 'ALREADY_ACTIVE',
+            roomUuid: canonicalRoomUuid,
+            sessionUuid: targetSessionUuid,
+            generationNumber: reconRoom.active_session.generation_number,
+            welcomeOperationUuid: '',
+            challengeUuid: '',
+            expiresAt: null,
+            groupIdHash: targetGroupIdHash,
+            recipientDeviceUuid: partnerDeviceUuid,
+          };
+        }
+        if (
+          reconRoom.pending_session?.session_uuid === targetSessionUuid &&
+          reconRoom.pending_session.has_active_challenge
+        ) {
+          try {
+            await workerRpc.sendRequest<UpdateOutboxStatusPayload, UpdateOutboxStatusResult>(
+              'UPDATE_OUTBOX_STATUS',
+              {
+                clientMessageUuid: targetClientMessageUuidWelcome,
+                status: 'acked',
+                deviceUuid: canonicalDeviceUuid,
+                fencing: cleanFencing,
+              },
+              5000
+            );
+          } catch {
+            // Abaikan
+          }
+          return {
+            status: 'AWAITING_ACK',
+            roomUuid: canonicalRoomUuid,
+            sessionUuid: targetSessionUuid,
+            generationNumber: reconRoom.pending_session.generation_number,
+            welcomeOperationUuid: reconRoom.pending_session.welcome_operation_uuid ?? '',
+            challengeUuid: '',
+            expiresAt: reconRoom.pending_session.expires_at ?? null,
+            groupIdHash: targetGroupIdHash,
+            recipientDeviceUuid: partnerDeviceUuid,
+          };
+        }
+      } catch {
+        // Lanjut lempar error ambigu
+      }
+
+      throw new BchatHandshakeCoordinatorError(
+        `Publikasi Welcome sesi menghasilkan status ambigu: ${(publishErr as Error)?.message}`,
+        'WELCOME_PUBLISH_IN_TRANSIT',
+        publishErr
+      );
+    }
+
+    try {
+      await workerRpc.sendRequest<UpdateOutboxStatusPayload, UpdateOutboxStatusResult>(
+        'UPDATE_OUTBOX_STATUS',
+        {
+          clientMessageUuid: targetClientMessageUuidWelcome,
+          status: 'failed',
+          errorMessage: (publishErr as Error)?.message ?? 'Session welcome publish rejected',
+          deviceUuid: canonicalDeviceUuid,
+          fencing: cleanFencing,
+        },
+        5000
+      );
+    } catch {
+      // Abaikan
+    }
+
+    throw new BchatHandshakeCoordinatorError(
+      `Publikasi Welcome sesi baru ditolak oleh server: ${(publishErr as Error)?.message}`,
+      'SESSION_WELCOME_PUBLISH_FAILED',
+      publishErr
+    );
+  }
+}
+
+/**
+ * Mengorkestrasikan penerimaan Welcome, JOIN_WELCOME, persistensi GroupState,
+ * penandatanganan Welcome ACK 158-byte Ed25519, dan publikasi ACK oleh dosen
+ * untuk mengaktifkan sesi generasi baru (BchatRoomSession).
+ *
+ * Menangani rotasi challenge otomatis jika challenge kedaluwarsa (CHALLENGE_EXPIRED)
+ * tanpa mengonsumsi ulang PrivateKeyPackage (anti-reuse defense via RESTORE_GROUP_STATE).
+ */
+export async function completePendingSessionHandshakeFlow(
+  workerRpc: BchatWorkerClient,
+  roomUuid: string,
+  deviceUuid: string,
+  options: CompletePendingSessionOptions
+): Promise<CompletePendingSessionResult> {
+  const canonicalRoomUuid = validateCanonicalUuid(roomUuid, 'roomUuid');
+  const canonicalDeviceUuid = validateCanonicalUuid(deviceUuid, 'deviceUuid');
+  const cleanFencing = validateFencing(options?.fencing, 'completePendingSessionHandshakeFlow');
+
+  if (!workerRpc || typeof workerRpc.sendRequest !== 'function') {
+    throw new BchatHandshakeCoordinatorError(
+      'Worker RPC client tidak valid atau belum diinisialisasi.',
+      'INVALID_WORKER_CLIENT'
+    );
+  }
+
+  const timeoutMs = options.timeoutMs ?? 25000;
+
+  // 1. Ambil detail room untuk memverifikasi pending_session yang valid
+  let roomDetail: BchatRoomDetail;
+  try {
+    const roomRes = await fetchRoomDetail(canonicalRoomUuid);
+    roomDetail = roomRes.data;
+  } catch (apiErr) {
+    throw new BchatHandshakeCoordinatorError(
+      `Gagal mengambil detail room [${canonicalRoomUuid}]: ${(apiErr as Error)?.message}`,
+      'FETCH_ROOM_DETAIL_FAILED',
+      apiErr
+    );
+  }
+
+  if (roomDetail.status !== 'ACTIVE') {
+    throw new BchatHandshakeCoordinatorError(
+      `Penyelesaian sesi generasi baru hanya berlaku pada room ACTIVE (status: ${roomDetail.status}).`,
+      'INVALID_ROOM_STATUS'
+    );
+  }
+
+  const pendingSession = roomDetail.pending_session;
+  if (!pendingSession) {
+    if (
+      options.expectedSessionUuid &&
+      roomDetail.active_session?.session_uuid?.toLowerCase() ===
+        options.expectedSessionUuid.trim().toLowerCase()
+    ) {
+      return {
+        roomUuid: canonicalRoomUuid,
+        sessionUuid: roomDetail.active_session.session_uuid,
+        generationNumber: roomDetail.active_session.generation_number,
+        sessionStatus: 'ACTIVE',
+        startSequence: roomDetail.active_session.start_sequence,
+        activatedAt: roomDetail.updated_at ?? new Date().toISOString(),
+        welcomeOperationUuid: '',
+        challengeUuid: '',
+        signatureBase64: '',
+        groupIdHash: roomDetail.group_id_hash ?? '',
+      };
+    }
+
+    throw new BchatHandshakeCoordinatorError(
+      'Tidak ditemukan sesi generasi baru berstatus PENDING pada ruang obrolan ini.',
+      'NO_PENDING_SESSION'
+    );
+  }
+
+  if (
+    !pendingSession.has_active_challenge ||
+    pendingSession.action_type !== 'FETCH_SESSION_CHALLENGE_AND_ACK'
+  ) {
+    throw new BchatHandshakeCoordinatorError(
+      `Sesi PENDING belum siap dikonfirmasi (action_type: ${pendingSession.action_type}).`,
+      'SESSION_ACTION_NOT_PERMITTED'
+    );
+  }
+
+  if (
+    pendingSession.recipient_device_uuid &&
+    pendingSession.recipient_device_uuid.toLowerCase() !== canonicalDeviceUuid
+  ) {
+    throw new BchatHandshakeCoordinatorError(
+      'Paket Welcome sesi ini ditujukan untuk perangkat lain pada akun Anda.',
+      'RECIPIENT_DEVICE_MISMATCH'
+    );
+  }
+
+  const targetSessionUuid = validateCanonicalUuid(pendingSession.session_uuid, 'session_uuid');
+
+  // Resolusi user_id penerima (dosen)
+  let resolvedUserId: string | number | bigint;
+  if (options.userId !== undefined && options.userId !== null) {
+    resolvedUserId = options.userId;
+  } else {
+    const identityKey = await getActiveDeviceIdentityKey(canonicalDeviceUuid);
+    const userIdFromMeta = identityKey?.metadata?.user_id;
+    if (
+      userIdFromMeta !== undefined &&
+      userIdFromMeta !== null &&
+      String(userIdFromMeta).trim() !== ''
+    ) {
+      resolvedUserId = String(userIdFromMeta);
+    } else {
+      throw new BchatHandshakeCoordinatorError(
+        `Recipient user ID tidak dapat ditentukan untuk perangkat [${canonicalDeviceUuid}].`,
+        'RECIPIENT_USER_ID_REQUIRED'
+      );
+    }
+  }
+
+  // Loop maksimal 2 kali: percobaan ke-2 hanya jika ACK terkena CHALLENGE_EXPIRED (rotasi in-place)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // 2. Ambil Welcome challenge sesi (backend otomatis merotasi in-place jika expired)
+    let challengeData: BchatSessionWelcomeChallengeResponseData;
+    try {
+      const challengeRes = await fetchSessionWelcomeChallenge(
+        canonicalRoomUuid,
+        targetSessionUuid,
+        canonicalDeviceUuid
+      );
+      challengeData = challengeRes.data;
+    } catch (apiErr) {
+      throw new BchatHandshakeCoordinatorError(
+        `Gagal mengambil tantangan Welcome sesi [${targetSessionUuid}]: ${(apiErr as Error)?.message}`,
+        'FETCH_SESSION_CHALLENGE_FAILED',
+        apiErr
+      );
+    }
+
+    if (
+      !challengeData?.welcome_message ||
+      !challengeData?.challenge_uuid ||
+      !challengeData?.challenge_nonce ||
+      !challengeData?.group_id_hash
+    ) {
+      throw new BchatHandshakeCoordinatorError(
+        'Data tantangan Welcome sesi dari backend tidak lengkap.',
+        'INVALID_WELCOME_CHALLENGE_DATA'
+      );
+    }
+
+    if (
+      challengeData.recipient_device_uuid &&
+      challengeData.recipient_device_uuid.toLowerCase() !== canonicalDeviceUuid
+    ) {
+      throw new BchatHandshakeCoordinatorError(
+        'Tantangan Welcome sesi ditujukan untuk perangkat lain.',
+        'RECIPIENT_DEVICE_MISMATCH'
+      );
+    }
+
+    const canonicalChallengeGroupIdHash = challengeData.group_id_hash.trim().toLowerCase();
+    if (!SHA256_HEX_REGEX.test(canonicalChallengeGroupIdHash)) {
+      throw new BchatHandshakeCoordinatorError(
+        'group_id_hash tantangan sesi tidak valid (wajib SHA-256 64 hex).',
+        'INVALID_CHALLENGE_GROUP_ID_HASH'
+      );
+    }
+
+    const canonicalChallengeUuid = validateCanonicalUuid(
+      challengeData.challenge_uuid,
+      'challenge_uuid'
+    );
+    const canonicalWelcomeOpUuid = validateCanonicalUuid(
+      challengeData.welcome_operation_uuid,
+      'welcome_operation_uuid'
+    );
+
+    // 3. Cek GroupState lokal terlebih dahulu (anti-reuse PrivateKeyPackage pada retry / rotasi challenge)
+    let restoreRes: RestoreGroupStateResult;
+    try {
+      restoreRes = await workerRpc.sendRequest<RestoreGroupStatePayload, RestoreGroupStateResult>(
+        'RESTORE_GROUP_STATE',
+        {
+          roomUuid: canonicalRoomUuid,
+          deviceUuid: canonicalDeviceUuid,
+          fencing: cleanFencing,
+        },
+        timeoutMs
+      );
+    } catch (workerErr) {
+      throw new BchatHandshakeCoordinatorError(
+        `Worker gagal memeriksa GroupState untuk sesi baru: ${(workerErr as Error)?.message}`,
+        'WORKER_RESTORE_GROUP_STATE_FAILED',
+        workerErr
+      );
+    }
+
+    let targetGroupIdHash: string;
+
+    if (restoreRes.status === 'FOUND') {
+      if (restoreRes.epoch !== '1' || !restoreRes.groupIdHash) {
+        throw new BchatHandshakeCoordinatorError(
+          `GroupState lokal pada epoch [${restoreRes.epoch}] tidak cocok untuk Welcome ACK sesi.`,
+          'INVALID_GROUP_STATE_EPOCH'
+        );
+      }
+      targetGroupIdHash = restoreRes.groupIdHash;
+    } else if (restoreRes.status === 'NOT_FOUND') {
+      const expectedRef = extractWelcomeKeyPackageRef(challengeData.welcome_message);
+      if (!expectedRef) {
+        throw new BchatHandshakeCoordinatorError(
+          'SECURITY STOP: Gagal mengekstrak KeyPackageRef dari Welcome message sesi.',
+          'KEY_PACKAGE_REF_EXTRACTION_FAILED'
+        );
+      }
+
+      const matchedKeyPackageHash = await findMatchingLocalKeyPackageHash(
+        canonicalDeviceUuid,
+        expectedRef
+      );
+
+      let joinRes: JoinWelcomeResult;
+      try {
+        joinRes = await workerRpc.sendRequest<JoinWelcomePayload, JoinWelcomeResult>(
+          'JOIN_WELCOME',
+          {
+            welcomeWireBase64: challengeData.welcome_message,
+            keyPackageHash: matchedKeyPackageHash,
+            roomUuid: canonicalRoomUuid,
+            deviceUuid: canonicalDeviceUuid,
+            fencing: cleanFencing,
+          },
+          timeoutMs
+        );
+      } catch (workerErr) {
+        throw new BchatHandshakeCoordinatorError(
+          `Worker gagal mengeksekusi JOIN_WELCOME untuk sesi baru: ${(workerErr as Error)?.message}`,
+          'WORKER_JOIN_WELCOME_FAILED',
+          workerErr
+        );
+      }
+
+      if (!joinRes || joinRes.epoch !== '1' || !joinRes.groupIdHash) {
+        throw new BchatHandshakeCoordinatorError(
+          `Hasil JOIN_WELCOME sesi tidak valid (epoch: ${joinRes?.epoch}).`,
+          'INVALID_JOIN_WELCOME_RESULT'
+        );
+      }
+      targetGroupIdHash = joinRes.groupIdHash;
+    } else {
+      throw new BchatHandshakeCoordinatorError(
+        `Pemulihan GroupState gagal dengan status [${restoreRes.status}]: ${restoreRes.message ?? 'Unknown error'}.`,
+        `RESTORE_STATUS_${restoreRes.status}`
+      );
+    }
+
+    const normalizedTargetGroupIdHash = targetGroupIdHash.toLowerCase();
+    if (canonicalChallengeGroupIdHash !== normalizedTargetGroupIdHash) {
+      throw new BchatHandshakeCoordinatorError(
+        'Hash Group ID tidak cocok antara GroupState lokal dan challenge sesi backend.',
+        'GROUP_ID_HASH_MISMATCH'
+      );
+    }
+
+    // 4. Bangun payload Welcome ACK kanonis 158 byte & tandatangani dengan Ed25519 Device Identity Key
+    const ackPayload = buildWelcomeAckPayload({
+      roomUuid: canonicalRoomUuid,
+      recipientUserId: resolvedUserId,
+      welcomeOperationUuid: canonicalWelcomeOpUuid,
+      challengeUuid: canonicalChallengeUuid,
+      challengeGeneration: challengeData.challenge_generation,
+      groupIdHash: normalizedTargetGroupIdHash,
+      epoch: BigInt(1),
+      challengeNonce: challengeData.challenge_nonce,
+    });
+
+    const signedAck = await signWelcomeAckWithDeviceIdentity(
+      ackPayload.payloadBytes,
+      canonicalDeviceUuid
+    );
+
+    const ackReq: BchatSessionWelcomeAckRequest = {
+      challenge_uuid: canonicalChallengeUuid,
+      signature: signedAck.signatureBase64,
+    };
+
+    try {
+      const ackRes = await submitSessionWelcomeAck(
+        canonicalRoomUuid,
+        targetSessionUuid,
+        ackReq,
+        canonicalDeviceUuid
+      );
+      const activated = ackRes.data;
+
+      if (!activated || activated.status !== 'ACTIVE') {
+        throw new BchatHandshakeCoordinatorError(
+          `Aktivasi sesi gagal: status backend [${activated?.status}] bukan ACTIVE.`,
+          'SESSION_ACTIVATION_FAILED'
+        );
+      }
+
+      return {
+        roomUuid: canonicalRoomUuid,
+        sessionUuid: activated.session_uuid,
+        generationNumber: activated.generation_number,
+        sessionStatus: activated.status,
+        startSequence: activated.start_sequence,
+        activatedAt: activated.activated_at ?? new Date().toISOString(),
+        welcomeOperationUuid: canonicalWelcomeOpUuid,
+        challengeUuid: canonicalChallengeUuid,
+        signatureBase64: signedAck.signatureBase64,
+        groupIdHash: normalizedTargetGroupIdHash,
+      };
+    } catch (ackErr) {
+      // Jika challenge kedaluwarsa di antara fetch dan submit, lakukan tepat 1x retry dengan rotasi in-place
+      if (
+        attempt === 0 &&
+        ackErr instanceof BchatApiError &&
+        ackErr.status === 409 &&
+        ackErr.errorCode === 'CHALLENGE_EXPIRED'
+      ) {
+        continue;
+      }
+
+      // Jika error jaringan ambigu, rekonsiliasi apakah sesi ternyata sudah ACTIVE
+      if (isAmbiguousPublishError(ackErr)) {
+        try {
+          const recon = await fetchRoomDetail(canonicalRoomUuid);
+          if (recon.data?.active_session?.session_uuid === targetSessionUuid) {
+            return {
+              roomUuid: canonicalRoomUuid,
+              sessionUuid: recon.data.active_session.session_uuid,
+              generationNumber: recon.data.active_session.generation_number,
+              sessionStatus: 'ACTIVE',
+              startSequence: recon.data.active_session.start_sequence,
+              activatedAt: recon.data.updated_at ?? new Date().toISOString(),
+              welcomeOperationUuid: canonicalWelcomeOpUuid,
+              challengeUuid: canonicalChallengeUuid,
+              signatureBase64: signedAck.signatureBase64,
+              groupIdHash: normalizedTargetGroupIdHash,
+            };
+          }
+        } catch {
+          // Abaikan error rekonsiliasi sekunder
+        }
+      }
+
+      throw new BchatHandshakeCoordinatorError(
+        `Pengiriman Welcome ACK sesi ke backend gagal: ${(ackErr as Error)?.message}`,
+        'SESSION_WELCOME_ACK_FAILED',
+        ackErr
+      );
+    }
+  }
+
+  throw new BchatHandshakeCoordinatorError(
+    'Gagal menyelesaikan Welcome ACK sesi setelah rotasi challenge.',
+    'SESSION_WELCOME_ACK_EXHAUSTED'
+  );
 }

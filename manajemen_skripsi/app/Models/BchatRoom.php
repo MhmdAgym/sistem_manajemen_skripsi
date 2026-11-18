@@ -128,6 +128,16 @@ class BchatRoom extends Model
     }
 
     /**
+     * Relasi ke sesi generasi baru yang sedang menunggu handshake (PENDING).
+     */
+    public function pendingSession(): HasOne
+    {
+        return $this->hasOne(BchatRoomSession::class, 'room_id', 'id')
+            ->where('status', 'PENDING')
+            ->latestOfMany('generation_number');
+    }
+
+    /**
      * Relasi ke sesi terbaru berdasarkan generation_number.
      */
     public function latestSession(): HasOne
