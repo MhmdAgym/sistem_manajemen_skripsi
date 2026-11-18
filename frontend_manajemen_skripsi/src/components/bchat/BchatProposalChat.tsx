@@ -78,13 +78,16 @@ import {
   getGroupStateCursor,
   updateGroupStateCursor,
   loadEncryptedHistory,
-  computeContiguousResolvedSequence,
+  resolveActiveSessionCursor,
   isHistoryTombstonePlaintext,
   type DecryptedMessageItem,
   type UnresolvedSequenceDetail,
 } from '@/lib/bchat/message/bchat-message-coordinator';
 import {
   BchatRealtimeSubscriber,
+  mapSubscriptionStateToConnectionStatus,
+  shouldRunMessageSyncFallback,
+  MESSAGE_SYNC_FALLBACK_INTERVAL_MS,
   type SubscriptionState,
   type BchatRecoveryState,
 } from '@/lib/bchat/message/bchat-realtime-listener';
@@ -247,6 +250,8 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
   const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const historyTransferPollingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const historyTransferInFlightRef = useRef<boolean>(false);
+  const messageSyncFallbackTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const messageSyncFallbackInFlightRef = useRef<boolean>(false);
 
   // Referensi Lifecycle & Scroll
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -1001,37 +1006,25 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           requiresRecovery: true,
         }));
 
-      const contiguousHistorySeq = computeContiguousResolvedSequence(validHistorySeqs, 0);
-
-      // Ambil kursor persisten dari GroupState jika ada.
-      // HANYA gunakan persistentCursor jika tidak melompati tombstone/celah pada riwayat lokal.
+      // Ambil kursor persisten dari GroupState jika ada dan hitung kursor awal secara konsisten
+      // terhadap batas bawah sesi aktif (`sessionFloor = Math.max(0, (active_session.start_sequence ?? 1) - 1)`).
+      // Sequence milik sesi ARCHIVED (<= sessionFloor) tidak pernah dianggap gap pada sesi aktif.
       const persistentCursor = await getGroupStateCursor(activeDevUuid, roomUuid);
-      const validHistorySet = new Set<number>(validHistorySeqs);
-      const minTombstoneSeq = tombstoneUnresolved.reduce(
-        (min, item) => Math.min(min, item.server_sequence),
-        Number.POSITIVE_INFINITY
+      const activeSessionUuid = currentDetail.active_session?.session_uuid ?? null;
+      const cursorResolution = resolveActiveSessionCursor({
+        activeSessionStartSequence: currentDetail.active_session?.start_sequence,
+        persistentCursor,
+        validHistorySequences: validHistorySeqs,
+        unresolvedSequences: tombstoneUnresolved.map((t) => t.server_sequence),
+      });
+      const { sessionFloor, contiguousHistorySeq, startingCursor } = cursorResolution;
+      const activeSessionTombstones = tombstoneUnresolved.filter(
+        (t) => t.server_sequence > sessionFloor
       );
-      const hasGapBelowPersistent =
-        historyItems.length > 0 &&
-        (minTombstoneSeq <= persistentCursor ||
-          Array.from({ length: persistentCursor }, (_, idx) => idx + 1).some(
-            (seq) => !validHistorySet.has(seq)
-          ));
 
-      const sessionStartBaseline =
-        historyItems.length === 0 &&
-        persistentCursor === 0 &&
-        currentDetail.active_session &&
-        currentDetail.active_session.start_sequence > 1
-          ? currentDetail.active_session.start_sequence - 1
-          : 0;
-
-      const startingCursor = hasGapBelowPersistent
-        ? contiguousHistorySeq
-        : Math.max(persistentCursor, contiguousHistorySeq, sessionStartBaseline);
-
-      // Sinkronkan kursor GroupState ke disk HANYA jika contiguousHistorySeq yang terverifikasi lebih tinggi
-      if (contiguousHistorySeq > persistentCursor) {
+      // Sinkronkan kursor GroupState ke disk HANYA jika contiguousHistorySeq yang terverifikasi
+      // pada sesi aktif lebih tinggi dari persistentCursor maupun sessionFloor.
+      if (contiguousHistorySeq > Math.max(persistentCursor, sessionFloor)) {
         await updateGroupStateCursor({
           deviceUuid: activeDevUuid,
           roomUuid,
@@ -1050,24 +1043,25 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         workerRpc: workerClient,
         fencing,
         initialSequence: startingCursor,
+        sessionFloor,
+        sessionUuid: activeSessionUuid,
         knownProcessedSequences: validHistorySeqs,
-        knownUnresolvedSequences: tombstoneUnresolved,
+        knownUnresolvedSequences: activeSessionTombstones,
         onSubscriptionStatusChange: (status: SubscriptionState, detail?: string) => {
           if (sessionIdRef.current !== currentSessionId) return;
+          setConnectionStatus(mapSubscriptionStateToConnectionStatus(status));
           if (status === 'SUBSCRIBED') {
-            setConnectionStatus('CONNECTED');
             if (!subscriberRef.current?.getIsRecoveryRequired()) {
               setStatusDetail('Terhubung aman via E2EE');
             }
           } else if (status === 'CONNECTING') {
-            setConnectionStatus('RECONNECTING');
-            setStatusDetail(detail || 'Menghubungkan kembali...');
+            setStatusDetail(detail || 'Menghubungkan saluran real-time...');
+          } else if (status === 'RECONNECTING') {
+            setStatusDetail(detail || 'Menghubungkan kembali ke saluran real-time...');
           } else if (status === 'ERROR') {
-            setConnectionStatus('ERROR');
             setStatusDetail(detail || 'Gangguan saluran WebSocket');
           } else {
-            setConnectionStatus('OFFLINE');
-            setStatusDetail(detail || 'Terputus');
+            setStatusDetail(detail || 'Saluran real-time terputus');
           }
         },
         onMessageDecrypted: (newMsg: DecryptedMessageItem) => {
@@ -1123,7 +1117,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       await subscriber.initializeFromPersistence();
       if (sessionIdRef.current !== currentSessionId) return;
 
-      // Berlangganan ke private channel Reverb
+      // Berlangganan ke private channel Reverb (status CONNECTED baru muncul setelah channel.subscribed())
       subscriber.subscribe();
 
       // Rekonsiliasi pesan dari REST API via subscriber (Single Source of Truth) untuk menutup celah saat offline
@@ -1132,13 +1126,18 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
 
       const currentRecState = subscriber.getRecoveryState();
       setRecoveryState(currentRecState);
-      setConnectionStatus('CONNECTED');
+      const currentSubState = subscriber.getSubscriptionState();
+      setConnectionStatus(mapSubscriptionStateToConnectionStatus(currentSubState));
       if (currentRecState.isRecoveryRequired && currentRecState.failedSequence) {
         setStatusDetail(
           `Pemulihan dibutuhkan untuk pesan urutan #${currentRecState.failedSequence}. Pesan baru tetap dapat diproses.`
         );
-      } else {
+      } else if (currentSubState === 'SUBSCRIBED') {
         setStatusDetail('Terhubung aman via E2EE');
+      } else if (currentSubState === 'CONNECTING' || currentSubState === 'RECONNECTING') {
+        setStatusDetail('Menghubungkan saluran real-time E2EE...');
+      } else if (currentSubState === 'DISCONNECTED') {
+        setStatusDetail('Saluran real-time terputus. Menunggu sambungan kembali...');
       }
       setTimeout(() => scrollToBottom(false), 200);
     } catch (err: any) {
@@ -1179,6 +1178,10 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       if (pollingTimerRef.current) {
         clearInterval(pollingTimerRef.current);
         pollingTimerRef.current = null;
+      }
+      if (messageSyncFallbackTimerRef.current) {
+        clearInterval(messageSyncFallbackTimerRef.current);
+        messageSyncFallbackTimerRef.current = null;
       }
       handshakeInProgressRef.current = false;
       if (subscriberRef.current) {
@@ -1264,6 +1267,109 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     waitingState,
     isHistoryTransferModalOpen,
     incomingTransferRequest,
+  ]);
+
+  // Fallback rekonsiliasi REST berkala (12 detik) + saat tab kembali visible / jaringan kembali online.
+  // Hanya berjalan saat room ACTIVE dengan GroupState lokal valid, tidak tumpang tindih dengan
+  // rekonsiliasi yang sedang berjalan, menggunakan cursor & session_uuid aktif, dan berhenti saat unmount/keluar room.
+  useEffect(() => {
+    if (messageSyncFallbackTimerRef.current) {
+      clearInterval(messageSyncFallbackTimerRef.current);
+      messageSyncFallbackTimerRef.current = null;
+    }
+
+    const isRoomActive = roomDetail?.status === 'ACTIVE' && Boolean(roomSummary?.room_uuid);
+    const canAttachFallback =
+      isRoomActive &&
+      onboardingGate === 'PASSED' &&
+      hasLocalGroupState &&
+      !isUnrecoverableActiveRoom &&
+      !waitingState;
+
+    if (!canAttachFallback) {
+      return;
+    }
+
+    let isMounted = true;
+
+    const triggerFallbackReconcile = async () => {
+      if (!isMounted) return;
+      const activeSubscriber = subscriberRef.current;
+      const isDocumentVisible =
+        typeof document === 'undefined' ? true : document.visibilityState === 'visible';
+      const isOnline = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+
+      const allowed = shouldRunMessageSyncFallback({
+        isRoomActive,
+        onboardingGate,
+        hasLocalGroupState,
+        isUnrecoverableActiveRoom,
+        hasWaitingState: Boolean(waitingState),
+        isDocumentVisible,
+        isOnline,
+        hasActiveSubscriber: Boolean(activeSubscriber),
+        isSubscriberUnsubscribed:
+          !activeSubscriber || activeSubscriber.getSubscriptionState() === 'UNSUBSCRIBED',
+        isReconciling: Boolean(activeSubscriber?.getIsReconciling()),
+        isFallbackInFlight: messageSyncFallbackInFlightRef.current,
+      });
+
+      if (!allowed || !activeSubscriber) {
+        return;
+      }
+
+      messageSyncFallbackInFlightRef.current = true;
+      try {
+        await activeSubscriber.reconcileFromRest({ retryUnresolved: false });
+      } catch (_err) {
+        // Error ditangani secara terpusat melalui callback onError subscriber
+      } finally {
+        messageSyncFallbackInFlightRef.current = false;
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        void triggerFallbackReconcile();
+      }
+    };
+
+    const handleOnline = () => {
+      void triggerFallbackReconcile();
+    };
+
+    messageSyncFallbackTimerRef.current = setInterval(() => {
+      void triggerFallbackReconcile();
+    }, MESSAGE_SYNC_FALLBACK_INTERVAL_MS);
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', handleOnline);
+    }
+
+    return () => {
+      isMounted = false;
+      if (messageSyncFallbackTimerRef.current) {
+        clearInterval(messageSyncFallbackTimerRef.current);
+        messageSyncFallbackTimerRef.current = null;
+      }
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleOnline);
+      }
+    };
+  }, [
+    roomSummary?.room_uuid,
+    roomDetail?.status,
+    roomDetail?.active_session?.session_uuid,
+    onboardingGate,
+    hasLocalGroupState,
+    isUnrecoverableActiveRoom,
+    waitingState,
   ]);
 
   // ---------------------------------------------------------------------------

@@ -407,6 +407,8 @@ export interface BchatMessageData {
     content_type: number
     ciphertext_payload: string
     payload_hash_sha256: string
+    session_uuid?: string | null
+    session_generation?: number | null
     client_sent_at: string | null
     created_at: string | null
 }
@@ -416,6 +418,8 @@ export type BchatSendMessageResponse = BchatSuccessResponse<BchatMessageData>
 export interface BchatFetchMessagesQuery {
     after_sequence?: number
     limit?: number
+    session_uuid?: string
+    generation_number?: number
 }
 
 export type BchatFetchMessagesResponse = BchatSuccessResponse<BchatMessageData[]>

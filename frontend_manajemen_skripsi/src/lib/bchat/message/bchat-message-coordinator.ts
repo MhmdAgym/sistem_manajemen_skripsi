@@ -196,6 +196,10 @@ export interface ReconcileInboundMessagesParams {
   workerRpc: BchatWorkerClient;
   fencing: FencingRpcInput;
   afterSequence?: number;
+  /** Batas bawah sequence sesi aktif: Math.max(0, (active_session.start_sequence ?? 1) - 1). */
+  sessionFloor?: number;
+  /** UUID sesi aktif agar pengambilan REST hanya mengambil pesan milik sesi aktif (bukan ARCHIVED). */
+  sessionUuid?: string | null;
   batchLimit?: number;
   processedSequences?: Set<number>;
   /**
@@ -272,6 +276,111 @@ export function computeContiguousResolvedSequence(
   return cursor;
 }
 
+/**
+ * Menghitung batas bawah sequence (sessionFloor) untuk sesi aktif:
+ * `Math.max(0, (activeSessionStartSequence ?? 1) - 1)`.
+ * Contoh: Gen 3 dengan `start_sequence = 18` menghasilkan `sessionFloor = 17`,
+ * sehingga sequence milik sesi ARCHIVED (1..17) tidak dianggap celah pada sesi aktif.
+ */
+export function computeSessionFloor(activeSessionStartSequence?: number | null): number {
+  if (
+    typeof activeSessionStartSequence !== 'number' ||
+    !Number.isInteger(activeSessionStartSequence) ||
+    activeSessionStartSequence <= 1
+  ) {
+    return 0;
+  }
+  return Math.max(0, activeSessionStartSequence - 1);
+}
+
+export interface ResolveActiveSessionCursorParams {
+  activeSessionStartSequence?: number | null;
+  persistentCursor: number;
+  validHistorySequences: Iterable<number>;
+  unresolvedSequences?: Iterable<number>;
+}
+
+export interface ResolveActiveSessionCursorResult {
+  sessionFloor: number;
+  contiguousHistorySeq: number;
+  hasGapBelowPersistent: boolean;
+  startingCursor: number;
+  activeSessionUnresolvedSequences: number[];
+}
+
+/**
+ * Menyelesaikan kursor awal rekonsiliasi secara konsisten terhadap batas bawah sesi aktif (`sessionFloor`):
+ * - Perhitungan `computeContiguousResolvedSequence()` dimulai dari `sessionFloor` (bukan selalu 0).
+ * - Pemeriksaan celah `hasGapBelowPersistent` HANYA mencakup rentang `(sessionFloor + 1)..persistentCursor`.
+ * - Sequence milik sesi ARCHIVED (`<= sessionFloor`) tidak pernah dianggap gap atau tombstone pemblokir.
+ * - Kursor persisten yang valid dipertahankan dan tidak dimundurkan secara tidak perlu.
+ */
+export function resolveActiveSessionCursor(
+  params: ResolveActiveSessionCursorParams
+): ResolveActiveSessionCursorResult {
+  const sessionFloor = computeSessionFloor(params.activeSessionStartSequence);
+  const safePersistent =
+    typeof params.persistentCursor === 'number' &&
+    Number.isInteger(params.persistentCursor) &&
+    params.persistentCursor > 0
+      ? params.persistentCursor
+      : 0;
+
+  const validHistorySet = new Set<number>();
+  for (const seq of Array.from(params.validHistorySequences)) {
+    if (typeof seq === 'number' && Number.isInteger(seq) && seq > 0) {
+      validHistorySet.add(seq);
+    }
+  }
+
+  const activeSessionUnresolvedSequences: number[] = [];
+  if (params.unresolvedSequences) {
+    for (const seq of Array.from(params.unresolvedSequences)) {
+      if (typeof seq === 'number' && Number.isInteger(seq) && seq > sessionFloor) {
+        activeSessionUnresolvedSequences.push(seq);
+      }
+    }
+  }
+  activeSessionUnresolvedSequences.sort((a, b) => a - b);
+
+  const contiguousHistorySeq = computeContiguousResolvedSequence(validHistorySet, sessionFloor);
+
+  const hasActiveHistoryItems =
+    Array.from(validHistorySet).some((seq) => seq > sessionFloor) ||
+    activeSessionUnresolvedSequences.length > 0;
+
+  let hasGapBelowPersistent = false;
+  if (safePersistent > sessionFloor) {
+    const minActiveUnresolved =
+      activeSessionUnresolvedSequences.length > 0
+        ? activeSessionUnresolvedSequences[0]
+        : Number.POSITIVE_INFINITY;
+
+    if (minActiveUnresolved <= safePersistent) {
+      hasGapBelowPersistent = true;
+    } else if (hasActiveHistoryItems) {
+      for (let seq = sessionFloor + 1; seq <= safePersistent; seq++) {
+        if (!validHistorySet.has(seq)) {
+          hasGapBelowPersistent = true;
+          break;
+        }
+      }
+    }
+  }
+
+  const startingCursor = hasGapBelowPersistent
+    ? Math.max(sessionFloor, contiguousHistorySeq)
+    : Math.max(sessionFloor, safePersistent, contiguousHistorySeq);
+
+  return {
+    sessionFloor,
+    contiguousHistorySeq,
+    hasGapBelowPersistent,
+    startingCursor,
+    activeSessionUnresolvedSequences,
+  };
+}
+
 // -----------------------------------------------------------------------------
 // HELPER UTILITIES
 // -----------------------------------------------------------------------------
@@ -321,15 +430,87 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export interface ClassifyInboundErrorContext {
+  source?: 'DECRYPT_MESSAGE' | 'GENERAL';
+}
+
 /**
  * Klasifikasi kategori error pesan masuk ke dalam 3 taksonomi ketat:
- * 1. PAYLOAD_INTEGRITY_ERROR (Base64 rusak, format corrupt, hash mismatch)
- * 2. MLS_CRYPTO_ERROR (Epoch mismatch, Desired gen in the past, signature invalid)
- * 3. TRANSIENT_ERROR (IndexedDB lock/busy sementara, kegagalan jaringan sementara)
+ * 1. TRANSIENT_ERROR (Timeout, AbortError, gangguan jaringan, IndexedDB busy/lock, kegagalan I/O)
+ * 2. PAYLOAD_INTEGRITY_ERROR (Base64 rusak, format corrupt, hash mismatch)
+ * 3. MLS_CRYPTO_ERROR (Epoch/generation mismatch, signature invalid, kegagalan AEAD/WebCrypto
+ *    OperationError dari DECRYPT_MESSAGE, kegagalan autentikasi ciphertext/sender data/validasi MLS)
  */
-export function classifyInboundError(error: unknown): BchatInboundErrorCategory {
-  const msg = error instanceof Error ? error.message : String(error || '');
+export function classifyInboundError(
+  error: unknown,
+  context?: ClassifyInboundErrorContext
+): BchatInboundErrorCategory {
+  const errObj = error && typeof error === 'object' ? (error as Record<string, unknown>) : null;
+  const errName =
+    error instanceof Error
+      ? error.name
+      : typeof errObj?.name === 'string'
+      ? errObj.name
+      : '';
+  const errCode = typeof errObj?.code === 'string' ? errObj.code : '';
+  const msg =
+    error instanceof Error
+      ? error.message
+      : typeof errObj?.message === 'string'
+      ? errObj.message
+      : String(error || '');
+
   const lower = msg.toLowerCase();
+  const lowerName = errName.toLowerCase();
+  const lowerCode = errCode.toLowerCase();
+
+  // 0. Guard eksplisit untuk kegagalan transien (timeout, AbortError, jaringan, IDB busy/lock, I/O)
+  // agar TIDAK PERNAH salah diklasifikasikan sebagai kesalahan kriptografi permanen.
+  // Pengecualian: kesalahan fencing/stale/quarantined tetap dievaluasi sebagai MLS_CRYPTO_ERROR.
+  const isFencingOrQuarantine =
+    lower.includes('fencing') ||
+    lower.includes('stale') ||
+    lower.includes('quarantined') ||
+    lower.includes('sesi worker terkunci');
+
+  if (!isFencingOrQuarantine) {
+    const isTransient =
+      lowerName === 'aborterror' ||
+      lowerName === 'timeouterror' ||
+      lowerCode === 'aborterror' ||
+      lowerCode === 'timeouterror' ||
+      lower.includes('[aborterror]') ||
+      lower.includes('[timeouterror]') ||
+      lower.includes('aborterror') ||
+      lower.includes('timeouterror') ||
+      lower.includes('rpc timeout') ||
+      lower.includes('timeout') ||
+      lower.includes('network') ||
+      lower.includes('econnrefused') ||
+      lower.includes('failed to fetch') ||
+      lower.includes('err_network') ||
+      lower.includes('offline') ||
+      lower.includes('indexeddb') ||
+      lower.includes('idbtransaction') ||
+      lower.includes('transactioninactiveerror') ||
+      lower.includes('database busy') ||
+      lower.includes('transaction busy') ||
+      lower.includes('transaction locked') ||
+      /\block(ed|s)?\b/.test(lower) ||
+      lower.includes('busy') ||
+      lower.includes('quotaexceeded') ||
+      lower.includes('persistensi group state gagal') ||
+      lower.includes('i/o error') ||
+      lower.includes('io error') ||
+      lower.includes('i/o failure') ||
+      lower.includes('io failure') ||
+      lower.includes('worker diterminasi') ||
+      lower.includes('worker telah diterminasi');
+
+    if (isTransient) {
+      return 'TRANSIENT_ERROR';
+    }
+  }
 
   // 1. Payload / Integrity Error
   if (
@@ -344,26 +525,47 @@ export function classifyInboundError(error: unknown): BchatInboundErrorCategory 
     return 'PAYLOAD_INTEGRITY_ERROR';
   }
 
-  // 2. MLS Cryptographic / State Error
+  // 2. MLS Cryptographic / State / AEAD Authentication Error
+  const isWebCryptoOperationError =
+    lowerName === 'operationerror' ||
+    lowerCode === 'operationerror' ||
+    lower.includes('[operationerror]') ||
+    lower.includes('operationerror') ||
+    lower.includes('operation-specific reason');
+
   if (
+    (isWebCryptoOperationError && context?.source === 'DECRYPT_MESSAGE') ||
     lower.includes('epoch') ||
     lower.includes('generation') ||
     lower.includes('desired gen in the past') ||
     lower.includes('desired generation too far in the future') ||
     lower.includes('signature invalid') ||
     lower.includes('cryptoverificationerror') ||
+    lower.includes('aead') ||
+    lower.includes('authentication tag') ||
+    lower.includes('auth tag') ||
+    lower.includes('mac authentication') ||
+    lower.includes('ciphertext authentication') ||
+    lower.includes('could not decode senderdata') ||
+    lower.includes('senderdata') ||
+    lower.includes('sender data') ||
+    lower.includes('could not decode privatemessagecontent') ||
+    lower.includes('codecerror') ||
+    lower.includes('validationerror') ||
+    lower.includes('gagal mendekode ciphertext') ||
     lower.includes('state grup belum aktif') ||
     lower.includes('sesi worker terkunci') ||
     lower.includes('bukan applicationmessage') ||
     lower.includes('cannot process message, epoch too old') ||
     lower.includes('fencing') ||
     lower.includes('stale') ||
+    lower.includes('quarantined') ||
     lower.includes('unrecoverable')
   ) {
     return 'MLS_CRYPTO_ERROR';
   }
 
-  // 3. Transient Error (Default for IDB busy/locks, temporary network blips, or timeouts)
+  // 3. Transient Error (Default untuk kegagalan I/O atau kendala sementara tak dikenal)
   return 'TRANSIENT_ERROR';
 }
 
@@ -898,7 +1100,7 @@ export async function processInboundMessageItem(
     };
   } catch (decErr: any) {
     const errorMsg = decErr?.message || 'Dekripsi MLS gagal';
-    const category = classifyInboundError(decErr);
+    const category = classifyInboundError(decErr, { source: 'DECRYPT_MESSAGE' });
     const isCryptoFatal = category === 'MLS_CRYPTO_ERROR';
 
     // Catat kegagalan ke riwayat lokal jika bukan transient error
@@ -1059,6 +1261,8 @@ export async function reconcileInboundMessages(
     workerRpc,
     fencing,
     afterSequence,
+    sessionFloor,
+    sessionUuid,
     batchLimit = 50,
     processedSequences,
     unresolvedSequences,
@@ -1082,9 +1286,23 @@ export async function reconcileInboundMessages(
   const processedSet = processedSequences ?? new Set<number>();
   const unresolvedMap = unresolvedSequences ?? new Map<number, UnresolvedSequenceDetail>();
 
+  const effectiveSessionFloor =
+    typeof sessionFloor === 'number' && Number.isInteger(sessionFloor) && sessionFloor > 0
+      ? sessionFloor
+      : 0;
+  const normalizedSessionUuid =
+    typeof sessionUuid === 'string' && sessionUuid.trim() !== ''
+      ? sessionUuid.trim().toLowerCase()
+      : undefined;
+
+  const baseAfterSequence = Math.max(
+    effectiveSessionFloor,
+    afterSequence !== undefined && afterSequence > 0 ? afterSequence : 0
+  );
+
   let contiguousCursor = computeContiguousResolvedSequence(
     processedSet,
-    afterSequence !== undefined && afterSequence > 0 ? afterSequence : 0
+    baseAfterSequence
   );
   let currentFetchCursor = contiguousCursor;
   let highestSeenSequence = contiguousCursor;
@@ -1122,6 +1340,7 @@ export async function reconcileInboundMessages(
     const query: BchatFetchMessagesQuery = {
       limit: batchLimit,
       ...(currentFetchCursor > 0 ? { after_sequence: currentFetchCursor } : {}),
+      ...(normalizedSessionUuid ? { session_uuid: normalizedSessionUuid } : {}),
     };
 
     let fetchRes;
@@ -1159,8 +1378,24 @@ export async function reconcileInboundMessages(
 
     for (const item of sortedList) {
       const seq = item.server_sequence;
-      highestSeenSequence = Math.max(highestSeenSequence, seq);
       batchMaxSeenSeq = Math.max(batchMaxSeenSeq, seq);
+
+      // 0. Perlindungan batas sesi aktif (defense-in-depth):
+      //    Pesan dari sesi ARCHIVED (sequence <= sessionFloor atau session_uuid berbeda dari sesi aktif)
+      //    DILARANG masuk ke dekripsi menggunakan GroupState sesi aktif. Riwayat lama tetap utuh.
+      if (effectiveSessionFloor > 0 && seq <= effectiveSessionFloor) {
+        continue;
+      }
+      if (
+        normalizedSessionUuid &&
+        typeof item.session_uuid === 'string' &&
+        item.session_uuid.trim() !== '' &&
+        item.session_uuid.trim().toLowerCase() !== normalizedSessionUuid
+      ) {
+        continue;
+      }
+
+      highestSeenSequence = Math.max(highestSeenSequence, seq);
 
       // 1. Jika sequence sudah pernah diproses & tersimpan secara valid -> skip (zero duplicate, zero re-decrypt)
       if (processedSet.has(seq)) {

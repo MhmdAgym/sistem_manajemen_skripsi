@@ -53,9 +53,76 @@ export interface BchatMessageSentSignal {
 export type SubscriptionState =
   | 'IDLE'
   | 'CONNECTING'
+  | 'RECONNECTING'
   | 'SUBSCRIBED'
+  | 'DISCONNECTED'
   | 'ERROR'
   | 'UNSUBSCRIBED';
+
+export type BchatUiConnectionStatus =
+  | 'CONNECTED'
+  | 'RECONNECTING'
+  | 'OFFLINE'
+  | 'ERROR';
+
+export const MESSAGE_SYNC_FALLBACK_INTERVAL_MS = 12000;
+
+/**
+ * Memetakan status langganan Reverb ke status koneksi UI secara tegas:
+ * Status CONNECTED HANYA berlaku ketika langganan channel benar-benar berstatus SUBSCRIBED.
+ */
+export function mapSubscriptionStateToConnectionStatus(
+  state: SubscriptionState
+): BchatUiConnectionStatus {
+  if (state === 'SUBSCRIBED') {
+    return 'CONNECTED';
+  }
+  if (state === 'CONNECTING' || state === 'RECONNECTING') {
+    return 'RECONNECTING';
+  }
+  if (state === 'ERROR') {
+    return 'ERROR';
+  }
+  return 'OFFLINE';
+}
+
+export interface MessageSyncFallbackGuardParams {
+  isRoomActive: boolean;
+  onboardingGate: string;
+  hasLocalGroupState: boolean;
+  isUnrecoverableActiveRoom: boolean;
+  hasWaitingState: boolean;
+  isDocumentVisible: boolean;
+  isOnline: boolean;
+  hasActiveSubscriber: boolean;
+  isSubscriberUnsubscribed: boolean;
+  isReconciling: boolean;
+  isFallbackInFlight: boolean;
+}
+
+/**
+ * Guard murni untuk menentukan apakah fallback rekonsiliasi REST berkala boleh dieksekusi:
+ * - Hanya saat room ACTIVE dan onboarding PASSED dengan GroupState lokal valid.
+ * - Hanya ketika tab visible dan browser online.
+ * - Tidak berjalan jika rekonsiliasi sebelumnya masih berlangsung atau subscriber sudah unsubscribed.
+ */
+export function shouldRunMessageSyncFallback(
+  params: MessageSyncFallbackGuardParams
+): boolean {
+  return (
+    params.isRoomActive &&
+    params.onboardingGate === 'PASSED' &&
+    params.hasLocalGroupState &&
+    !params.isUnrecoverableActiveRoom &&
+    !params.hasWaitingState &&
+    params.isDocumentVisible &&
+    params.isOnline &&
+    params.hasActiveSubscriber &&
+    !params.isSubscriberUnsubscribed &&
+    !params.isReconciling &&
+    !params.isFallbackInFlight
+  );
+}
 
 export interface BchatRecoveryState {
   isRecoveryRequired: boolean;
@@ -75,6 +142,10 @@ export interface BchatRealtimeSubscriberOptions {
   fencing: FencingRpcInput;
   /** Contiguous verified cursor awal (seluruh 1..initialSequence sudah sah tanpa celah). */
   initialSequence?: number;
+  /** Batas bawah sequence sesi aktif: Math.max(0, (active_session.start_sequence ?? 1) - 1). */
+  sessionFloor?: number;
+  /** UUID sesi aktif agar rekonsiliasi REST selalu memfilter pesan sesi aktif. */
+  sessionUuid?: string | null;
   /** Daftar sequence individual valid yang sudah tersimpan lokal (termasuk di atas celah). */
   knownProcessedSequences?: Iterable<number>;
   /** Daftar sequence yang sudah diketahui gagal (tombstone) dari penyimpanan lokal. */
@@ -146,7 +217,12 @@ export function validateMessageSentSignal(data: unknown): BchatMessageSentSignal
 
 export class BchatRealtimeSubscriber {
   private readonly options: BchatRealtimeSubscriberOptions;
+  private readonly sessionFloor: number;
+  private readonly sessionUuid: string | null;
   private echoChannel: any = null;
+  private boundPusherConnection: any = null;
+  private connectionStateHandler: ((states: { previous?: string; current?: string }) => void) | null = null;
+  private hasConfirmedSubscriptionOnce: boolean = false;
   /** Contiguous verified cursor: seluruh sequence 1..contiguousSequence telah selesai sah tanpa celah. */
   private contiguousSequence: number;
   /** Sequence tertinggi yang pernah diamati dari server/WS/outbound untuk mendeteksi celah secara eksplisit. */
@@ -165,10 +241,22 @@ export class BchatRealtimeSubscriber {
 
   constructor(options: BchatRealtimeSubscriberOptions) {
     this.options = options;
-    const baseInitial =
+    this.sessionFloor =
+      typeof options.sessionFloor === 'number' &&
+      Number.isInteger(options.sessionFloor) &&
+      options.sessionFloor > 0
+        ? options.sessionFloor
+        : 0;
+    this.sessionUuid =
+      typeof options.sessionUuid === 'string' && options.sessionUuid.trim() !== ''
+        ? options.sessionUuid.trim().toLowerCase()
+        : null;
+
+    const rawInitial =
       typeof options.initialSequence === 'number' && options.initialSequence > 0
         ? options.initialSequence
         : 0;
+    const baseInitial = Math.max(this.sessionFloor, rawInitial);
     this.contiguousSequence = baseInitial;
     this.highestObservedSequence = baseInitial;
     this.hasExplicitLocalKnowledge =
@@ -196,7 +284,7 @@ export class BchatRealtimeSubscriber {
           detail &&
           typeof detail.server_sequence === 'number' &&
           Number.isInteger(detail.server_sequence) &&
-          detail.server_sequence > 0
+          detail.server_sequence > this.sessionFloor
         ) {
           this.processedSequences.delete(detail.server_sequence);
           this.unresolvedSequences.set(detail.server_sequence, detail);
@@ -210,7 +298,7 @@ export class BchatRealtimeSubscriber {
 
     this.contiguousSequence = computeContiguousResolvedSequence(
       this.processedSequences,
-      this.contiguousSequence
+      Math.max(this.sessionFloor, this.contiguousSequence)
     );
 
     if (this.unresolvedSequences.size > 0) {
@@ -224,6 +312,18 @@ export class BchatRealtimeSubscriber {
 
   public getSubscriptionState(): SubscriptionState {
     return this.subscriptionState;
+  }
+
+  public getIsReconciling(): boolean {
+    return this.isReconciling;
+  }
+
+  public getSessionFloor(): number {
+    return this.sessionFloor;
+  }
+
+  public getSessionUuid(): string | null {
+    return this.sessionUuid;
   }
 
   /** Mengembalikan contiguous verified cursor (tidak pernah melompati celah/pesan gagal). */
@@ -337,7 +437,11 @@ export class BchatRealtimeSubscriber {
       this.highestObservedSequence = Math.max(this.highestObservedSequence, seq);
 
       if (isHistoryTombstonePlaintext(item.plaintext)) {
-        if (!this.processedSequences.has(seq) && !this.unresolvedSequences.has(seq)) {
+        if (
+          seq > this.sessionFloor &&
+          !this.processedSequences.has(seq) &&
+          !this.unresolvedSequences.has(seq)
+        ) {
           this.unresolvedSequences.set(seq, {
             server_sequence: seq,
             message_uuid: item.message_uuid,
@@ -387,13 +491,19 @@ export class BchatRealtimeSubscriber {
         this.options.deviceUuid,
         this.options.roomUuid
       );
+      if (this.contiguousSequence < this.sessionFloor) {
+        this.contiguousSequence = this.sessionFloor;
+      }
       if (persistentCursor > this.contiguousSequence) {
         const minUnresolved = this.getUnresolvedSequences()[0]?.server_sequence;
         const hasBlockingUnresolved =
-          minUnresolved !== undefined && minUnresolved <= persistentCursor;
+          minUnresolved !== undefined &&
+          minUnresolved > this.sessionFloor &&
+          minUnresolved <= persistentCursor;
 
         // Jika konstruktor membawa peta riwayat lokal secara eksplisit dan ada gap/unresolved
-        // di bawah persistentCursor (mis. akibat cursor jump sebelum perbaikan), jangan lompati gap!
+        // di bawah persistentCursor pada sesi aktif (rentang sessionFloor+1..persistentCursor),
+        // jangan lompati gap; namun sequence sesi ARCHIVED (<= sessionFloor) tidak pernah dianggap gap.
         if (!hasBlockingUnresolved && !this.hasExplicitLocalKnowledge) {
           this.contiguousSequence = persistentCursor;
           this.highestObservedSequence = Math.max(this.highestObservedSequence, persistentCursor);
@@ -401,8 +511,8 @@ export class BchatRealtimeSubscriber {
             this.processedSequences.add(s);
           }
         } else if (!hasBlockingUnresolved && this.hasExplicitLocalKnowledge) {
-          // Hanya maju sejauh benar-benar tidak ada celah pada knownProcessedSequences
-          let safeTarget = this.contiguousSequence;
+          // Maju dari batas bawah sesi aktif sejauh tidak ada celah pada knownProcessedSequences
+          let safeTarget = Math.max(this.contiguousSequence, this.sessionFloor);
           while (safeTarget < persistentCursor && this.processedSequences.has(safeTarget + 1)) {
             safeTarget++;
           }
@@ -422,11 +532,13 @@ export class BchatRealtimeSubscriber {
   /**
    * Berlangganan ke saluran privat Reverb `bchat.rooms.{roomUuid}`.
    * Dilengkapi idempotency guard untuk mencegah pendaftaran listener berulang.
+   * Status SUBSCRIBED hanya ditetapkan setelah library mengonfirmasi langganan channel.
    */
   public subscribe(): void {
     if (
       this.subscriptionState === 'SUBSCRIBED' ||
-      this.subscriptionState === 'CONNECTING'
+      this.subscriptionState === 'CONNECTING' ||
+      this.subscriptionState === 'RECONNECTING'
     ) {
       return;
     }
@@ -438,15 +550,59 @@ export class BchatRealtimeSubscriber {
       return;
     }
 
-    this.updateStatus('CONNECTING');
+    this.updateStatus(
+      this.hasConfirmedSubscriptionOnce ? 'RECONNECTING' : 'CONNECTING',
+      'Menghubungkan saluran Reverb...'
+    );
     const channelName = `bchat.rooms.${this.options.roomUuid}`;
 
     try {
       const channel = echo.private(channelName);
       this.echoChannel = channel;
 
+      // Pantau transisi koneksi transport Pusher/Reverb secara aman (disconnected, reconnecting, failed)
+      // tanpa mengubah mekanisme autentikasi WebSocket yang sudah berjalan.
+      const pusherConnection = (echo as any)?.connector?.pusher?.connection;
+      if (pusherConnection && typeof pusherConnection.bind === 'function') {
+        this.detachConnectionListeners();
+        this.boundPusherConnection = pusherConnection;
+        this.connectionStateHandler = (states: { previous?: string; current?: string }) => {
+          if (this.subscriptionState === 'UNSUBSCRIBED') return;
+          const current = states?.current;
+          if (current === 'connecting') {
+            this.updateStatus(
+              this.hasConfirmedSubscriptionOnce ? 'RECONNECTING' : 'CONNECTING',
+              this.hasConfirmedSubscriptionOnce
+                ? 'Menghubungkan kembali ke saluran Reverb...'
+                : 'Menghubungkan saluran Reverb...'
+            );
+          } else if (current === 'unavailable' || current === 'disconnected') {
+            this.updateStatus(
+              'DISCONNECTED',
+              'Saluran WebSocket terputus. Menunggu sambungan kembali...'
+            );
+          } else if (current === 'failed') {
+            this.updateStatus('ERROR', 'Koneksi WebSocket Reverb gagal.');
+          } else if (current === 'connected') {
+            // Transport terhubung tidak otomatis berarti private channel sudah terotorisasi & subscribed.
+            if (this.echoChannel?.subscription?.subscribed === true) {
+              this.hasConfirmedSubscriptionOnce = true;
+              this.updateStatus('SUBSCRIBED', 'Terhubung aman via E2EE');
+            } else {
+              this.updateStatus(
+                this.hasConfirmedSubscriptionOnce ? 'RECONNECTING' : 'CONNECTING',
+                'Mengonfirmasi langganan saluran privat...'
+              );
+            }
+          }
+        };
+        pusherConnection.bind('state_change', this.connectionStateHandler);
+      }
+
       channel.subscribed(() => {
-        this.updateStatus('SUBSCRIBED');
+        if (this.subscriptionState === 'UNSUBSCRIBED') return;
+        this.hasConfirmedSubscriptionOnce = true;
+        this.updateStatus('SUBSCRIBED', 'Terhubung aman via E2EE');
         // Saat pertama terhubung atau reconnect: rekonsiliasi pesan yang mungkin terlewat
         this.reconcileFromRest().catch((_err) => {
           // Error ditangani melalui onError callback di dalam reconcileFromRest
@@ -454,6 +610,7 @@ export class BchatRealtimeSubscriber {
       });
 
       channel.error((err: any) => {
+        if (this.subscriptionState === 'UNSUBSCRIBED') return;
         const errMsg = err?.message || JSON.stringify(err) || 'Autentikasi private channel ditolak.';
         this.updateStatus('ERROR', errMsg);
         this.options.onError?.(new Error(`Otorisasi saluran privat gagal: ${errMsg}`));
@@ -463,6 +620,12 @@ export class BchatRealtimeSubscriber {
       channel.listen('.message.sent', (rawPayload: unknown) => {
         this.handleSignal(rawPayload);
       });
+
+      // Jika library melaporkan channel sudah dalam status subscribed secara eksplisit
+      if (channel?.subscription?.subscribed === true) {
+        this.hasConfirmedSubscriptionOnce = true;
+        this.updateStatus('SUBSCRIBED', 'Terhubung aman via E2EE');
+      }
     } catch (err: any) {
       const errMsg = err?.message || 'Gagal memulai koneksi WebSocket.';
       this.updateStatus('ERROR', errMsg);
@@ -579,7 +742,9 @@ export class BchatRealtimeSubscriber {
         currentUserId: this.options.currentUserId,
         workerRpc: this.options.workerRpc,
         fencing: this.options.fencing,
-        afterSequence: this.contiguousSequence,
+        afterSequence: Math.max(this.sessionFloor, this.contiguousSequence),
+        sessionFloor: this.sessionFloor,
+        sessionUuid: this.sessionUuid ?? undefined,
         batchLimit: this.options.batchLimit,
         processedSequences: this.processedSequences,
         unresolvedSequences: this.unresolvedSequences,
@@ -683,11 +848,26 @@ export class BchatRealtimeSubscriber {
     return this.lastFailedSequence;
   }
 
+  private detachConnectionListeners(): void {
+    if (this.boundPusherConnection && this.connectionStateHandler) {
+      try {
+        if (typeof this.boundPusherConnection.unbind === 'function') {
+          this.boundPusherConnection.unbind('state_change', this.connectionStateHandler);
+        }
+      } catch (_err) {
+        // noop
+      }
+    }
+    this.boundPusherConnection = null;
+    this.connectionStateHandler = null;
+  }
+
   /**
    * Berhenti berlangganan dan membersihkan saluran WebSocket.
    */
   public unsubscribe(): void {
     this.updateStatus('UNSUBSCRIBED');
+    this.detachConnectionListeners();
     if (this.echoChannel) {
       try {
         if (typeof this.echoChannel.stopListening === 'function') {
