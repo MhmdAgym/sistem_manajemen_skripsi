@@ -333,9 +333,14 @@ export interface BchatDeviceStatusQuery {
 export interface BchatActiveDeviceInfo {
     device_uuid: string
     device_name: string
-    status: string        // 'ACTIVE'
+    status: string        // 'ACTIVE' | 'REVOKED'
+    is_trusted?: boolean
+    trusted_at?: string | null
     key_version: number
     registered_at: string
+    revoked_at?: string | null
+    revocation_reason?: string | null
+    public_key?: string
 }
 
 export interface BchatQueriedDeviceInfo {
@@ -345,17 +350,102 @@ export interface BchatQueriedDeviceInfo {
 
 export interface BchatDeviceStatusData {
     has_active_device: boolean
+    has_trusted_device?: boolean
     active_device: BchatActiveDeviceInfo | null
+    active_devices?: BchatActiveDeviceInfo[]
+    revoked_devices?: BchatActiveDeviceInfo[]
     queried_device: BchatQueriedDeviceInfo | null
 }
 
 // -----------------------------------------------------------------------------
-// 14. DEVICE REGISTER WITH REPLACEMENT PROTECTION — Tahap A extension
+// 14. DEVICE REGISTER WITH MULTI-DEVICE & REPLACEMENT PROTECTION
 // -----------------------------------------------------------------------------
 
 export interface BchatDeviceRegisterWithReplacementRequest extends BchatDeviceRegisterRequest {
+    registration_mode?: 'ADD_DEVICE' | 'MANAGED_REPLACEMENT'
     confirm_replacement?: boolean
     expected_active_device_uuid?: string
+}
+
+export interface BchatDeviceRevokeResponseData {
+    device_uuid: string
+    device_name: string
+    status: string
+    revocation_reason: string
+    revoked_at: string
+}
+
+// -----------------------------------------------------------------------------
+// 15. TRUSTED DEVICE PAIRING (Tahap 2A)
+// -----------------------------------------------------------------------------
+
+export interface BchatPairingQrPayload {
+    v: number
+    type: string
+    pairing_uuid: string
+    pairing_code: string
+    user_id: number
+    target_uuid: string
+    target_name: string
+    fingerprint: string
+    expires_at: string
+}
+
+export interface BchatPairingRequestData {
+    pairing_uuid: string
+    pairing_code: string
+    target_device_uuid: string
+    target_device_name: string
+    target_public_key_fingerprint: string
+    challenge_nonce: string
+    expires_at: string
+    expires_in_seconds: number
+    qr_payload: BchatPairingQrPayload
+}
+
+export interface BchatPairingTargetDeviceSummary {
+    device_uuid: string
+    device_name: string
+    public_key_fingerprint: string
+    is_trusted: boolean
+}
+
+export interface BchatPairingApproverSummary {
+    device_uuid: string
+    device_name: string
+}
+
+export type BchatPairingStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'CANCELED'
+
+export interface BchatPairingStatusData {
+    pairing_uuid: string
+    pairing_code: string
+    status: BchatPairingStatus
+    target_device: BchatPairingTargetDeviceSummary
+    approver_device: BchatPairingApproverSummary | null
+    approved_at?: string | null
+    rejected_at?: string | null
+    rejection_reason?: string | null
+    expires_at: string
+    is_expired: boolean
+}
+
+export interface BchatPairingLookupData {
+    pairing_uuid: string
+    pairing_code: string
+    target_device_uuid: string
+    target_device_name: string
+    target_public_key_fingerprint: string
+    challenge_nonce: string
+    expires_at: string
+}
+
+export interface BchatPairingApprovalResultData {
+    pairing_uuid: string
+    status: 'APPROVED'
+    target_device_uuid: string
+    approver_device_uuid: string
+    approved_at: string
 }
 
 

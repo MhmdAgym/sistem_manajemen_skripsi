@@ -24,6 +24,7 @@ import type {
     BchatDeviceRegisterRequest,
     BchatDeviceRegisterResponseData,
     BchatDeviceRegisterWithReplacementRequest,
+    BchatDeviceRevokeResponseData,
     BchatDeviceStatusQuery,
     BchatDeviceStatusData,
     BchatKeyPackageUploadRequest,
@@ -72,7 +73,7 @@ export class BchatApiError extends Error {
  * Transforms an Axios or unknown error into a structured `BchatApiError`.
  * Prevents leaking raw request payloads containing passwords or cryptographic material.
  */
-function parseBchatApiError(error: unknown): BchatApiError {
+export function parseBchatApiError(error: unknown): BchatApiError {
     if (error instanceof BchatApiError) {
         return error
     }
@@ -185,6 +186,32 @@ export async function getDeviceStatus(
         const res = await axios.get<BchatSuccessResponse<BchatDeviceStatusData>>(
             '/api/bchat/devices/status',
             { params: query }
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+/**
+ * Endpoint: POST /api/bchat/devices/{deviceUuid}/revoke
+ * Mencabut status aktif satu perangkat spesifik milik pengguna dengan verifikasi kata sandi akun (Tahap 1B).
+ */
+export async function revokeDevice(
+    deviceUuid: string,
+    options?: { reason?: string; password?: string; stepUpToken?: string } | string
+): Promise<BchatSuccessResponse<BchatDeviceRevokeResponseData>> {
+    try {
+        const payload = typeof options === 'string'
+            ? { reason: options }
+            : {
+                reason: options?.reason,
+                password: options?.password,
+                step_up_token: options?.stepUpToken,
+            }
+        const res = await axios.post<BchatSuccessResponse<BchatDeviceRevokeResponseData>>(
+            `/api/bchat/devices/${encodeURIComponent(deviceUuid)}/revoke`,
+            payload
         )
         return res.data
     } catch (err) {
@@ -376,6 +403,7 @@ export const bchatApiClient = {
     issueRegistrationNonce,
     registerDevice,
     getDeviceStatus,
+    revokeDevice,
     uploadKeyPackages,
     fetchRooms,
     fetchRoomDetail,

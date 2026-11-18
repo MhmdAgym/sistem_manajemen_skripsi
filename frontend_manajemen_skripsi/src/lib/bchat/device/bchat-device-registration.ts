@@ -627,7 +627,9 @@ export interface DeviceRegistrationOptions {
   password: string
   deviceName?: string | null
   existingDeviceUuid?: string | null
-  /** Replacement Protection — wajib jika ada active device di backend */
+  /** Mode registrasi: 'ADD_DEVICE' (Multi-Device) atau 'MANAGED_REPLACEMENT' */
+  registrationMode?: 'ADD_DEVICE' | 'MANAGED_REPLACEMENT'
+  /** Replacement Protection — wajib jika ada active device di backend dan mode replacement */
   confirmReplacement?: boolean
   /** UUID perangkat aktif yang akan diganti, harus cocok dengan backend */
   expectedActiveDeviceUuid?: string | null
@@ -786,6 +788,7 @@ export async function registerDeviceFlow(
       pop_payload: popSignature.payloadHex,
       pop_signature: popSignature.signatureHex,
       device_name: options.deviceName ?? 'Browser Device',
+      registration_mode: options.registrationMode,
     }
     if (options.confirmReplacement) {
       registerPayload.confirm_replacement = true

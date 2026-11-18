@@ -32,6 +32,7 @@ import {
   Eye,
   EyeOff,
   Smartphone,
+  Laptop,
   WifiOff,
 } from 'lucide-react';
 import {
@@ -404,25 +405,18 @@ export function BchatDeviceOnboarding({
       // 3. Analisis kondisi
       if (localDevice) {
         const localUuid = localDevice.deviceUuid.toLowerCase();
+        const activeList = backendRes.active_devices ?? (backendRes.active_device ? [backendRes.active_device] : []);
+        const matchingActiveDevice = activeList.find(
+          (d) => d.device_uuid.toLowerCase() === localUuid
+        );
 
-        if (backendRes.has_active_device && backendRes.active_device) {
-          const backendActiveUuid = backendRes.active_device.device_uuid.toLowerCase();
-
-          if (backendActiveUuid === localUuid) {
-            // ✅ Kondisi A: lokal ACTIVE = backend ACTIVE
-            setRegisteredDeviceUuid(localDevice.deviceUuid);
-            await runKeyPackagePublish(localDevice.deviceUuid, session);
-            return;
-          } else {
-            // ❌ Kondisi C: ada active device LAIN di backend → perlu replacement
-            setExistingActiveDevice(backendRes.active_device);
-            setPhase('NEEDS_REPLACEMENT_CONFIRM');
-            setStatusMessage('');
-            return;
-          }
-        } else if (!backendRes.has_active_device) {
-          // Backend tidak punya active device, tapi lokal ada "active" key
-          // Ini seharusnya tidak terjadi, tapi kita anggap perlu registrasi ulang
+        if (matchingActiveDevice) {
+          // ✅ Kondisi A: lokal ACTIVE cocok dengan salah satu perangkat ACTIVE di backend (Multi-Device)
+          setRegisteredDeviceUuid(localDevice.deviceUuid);
+          await runKeyPackagePublish(localDevice.deviceUuid, session);
+          return;
+        } else {
+          // Kunci lokal ada namun tidak lagi terdaftar aktif di backend (misal telah dicabut)
           setPhase('NEEDS_REGISTRATION');
           setStatusMessage('');
           return;
@@ -459,14 +453,8 @@ export function BchatDeviceOnboarding({
             setStagedKey(null);
             await runKeyPackagePublish(staged.deviceUuid, session);
             return;
-          } else if (reconRes.data.has_active_device && reconRes.data.active_device) {
-            // Backend punya active device lain, staged belum terdaftar
-            setExistingActiveDevice(reconRes.data.active_device);
-            setPhase('NEEDS_REPLACEMENT_CONFIRM');
-            setStatusMessage('');
-            return;
           } else {
-            // Staged belum terdaftar & belum ada active → perlu registrasi
+            // Staged belum terdaftar aktif → arahkan ke registrasi baru
             setPhase('NEEDS_REGISTRATION');
             setStatusMessage('');
             return;
@@ -482,14 +470,8 @@ export function BchatDeviceOnboarding({
         }
       }
 
-      // Tidak ada lokal, tidak ada staged → perlu registrasi baru
-      if (backendRes.has_active_device && backendRes.active_device) {
-        // Ada active device lain di backend (browser lain)
-        setExistingActiveDevice(backendRes.active_device);
-        setPhase('NEEDS_REPLACEMENT_CONFIRM');
-      } else {
-        setPhase('NEEDS_REGISTRATION');
-      }
+      // Tidak ada lokal, tidak ada staged → registrasi perangkat baru (Multi-Device ADD_DEVICE)
+      setPhase('NEEDS_REGISTRATION');
       setStatusMessage('');
     } catch (err) {
       if (session !== sessionRef.current) return;
@@ -539,6 +521,7 @@ export function BchatDeviceOnboarding({
       const result = await registerDeviceFlow({
         password: pwd,
         deviceName,
+        registrationMode: 'ADD_DEVICE',
         confirmReplacement: false,
       });
 
@@ -589,6 +572,7 @@ export function BchatDeviceOnboarding({
       const result = await registerDeviceFlow({
         password: pwd,
         deviceName,
+        registrationMode: 'MANAGED_REPLACEMENT',
         confirmReplacement: true,
         expectedActiveDeviceUuid: existingActiveDevice.device_uuid,
       });
@@ -786,6 +770,39 @@ export function BchatDeviceOnboarding({
             </div>
           </div>
 
+          {/* Daftar Perangkat Aktif Lain (Multi-Device) */}
+          {backendStatus?.active_devices && backendStatus.active_devices.length > 0 && (
+            <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs text-slate-700 space-y-2">
+              <p className="font-semibold text-slate-800 flex items-center gap-1.5">
+                <Laptop className="w-3.5 h-3.5 text-blue-600" />
+                Perangkat Aktif Terdaftar ({backendStatus.active_devices.length}):
+              </p>
+              <ul className="space-y-1">
+                {backendStatus.active_devices.map((dev) => {
+                  const isCurrent = registeredDeviceUuid?.toLowerCase() === dev.device_uuid.toLowerCase();
+                  return (
+                    <li key={dev.device_uuid} className="flex items-center justify-between py-1 px-2 rounded bg-white border border-slate-100">
+                      <span className="font-medium text-slate-700 flex items-center gap-1.5">
+                        {dev.device_name}
+                        {isCurrent && (
+                          <span className="text-[10px] bg-blue-100 text-blue-700 font-bold px-1.5 py-0.5 rounded">
+                            Perangkat Ini
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-slate-400 font-mono text-[10px]">
+                        {dev.device_uuid.slice(0, 8)}...
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+              <p className="text-[11px] text-slate-500 italic">
+                Perangkat ini akan ditambahkan sebagai perangkat aktif baru tanpa mencabut perangkat di atas.
+              </p>
+            </div>
+          )}
+
           <form onSubmit={handleRegisterSubmit} className="flex flex-col gap-3">
             <div className="flex flex-col gap-1">
               <label className="text-xs font-medium text-slate-600">Password Akun</label>
@@ -835,6 +852,21 @@ export function BchatDeviceOnboarding({
           <p className="text-[11px] text-slate-400 text-center">
             Password digunakan sekali untuk otorisasi kriptografi dan tidak disimpan.
           </p>
+
+          {backendStatus?.active_devices && backendStatus.active_devices.length > 0 && (
+            <div className="text-center pt-1">
+              <button
+                type="button"
+                onClick={() => {
+                  setExistingActiveDevice(backendStatus.active_devices![0]);
+                  setPhase('NEEDS_REPLACEMENT_CONFIRM');
+                }}
+                className="text-xs text-amber-600 hover:text-amber-700 underline"
+              >
+                Ingin mengganti perangkat lama yang hilang?
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -907,6 +939,18 @@ export function BchatDeviceOnboarding({
               )}
             </div>
           </form>
+
+          <div className="text-center pt-1">
+            <button
+              type="button"
+              onClick={() => {
+                setPhase('NEEDS_REGISTRATION');
+              }}
+              className="text-xs text-blue-600 hover:text-blue-700 underline"
+            >
+              Kembali, daftarkan sebagai perangkat tambahan
+            </button>
+          </div>
 
           <p className="text-[11px] text-slate-400 text-center">
             Setelah diganti, perangkat lama tidak dapat lagi digunakan untuk mengakses ruang chat.

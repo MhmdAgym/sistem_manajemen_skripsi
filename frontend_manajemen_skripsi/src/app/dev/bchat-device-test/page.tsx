@@ -37,6 +37,10 @@ import {
   type PublishWelcomeResult,
   type FetchChallengeAndAckResult,
 } from '@/lib/bchat/handshake/bchat-handshake-coordinator';
+import {
+  buildWelcomeAckPayload,
+  signWelcomeAckWithDeviceIdentity,
+} from '@/lib/bchat/handshake/bchat-welcome-ack-builder';
 import { fetchRoomDetail, fetchPartnerKeyPackage, sendMessage, getDeviceStatus } from '@/lib/bchat/api/bchat-api-client';
 import type { BchatSendMessageRequest } from '@/lib/bchat/api/bchat-api-types';
 import {
@@ -372,6 +376,31 @@ export default function BchatDeviceTestPage() {
   const [rvDosenSteps, setRvDosenSteps] = useState<StepStatus[]>(REVERB_STEPS);
 
   const autoRunTriggered = useRef<boolean>(false);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      (window as any).__BCAT_TEST_MODULES__ = {
+        createBchatWorkerClient,
+        publishKeyPackagesFlow,
+        publishWelcomeHandshakeFlow,
+        fetchChallengeAndAckHandshakeFlow,
+        buildWelcomeAckPayload,
+        signWelcomeAckWithDeviceIdentity,
+        fetchRoomDetail,
+        fetchPartnerKeyPackage,
+        sendMessage,
+        getDeviceStatus,
+        sendApplicationMessageFlow,
+        receiveApplicationMessagesFlow,
+        computePayloadSha256,
+        getGroupStateCursor,
+        idbGet,
+        idbPut,
+        withReadonlyTransaction,
+        BCAT_STORES,
+      };
+    }
+  }, []);
 
   const addLog = (message: string, type: 'info' | 'success' | 'warn' | 'error' = 'info') => {
     const timestamp = new Date().toISOString().substring(11, 23);

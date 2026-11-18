@@ -1,6 +1,7 @@
 import Echo from 'laravel-echo'
 import Pusher from 'pusher-js'
 import axios from '@/lib/axios'
+import { authorizeBchatWsChannel } from '@/lib/bchat/device/bchat-ws-auth-client'
 
 declare global {
     interface Window {
@@ -10,12 +11,24 @@ declare global {
 }
 
 let echoInstance: Echo<any> | null = null
+let currentEchoDeviceUuid: string | null = null
+
+/**
+ * Mengatur UUID perangkat aktif untuk disertakan pada otorisasi channel privat Echo.
+ */
+export function setEchoDeviceUuid(deviceUuid: string | null): void {
+    currentEchoDeviceUuid = deviceUuid ? deviceUuid.toLowerCase().trim() : null
+}
 
 /**
  * Inisialisasi atau ambil instance singleton Laravel Echo untuk koneksi WebSocket Reverb.
  * Aman untuk SSR (mengembalikan null jika dipanggil di server).
  */
-export function getEcho(): Echo<any> | null {
+export function getEcho(deviceUuid?: string): Echo<any> | null {
+    if (deviceUuid) {
+        setEchoDeviceUuid(deviceUuid)
+    }
+
     if (typeof window === 'undefined') {
         return null
     }
@@ -44,10 +57,26 @@ export function getEcho(): Echo<any> | null {
             authorizer: (channel: { name: string }) => {
                 return {
                     authorize: (socketId: string, callback: (error: any, authData: any) => void) => {
+                        const isBchatRoom = channel.name.startsWith('private-bchat.rooms.') || channel.name.startsWith('bchat.rooms.')
+                        if (isBchatRoom && currentEchoDeviceUuid) {
+                            authorizeBchatWsChannel(socketId, channel.name, currentEchoDeviceUuid)
+                                .then(authData => callback(null, authData))
+                                .catch(err => {
+                                    console.error('[ECHO] Gagal melakukan otorisasi kriptografis kanal bchat:', err)
+                                    callback(err, null)
+                                })
+                            return
+                        }
+
+                        const headers: Record<string, string> = {}
+                        if (currentEchoDeviceUuid) {
+                            headers['X-Bchat-Device-Uuid'] = currentEchoDeviceUuid
+                        }
+
                         axios.post('/broadcasting/auth', {
                             socket_id: socketId,
                             channel_name: channel.name,
-                        })
+                        }, { headers })
                         .then(response => {
                             callback(null, response.data)
                         })
@@ -71,6 +100,7 @@ export function getEcho(): Echo<any> | null {
  * Putuskan koneksi dan bersihkan instance Laravel Echo (dipanggil saat logout).
  */
 export function destroyEcho(): void {
+    currentEchoDeviceUuid = null
     if (echoInstance) {
         try {
             echoInstance.disconnect()
