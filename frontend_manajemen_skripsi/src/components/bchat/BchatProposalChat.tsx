@@ -38,11 +38,14 @@ import {
   FileCheck,
   FileX,
   X,
+  Smartphone,
+  History,
 } from 'lucide-react';
 import { useAuth } from '@/hooks/auth';
 import {
   fetchRooms,
   fetchRoomDetail,
+  getDeviceStatus,
 } from '@/lib/bchat/api/bchat-api-client';
 import type {
   BchatRoomSummary,
@@ -66,21 +69,35 @@ import {
   getGroupStateCursor,
   updateGroupStateCursor,
   loadEncryptedHistory,
+  computeContiguousResolvedSequence,
+  isHistoryTombstonePlaintext,
   type DecryptedMessageItem,
+  type UnresolvedSequenceDetail,
 } from '@/lib/bchat/message/bchat-message-coordinator';
 import {
   BchatRealtimeSubscriber,
   type SubscriptionState,
+  type BchatRecoveryState,
 } from '@/lib/bchat/message/bchat-realtime-listener';
 import {
   idbGet,
   idbPut,
 } from '@/lib/bchat/storage/bchat-idb-core';
 import {
+  saveEncryptedHistoryItem,
+} from '@/lib/bchat/storage/bchat-encrypted-history';
+import {
   BCAT_STORES,
   type TabLeaseRecord,
 } from '@/lib/bchat/storage/bchat-idb-schema';
 import { BchatDeviceOnboarding } from '@/components/bchat/BchatDeviceOnboarding';
+import { BchatDeviceManagementModal } from '@/components/bchat/BchatDeviceManagementModal';
+import { BchatDevicePairingGate } from '@/components/bchat/BchatDevicePairingGate';
+import { BchatHistoryTransferModal } from '@/components/bchat/BchatHistoryTransferModal';
+import {
+  fetchPendingHistoryTransfers,
+  type BchatHistoryTransferData,
+} from '@/lib/bchat/history/bchat-history-transfer-client';
 import {
   ATTACHMENT_CANONICAL,
   BchatAttachmentCoordinator,
@@ -94,7 +111,7 @@ import {
 // ONBOARDING GATE TYPE
 // -----------------------------------------------------------------------------
 
-type OnboardingGate = 'PENDING' | 'ONBOARDING' | 'PASSED';
+type OnboardingGate = 'PENDING' | 'ONBOARDING' | 'PAIRING' | 'PASSED';
 
 // -----------------------------------------------------------------------------
 // KONSTANTA & REGEX
@@ -152,8 +169,13 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
 
   // State Room & Kredensial
   const [deviceUuid, setDeviceUuid] = useState<string | null>(null);
+  const [isDeviceModalOpen, setIsDeviceModalOpen] = useState<boolean>(false);
   const [roomSummary, setRoomSummary] = useState<BchatRoomSummary | null>(null);
   const [roomDetail, setRoomDetail] = useState<BchatRoomDetail | null>(null);
+
+  // State History Transfer E2EE (Tahap 2B)
+  const [isHistoryTransferModalOpen, setIsHistoryTransferModalOpen] = useState<boolean>(false);
+  const [incomingTransferRequest, setIncomingTransferRequest] = useState<BchatHistoryTransferData | null>(null);
 
   // State Pesan & Input
   const [messages, setMessages] = useState<DecryptedMessageItem[]>([]);
@@ -189,6 +211,8 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
   >('INITIALIZING');
   const [statusDetail, setStatusDetail] = useState<string>('Menyiapkan sesi E2EE...');
   const [initError, setInitError] = useState<string | null>(null);
+  const [recoveryState, setRecoveryState] = useState<BchatRecoveryState | null>(null);
+  const [isRetryingRecovery, setIsRetryingRecovery] = useState<boolean>(false);
 
   // State Handshake & Polling Otomatis
   const [waitingState, setWaitingState] = useState<{
@@ -226,6 +250,25 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     setShowScrollBottom(!isNearBottom);
   };
 
+  // Test Harness Hook untuk pengujian otomatis (dev / test port 3001)
+  useEffect(() => {
+    if (typeof window !== 'undefined' && (process.env.NEXT_PUBLIC_IS_TEST_HARNESS === 'true' || window.location.port === '3001')) {
+      (window as unknown as Record<string, unknown>).__bchatHarness = {
+        saveEncryptedHistoryItem,
+        loadEncryptedHistory,
+        setMessages,
+        getMessages: () => messages,
+        deviceUuid,
+        roomSummary,
+        connectionStatus,
+        isUnrecoverableActiveRoom,
+        initError,
+        openTransferModal: () => setIsHistoryTransferModalOpen(true),
+        workerClient: workerClientRef.current,
+      };
+    }
+  }, [messages, deviceUuid, roomSummary, connectionStatus, isUnrecoverableActiveRoom, initError]);
+
   // ---------------------------------------------------------------------------
   // INISIALISASI PROTOKOL & PERSIAPAN SESI
   // ---------------------------------------------------------------------------
@@ -261,6 +304,24 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       }
       const activeDevUuid = localDevice.deviceUuid;
       setDeviceUuid(activeDevUuid);
+
+      // 1b. Periksa status kepercayaan perangkat aktif di backend (Tahap 2A)
+      try {
+        const devStatusRes = await getDeviceStatus({ device_uuid: activeDevUuid });
+        if (sessionIdRef.current !== currentSessionId) return;
+        const matched = devStatusRes.data.active_devices?.find(
+          (d) => d.device_uuid.toLowerCase() === activeDevUuid.toLowerCase()
+        ) || devStatusRes.data.active_device;
+
+        if (matched && matched.is_trusted === false) {
+          setOnboardingGate('PAIRING');
+          return;
+        }
+      } catch {
+        // Jika status perangkat tidak dapat dijangkau, biarkan alur berlanjut
+      }
+
+      setOnboardingGate('PASSED');
 
       // 2. Ambil Daftar Room B-CHAT dari REST API
       setStatusDetail('Mengambil data ruang bimbingan...');
@@ -603,6 +664,14 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         return;
       }
 
+      // 6.5 Muat Riwayat Pesan Terenkripsi dari IndexedDB Lokal (jika ada)
+      setStatusDetail('Memeriksa riwayat pesan lokal...');
+      const localHistoryItems = await loadEncryptedHistory(activeDevUuid, roomUuid).catch(() => []);
+      if (sessionIdRef.current !== currentSessionId) return;
+      if (localHistoryItems.length > 0) {
+        setMessages(localHistoryItems);
+      }
+
       // 7. Restore GroupState MLS (Room berstatus ACTIVE)
       setStatusDetail('Memulihkan status kriptografi room...');
       const restoreRes = await workerClient.restoreGroupState({
@@ -614,44 +683,82 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
 
       if (restoreRes.status !== 'FOUND') {
         if (restoreRes.status === 'NOT_FOUND') {
-          // Room ACTIVE namun GroupState tidak ada di IndexedDB perangkat ini
-          setIsUnrecoverableActiveRoom(true);
-          setInitError(
-            'Ruang obrolan ini sudah aktif pada perangkat lain, namun kunci sesi lokal (GroupState) tidak ditemukan pada browser/perangkat ini. Demi menjaga keamanan End-to-End Encryption (Forward Secrecy), sesi baru tidak dapat dibuat ulang. Harap gunakan perangkat yang sebelumnya digunakan untuk membuka bimbingan ini.'
+          // Jika sudah ada riwayat lokal yang diimpor, tampilkan riwayat dan aktifkan mode baca
+          if (localHistoryItems.length > 0) {
+            setConnectionStatus('CONNECTED');
+            setStatusDetail('Riwayat obrolan aman dimuat dari penyimpanan lokal');
+            // Tetap lanjutkan inisialisasi subscriber agar multi-device realtime sync bekerja
+          } else {
+            // Room ACTIVE namun GroupState tidak ada di IndexedDB perangkat ini
+            setIsUnrecoverableActiveRoom(true);
+            setInitError(
+              'Ruang obrolan ini sudah aktif pada perangkat lain, namun kunci sesi lokal (GroupState) tidak ditemukan pada browser ini. Harap gunakan perangkat yang sebelumnya digunakan atau sinkronkan riwayat dari perangkat tepercaya Anda.'
+            );
+            setConnectionStatus('ERROR');
+            return;
+          }
+        } else {
+          // Fail-closed untuk status abnormal lainnya (QUARANTINED, FENCING_STALE, RESTORE_ERROR)
+          throw new Error(
+            `Sesi GroupState tidak dapat dipulihkan (${restoreRes.status}: ${restoreRes.message || 'Kegagalan keystore lokal'}).`
           );
-          setConnectionStatus('ERROR');
-          return;
         }
-
-        // Fail-closed untuk status abnormal lainnya (QUARANTINED, FENCING_STALE, RESTORE_ERROR)
-        throw new Error(
-          `Sesi GroupState tidak dapat dipulihkan (${restoreRes.status}: ${restoreRes.message || 'Kegagalan keystore lokal'}).`
-        );
       }
 
       // 8. Muat Riwayat Pesan Terenkripsi dari IndexedDB (AES-256-GCM via KEK)
       setStatusDetail('Mendekripsi riwayat pesan lokal...');
-      const historyItems = await loadEncryptedHistory(activeDevUuid, roomUuid);
+      const historyItems = localHistoryItems.length > 0 ? localHistoryItems : await loadEncryptedHistory(activeDevUuid, roomUuid);
       if (sessionIdRef.current !== currentSessionId) return;
 
       setMessages(historyItems);
 
-      // Hitung kursor tertinggi yang sudah ada di riwayat terenkripsi lokal
-      const maxHistorySeq = historyItems.reduce(
-        (max, item) => Math.max(max, item.server_sequence),
-        0
-      );
+      // Pisahkan riwayat valid (bukan tombstone) dari pesan gagal/tombstone untuk menjaga
+      // Contiguous Verified Cursor agar tidak pernah melompati celah atau pesan yang gagal didekripsi.
+      const validHistorySeqs = historyItems
+        .filter((item) => !isHistoryTombstonePlaintext(item.plaintext))
+        .map((item) => item.server_sequence);
+      const tombstoneUnresolved: UnresolvedSequenceDetail[] = historyItems
+        .filter((item) => isHistoryTombstonePlaintext(item.plaintext))
+        .map((item) => ({
+          server_sequence: item.server_sequence,
+          message_uuid: item.message_uuid,
+          errorCategory:
+            item.plaintext === '[Integritas Gagal]' || item.plaintext === '[Format Corrupt]'
+              ? 'PAYLOAD_INTEGRITY_ERROR'
+              : 'MLS_CRYPTO_ERROR',
+          error:
+            item.error ||
+            `Pesan urutan #${item.server_sequence} belum dapat didekripsi pada perangkat ini.`,
+          requiresRecovery: true,
+        }));
 
-      // Ambil kursor persisten dari GroupState jika ada
+      const contiguousHistorySeq = computeContiguousResolvedSequence(validHistorySeqs, 0);
+
+      // Ambil kursor persisten dari GroupState jika ada.
+      // HANYA gunakan persistentCursor jika tidak melompati tombstone/celah pada riwayat lokal.
       const persistentCursor = await getGroupStateCursor(activeDevUuid, roomUuid);
-      const startingCursor = Math.max(persistentCursor, maxHistorySeq);
+      const validHistorySet = new Set<number>(validHistorySeqs);
+      const minTombstoneSeq = tombstoneUnresolved.reduce(
+        (min, item) => Math.min(min, item.server_sequence),
+        Number.POSITIVE_INFINITY
+      );
+      const hasGapBelowPersistent =
+        historyItems.length > 0 &&
+        (minTombstoneSeq <= persistentCursor ||
+          Array.from({ length: persistentCursor }, (_, idx) => idx + 1).some(
+            (seq) => !validHistorySet.has(seq)
+          ));
 
-      // Sinkronkan kursor GroupState ke disk jika maxHistorySeq lebih tinggi
-      if (maxHistorySeq > persistentCursor) {
+      const startingCursor = hasGapBelowPersistent
+        ? contiguousHistorySeq
+        : Math.max(persistentCursor, contiguousHistorySeq);
+
+      // Sinkronkan kursor GroupState ke disk HANYA jika contiguousHistorySeq yang terverifikasi lebih tinggi
+      if (contiguousHistorySeq > persistentCursor) {
         await updateGroupStateCursor({
           deviceUuid: activeDevUuid,
           roomUuid,
-          sequence: maxHistorySeq,
+          sequence: contiguousHistorySeq,
           fencing,
         }).catch(() => {});
       }
@@ -666,11 +773,15 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         workerRpc: workerClient,
         fencing,
         initialSequence: startingCursor,
+        knownProcessedSequences: validHistorySeqs,
+        knownUnresolvedSequences: tombstoneUnresolved,
         onSubscriptionStatusChange: (status: SubscriptionState, detail?: string) => {
           if (sessionIdRef.current !== currentSessionId) return;
           if (status === 'SUBSCRIBED') {
             setConnectionStatus('CONNECTED');
-            setStatusDetail('Terhubung aman via E2EE');
+            if (!subscriberRef.current?.getIsRecoveryRequired()) {
+              setStatusDetail('Terhubung aman via E2EE');
+            }
           } else if (status === 'CONNECTING') {
             setConnectionStatus('RECONNECTING');
             setStatusDetail(detail || 'Menghubungkan kembali...');
@@ -685,8 +796,21 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         onMessageDecrypted: (newMsg: DecryptedMessageItem) => {
           if (sessionIdRef.current !== currentSessionId) return;
           setMessages((prev) => {
-            // Hindari duplikasi pesan berdasarkan sequence
-            if (prev.some((m) => m.server_sequence === newMsg.server_sequence)) {
+            const existingIdx = prev.findIndex(
+              (m) => m.server_sequence === newMsg.server_sequence
+            );
+            if (existingIdx !== -1) {
+              const existing = prev[existingIdx];
+              const existingIsTombstone =
+                !!existing.error || isHistoryTombstonePlaintext(existing.plaintext);
+              const incomingIsValid =
+                !newMsg.error && !isHistoryTombstonePlaintext(newMsg.plaintext);
+              // Hanya timpa jika pesan sebelumnya berupa tombstone dan kini pulih menjadi plaintext sah
+              if (existingIsTombstone && incomingIsValid) {
+                const next = [...prev];
+                next[existingIdx] = newMsg;
+                return next;
+              }
               return prev;
             }
             const updated = [...prev, newMsg].sort(
@@ -703,8 +827,12 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         onRecoveryRequired: (failedSeq: number) => {
           if (sessionIdRef.current !== currentSessionId) return;
           setStatusDetail(
-            `Sesi obrolan membutuhkan pemulihan sinkronisasi enkripsi (pesan urutan #${failedSeq}). Harap muat ulang halaman.`
+            `Pemulihan dibutuhkan untuk pesan urutan #${failedSeq}. Pesan baru tetap dapat diproses.`
           );
+        },
+        onRecoveryStateChange: (state: BchatRecoveryState) => {
+          if (sessionIdRef.current !== currentSessionId) return;
+          setRecoveryState(state);
         },
       });
 
@@ -725,8 +853,16 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       await subscriber.reconcileFromRest();
       if (sessionIdRef.current !== currentSessionId) return;
 
+      const currentRecState = subscriber.getRecoveryState();
+      setRecoveryState(currentRecState);
       setConnectionStatus('CONNECTED');
-      setStatusDetail('Terhubung aman via E2EE');
+      if (currentRecState.isRecoveryRequired && currentRecState.failedSequence) {
+        setStatusDetail(
+          `Pemulihan dibutuhkan untuk pesan urutan #${currentRecState.failedSequence}. Pesan baru tetap dapat diproses.`
+        );
+      } else {
+        setStatusDetail('Terhubung aman via E2EE');
+      }
       setTimeout(() => scrollToBottom(false), 200);
     } catch (err: any) {
       if (sessionIdRef.current !== currentSessionId) return;
@@ -778,6 +914,36 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       }
     };
   }, [user?.id, onboardingGate, initializeChatSession]);
+
+  // Polling deteksi transfer riwayat masuk untuk perangkat ini (Perangkat Sumber - Tahap 2B)
+  useEffect(() => {
+    if (!deviceUuid || !user?.id) return;
+
+    let isMounted = true;
+    const checkIncomingTransfers = async () => {
+      try {
+        const res = await fetchPendingHistoryTransfers(deviceUuid);
+        if (!isMounted) return;
+        const pending = res.data || [];
+        if (pending.length > 0) {
+          const activePending = pending.find((t) => t.status === 'REQUESTED');
+          if (activePending) {
+            setIncomingTransferRequest(activePending);
+          }
+        }
+      } catch (_e) {
+        // Abaikan kegagalan jaringan berkala saat polling
+      }
+    };
+
+    checkIncomingTransfers();
+    const timer = setInterval(checkIncomingTransfers, 3500);
+
+    return () => {
+      isMounted = false;
+      clearInterval(timer);
+    };
+  }, [deviceUuid, user?.id]);
 
   // ---------------------------------------------------------------------------
   // MANAJEMEN LAMPIRAN E2EE (STAGE 4)
@@ -839,7 +1005,8 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     msg: DecryptedMessageItem,
     att: BchatAttachmentItemManifest
   ) => {
-    if (!roomSummary || !workerClientRef.current) return;
+    if (!roomSummary) return;
+    if (!att.cekBase64 && !workerClientRef.current) return;
 
     const key = `${msg.message_uuid}_${att.attachmentUuid}`;
 
@@ -861,6 +1028,10 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     }));
 
     try {
+      const preDerivedCekBytes = att.cekBase64
+        ? Uint8Array.from(atob(att.cekBase64), (c) => c.charCodeAt(0))
+        : undefined;
+
       const assembledBytes = await BchatAttachmentCoordinator.downloadAttachment({
         roomUuid: roomSummary.room_uuid,
         messageUuid: msg.message_uuid,
@@ -870,6 +1041,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         expectedTotalSize: att.fileSizeBytes,
         expectedFileSha256: att.fileHashSha256,
         workerClient: workerClientRef.current,
+        preDerivedCekBytes,
         onProgress: (p) => {
           setDownloadStateMap((prev) => ({
             ...prev,
@@ -991,6 +1163,15 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             },
           });
 
+          let cekBase64: string | undefined;
+          if (uploadRes.cekBytes && uploadRes.cekBytes.length === ATTACHMENT_CANONICAL.CEK_LENGTH_BYTES) {
+            let bin = '';
+            for (let b = 0; b < uploadRes.cekBytes.length; b++) {
+              bin += String.fromCharCode(uploadRes.cekBytes[b]);
+            }
+            cekBase64 = btoa(bin);
+          }
+
           manifestAttachments.push({
             attachmentUuid: uploadRes.attachmentUuid,
             uploadSessionId: uploadRes.sessionUuid,
@@ -999,6 +1180,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             fileSizeBytes: uploadRes.plaintextBytes,
             totalChunks: uploadRes.totalChunks,
             fileHashSha256: uploadRes.fileHashSha256,
+            ...(cekBase64 ? { cekBase64 } : {}),
           });
         }
 
@@ -1060,6 +1242,21 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     }
   };
 
+  const handleRetryRecovery = async () => {
+    if (!subscriberRef.current || isRetryingRecovery) return;
+    setIsRetryingRecovery(true);
+    try {
+      await subscriberRef.current.retryRecovery();
+      const updatedState = subscriberRef.current.getRecoveryState();
+      setRecoveryState(updatedState);
+      if (!updatedState.isRecoveryRequired) {
+        setStatusDetail('Terhubung aman via E2EE');
+      }
+    } finally {
+      setIsRetryingRecovery(false);
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -1079,9 +1276,24 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         onDeviceReady={(devUuid) => {
           setDeviceUuid(devUuid);
           setOnboardingGate('PASSED');
+          initializeChatSession();
         }}
         onCancel={onBack}
         workerRpc={workerClientRef.current}
+      />
+    );
+  }
+
+  // Gate: Tampilkan pairing jika perangkat aktif namun belum tepercaya (Tahap 2A)
+  if (onboardingGate === 'PAIRING' && deviceUuid) {
+    return (
+      <BchatDevicePairingGate
+        deviceUuid={deviceUuid}
+        onPairingApproved={() => {
+          setOnboardingGate('PASSED');
+          initializeChatSession();
+        }}
+        onCancel={onBack}
       />
     );
   }
@@ -1218,20 +1430,58 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
               <ShieldAlert className="w-3.5 h-3.5 text-amber-600" /> Perlindungan Forward Secrecy MLS:
             </p>
             <p>
-              Untuk mencegah penyadapan, protokol enkripsi E2EE tidak mengizinkan pembuatan ulang grup secara sepihak saat percakapan telah aktif. Silakan gunakan perangkat/browser yang sebelumnya digunakan untuk membuka bimbingan ini.
+              Untuk mencegah penyadapan, protokol enkripsi E2EE tidak mengizinkan pembuatan ulang grup secara sepihak saat percakapan telah aktif. Anda dapat memindahkan riwayat obrolan aman dari perangkat tepercaya Anda yang lain.
             </p>
           </div>
         </div>
-        <div className="pt-2 flex justify-center gap-3">
+        <div className="pt-2 flex flex-col sm:flex-row justify-center gap-3">
+          {roomSummary && deviceUuid && user && (
+            <button
+              type="button"
+              onClick={() => setIsHistoryTransferModalOpen(true)}
+              className="px-5 py-2.5 bg-emerald-600 text-white text-xs font-bold rounded-xl hover:bg-emerald-700 transition shadow-sm flex items-center justify-center gap-2"
+            >
+              <History className="w-3.5 h-3.5" />
+              Sinkronkan Riwayat Chat
+            </button>
+          )}
           {onBack && (
             <button
               onClick={onBack}
-              className="px-5 py-2.5 bg-slate-800 text-white text-xs font-bold rounded-xl hover:bg-slate-900 transition shadow-sm"
+              className="px-5 py-2.5 bg-slate-100 text-slate-700 text-xs font-bold rounded-xl hover:bg-slate-200 transition shadow-sm"
             >
               Kembali ke Menu Bimbingan
             </button>
           )}
         </div>
+
+        {/* Modal Transfer Riwayat saat di layar Sesi Kriptografi Tidak Ditemukan */}
+        {roomSummary && deviceUuid && user && (
+          <BchatHistoryTransferModal
+            isOpen={isHistoryTransferModalOpen || Boolean(incomingTransferRequest)}
+            onClose={() => {
+              setIsHistoryTransferModalOpen(false);
+              setIncomingTransferRequest(null);
+            }}
+            roomUuid={roomSummary.room_uuid}
+            currentDeviceUuid={deviceUuid}
+            userId={Number(user.id)}
+            incomingTransfer={incomingTransferRequest}
+            onIncomingHandled={() => setIncomingTransferRequest(null)}
+            onTransferSuccess={async () => {
+              try {
+                const freshHistory = await loadEncryptedHistory(deviceUuid, roomSummary.room_uuid);
+                setMessages(freshHistory);
+                setIsUnrecoverableActiveRoom(false);
+                setConnectionStatus('CONNECTED');
+                setTimeout(() => scrollToBottom(true), 100);
+                initializeChatSession();
+              } catch (_e) {
+                // Abaikan jika pemuatan riwayat pasca transfer tertunda
+              }
+            }}
+          />
+        )}
       </div>
     );
   }
@@ -1332,6 +1582,26 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
 
         {/* Status Pill & Aksi Header */}
         <div className="flex items-center gap-2 shrink-0">
+          {/* Tombol Sinkronisasi Riwayat Chat (Tahap 2B) */}
+          <button
+            onClick={() => setIsHistoryTransferModalOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1 bg-teal-50 hover:bg-teal-100 text-teal-700 text-[11px] font-bold rounded-full transition cursor-pointer border border-teal-200 shadow-2xs"
+            title="Sinkronkan Riwayat Chat dari Perangkat Tepercaya Lain"
+          >
+            <History className="w-3.5 h-3.5 text-teal-600" />
+            <span className="hidden sm:inline">Sinkronkan Riwayat</span>
+          </button>
+
+          {/* Tombol Manajemen Perangkat */}
+          <button
+            onClick={() => setIsDeviceModalOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 text-[11px] font-bold rounded-full transition cursor-pointer"
+            title="Kelola Perangkat B-CHAT"
+          >
+            <Smartphone className="w-3.5 h-3.5 text-slate-500" />
+            <span className="hidden sm:inline">Perangkat</span>
+          </button>
+
           {/* Tombol Ganti Mahasiswa (jika dosen membimbing > 1 mahasiswa) */}
           {availableProposalRooms.length > 1 && (
             <button
@@ -1401,6 +1671,52 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           </div>
         </div>
 
+        {/* Banner Status Recovery Sequence (Eksplisit & Actionable — Tidak Terkunci Diam-Diam) */}
+        {recoveryState?.isRecoveryRequired && recoveryState.unresolvedSequences.length > 0 && (
+          <div
+            data-bchat-recovery-banner="true"
+            className="mx-auto max-w-2xl rounded-2xl border border-amber-300 bg-amber-50/95 px-4 py-3 text-xs text-amber-900 shadow-2xs"
+          >
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div className="flex-1 space-y-1.5">
+                <p className="font-semibold text-amber-900">
+                  Pemulihan Diperlukan pada Pesan Urutan{' '}
+                  {recoveryState.unresolvedSequences
+                    .map((u) => `#${u.server_sequence}`)
+                    .join(', ')}
+                </p>
+                <p className="text-[11px] text-amber-800 leading-relaxed">
+                  Kunci ratchet lokal atau verifikasi kriptografis untuk pesan tersebut tidak tersedia di perangkat ini (Forward Secrecy RFC 9420). Pesan baru tetap diterima secara real-time tanpa melompati urutan yang belum pulih.
+                </p>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleRetryRecovery}
+                    disabled={isRetryingRecovery}
+                    className="inline-flex items-center gap-1.5 px-3 py-1 bg-white hover:bg-amber-100/60 border border-amber-300 text-amber-900 text-[11px] font-semibold rounded-lg transition disabled:opacity-50 cursor-pointer"
+                  >
+                    {isRetryingRecovery ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3 h-3" />
+                    )}
+                    <span>Coba Rekonsiliasi Ulang</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsHistoryTransferModalOpen(true)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-semibold rounded-lg transition cursor-pointer"
+                  >
+                    <History className="w-3 h-3" />
+                    <span>Sinkronkan Riwayat dari Perangkat Lain</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* State Kosong */}
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-48 text-center text-slate-400 space-y-2">
@@ -1411,6 +1727,13 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             <p className="text-[11px] text-slate-400 max-w-xs">
               Mulai komunikasi mengenai revisi proposal, rumusan masalah, atau jadwal bimbingan.
             </p>
+            <button
+              onClick={() => setIsHistoryTransferModalOpen(true)}
+              className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-50 border border-slate-200 text-teal-700 hover:text-teal-800 text-xs font-semibold rounded-xl shadow-2xs transition cursor-pointer"
+            >
+              <History className="w-3.5 h-3.5 text-teal-600" />
+              <span>Sinkronkan Riwayat dari Perangkat Lain</span>
+            </button>
           </div>
         )}
 
@@ -1418,19 +1741,19 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         {messages.map((msg) => {
           const isSelf = msg.is_self;
           const timeStr = formatMessageTime(msg.created_at || msg.client_sent_at);
-          const hasError = !!msg.error;
+          const hasError = !!msg.error || isHistoryTombstonePlaintext(msg.plaintext);
 
-          // Klasifikasi status pesan kriptografis
+          // Klasifikasi status pesan kriptografis (termasuk tombstone yang dimuat ulang dari IndexedDB)
           const isIntegrityError =
-            hasError &&
-            (msg.plaintext === '[Integritas Gagal]' ||
-              /integritas|sha-256|hash|base64|tamper/i.test(msg.error || ''));
+            msg.plaintext === '[Integritas Gagal]' ||
+            msg.plaintext === '[Format Corrupt]' ||
+            (!!msg.error && /integritas|sha-256|hash|base64|tamper/i.test(msg.error));
 
           const isPastRatchetUnavailable =
             !isIntegrityError &&
-            (hasError &&
-              (/past|generation|ratchet|expired|kunci|dekripsi mls gagal/i.test(msg.error || '') ||
-                msg.plaintext === '[Dekripsi Gagal]'));
+            (msg.plaintext === '[Dekripsi Gagal]' ||
+              (!!msg.error &&
+                /past|generation|ratchet|expired|kunci|dekripsi mls gagal/i.test(msg.error)));
 
           // Kasus 1: Peringatan Integritas Kriptografis (Fail-Closed)
           if (isIntegrityError) {
@@ -1846,6 +2169,50 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           </button>
         </form>
       </div>
+
+      {/* MODAL MANAJEMEN PERANGKAT (TAHAP 1B) */}
+      <BchatDeviceManagementModal
+        isOpen={isDeviceModalOpen}
+        onClose={() => setIsDeviceModalOpen(false)}
+        currentDeviceUuid={deviceUuid}
+        onRequestHistoryTransfer={() => {
+          setIsDeviceModalOpen(false);
+          setIsHistoryTransferModalOpen(true);
+        }}
+      />
+
+      {/* MODAL TRANSFER RIWAYAT CHAT E2EE (TAHAP 2B) */}
+      {roomSummary && deviceUuid && user && (
+        <BchatHistoryTransferModal
+          isOpen={isHistoryTransferModalOpen || Boolean(incomingTransferRequest)}
+          onClose={() => {
+            setIsHistoryTransferModalOpen(false);
+            setIncomingTransferRequest(null);
+          }}
+          roomUuid={roomSummary.room_uuid}
+          currentDeviceUuid={deviceUuid}
+          userId={Number(user.id)}
+          incomingTransfer={incomingTransferRequest}
+          onIncomingHandled={() => setIncomingTransferRequest(null)}
+          onTransferSuccess={async () => {
+            // Muat ulang riwayat dari IndexedDB lokal, sinkronkan cursor kontigu subscriber, dan perbarui tampilan chat
+            try {
+              const freshHistory = await loadEncryptedHistory(deviceUuid, roomSummary.room_uuid);
+              setMessages(freshHistory);
+              if (subscriberRef.current) {
+                await subscriberRef.current.syncFromLocalHistory(freshHistory);
+                setRecoveryState(subscriberRef.current.getRecoveryState());
+              }
+              setIsUnrecoverableActiveRoom(false);
+              setConnectionStatus('CONNECTED');
+              setTimeout(() => scrollToBottom(true), 100);
+              initializeChatSession();
+            } catch (_e) {
+              // Abaikan jika pemuatan riwayat pasca transfer tertunda
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

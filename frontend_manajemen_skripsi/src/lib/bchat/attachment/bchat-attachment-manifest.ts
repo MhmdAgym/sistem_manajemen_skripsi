@@ -21,6 +21,7 @@ export interface BchatAttachmentItemManifest {
   fileSizeBytes: number;
   totalChunks: number;
   fileHashSha256: string;
+  cekBase64?: string;
 }
 
 export interface BchatAttachmentManifest {
@@ -126,6 +127,28 @@ export function validateAttachmentManifest(data: unknown): BchatAttachmentManife
       throw new ManifestConsistencyError(
         `Item lampiran #${idx} memiliki fileHashSha256 tidak valid: '${item.fileHashSha256}'.`
       );
+    }
+
+    // Validasi opsional cekBase64 (jika disertakan wajib valid Base64 32-byte CEK)
+    if (item.cekBase64 !== undefined) {
+      if (typeof item.cekBase64 !== 'string' || item.cekBase64.trim().length === 0) {
+        throw new ManifestConsistencyError(
+          `Item lampiran #${idx} memiliki cekBase64 kosong atau tidak valid.`
+        );
+      }
+      try {
+        const decoded = atob(item.cekBase64);
+        if (decoded.length !== ATTACHMENT_CANONICAL.CEK_LENGTH_BYTES) {
+          throw new ManifestConsistencyError(
+            `Item lampiran #${idx} memiliki panjang CEK tidak valid (${decoded.length} B, wajib ${ATTACHMENT_CANONICAL.CEK_LENGTH_BYTES} B).`
+          );
+        }
+      } catch (err) {
+        if (err instanceof ManifestConsistencyError) throw err;
+        throw new ManifestConsistencyError(
+          `Item lampiran #${idx} memiliki encoding Base64 cekBase64 tidak valid.`
+        );
+      }
     }
   }
 
