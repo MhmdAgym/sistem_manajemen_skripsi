@@ -11,7 +11,9 @@ use App\Http\Requests\Bchat\BchatUploadChunkRequest;
 use App\Models\BchatAttachment;
 use App\Models\BchatAttachmentChunk;
 use App\Models\BchatRoom;
+use App\Models\BchatRoomSession;
 use App\Models\BchatUploadSession;
+use App\Models\BchatUserDevice;
 use App\Policies\BchatAttachmentPolicy;
 use App\Services\BchatAttachmentService;
 use Illuminate\Http\JsonResponse;
@@ -61,6 +63,35 @@ class BchatAttachmentController extends Controller
             return $room;
         }
 
+        // 1. Dapatkan sesi kriptografi MLS ACTIVE dari room
+        $activeCryptoSession = BchatRoomSession::where('room_id', $room->id)
+            ->where('status', 'ACTIVE')
+            ->first();
+
+        if (!$activeCryptoSession) {
+            $hasAnySession = BchatRoomSession::where('room_id', $room->id)->exists();
+            if ($hasAnySession) {
+                return $this->errorResponse(
+                    'Ruang obrolan tidak memiliki sesi kriptografi yang aktif untuk mengunggah lampiran.',
+                    'NO_ACTIVE_CRYPTO_SESSION',
+                    409
+                );
+            }
+
+            // Auto-create Generasi 1 aktif jika room legacy/fixture aktif belum memiliki record session
+            $activeCryptoSession = BchatRoomSession::create([
+                'session_uuid'       => (string) Str::uuid(),
+                'room_id'            => $room->id,
+                'generation_number'  => 1,
+                'status'             => 'ACTIVE',
+                'group_id_hash'      => $room->group_id_hash,
+                'start_epoch'        => 1,
+                'start_sequence'     => 1,
+                'current_sequence'   => (int) $room->current_sequence,
+                'activated_at'       => now(),
+            ]);
+        }
+
         $attachmentUuid = strtolower(trim((string) $request->input('attachment_uuid')));
         $totalChunks = (int) $request->input('total_chunks');
         $ciphertextBytes = (int) $request->input('ciphertext_bytes');
@@ -73,6 +104,7 @@ class BchatAttachmentController extends Controller
             $result = DB::transaction(function () use (
                 $room,
                 $user,
+                $activeCryptoSession,
                 $attachmentUuid,
                 $totalChunks,
                 $ciphertextBytes,
@@ -105,6 +137,7 @@ class BchatAttachmentController extends Controller
                     'attachment_uuid'   => $attachmentUuid,
                     'upload_session_id' => $session->id,
                     'room_id'           => $room->id,
+                    'session_id'        => $activeCryptoSession->id,
                     'message_id'        => null, // Diisi nanti saat pesan manifest terkirim
                     'plaintext_bytes'   => $plaintextBytes,
                     'ciphertext_bytes'  => $ciphertextBytes,
@@ -386,6 +419,32 @@ class BchatAttachmentController extends Controller
                     throw new BchatAttachmentException('Record lampiran tidak ditemukan.', 'ATTACHMENT_NOT_FOUND', 500);
                 }
 
+                // Validasi bahwa sesi kriptografi tempat upload dimulai masih ACTIVE dan tidak berganti generasi
+                $currentActiveSession = BchatRoomSession::where('room_id', $room->id)
+                    ->where('status', 'ACTIVE')
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$currentActiveSession) {
+                    throw new BchatAttachmentException(
+                        'Ruang obrolan tidak memiliki sesi kriptografi yang aktif untuk memfinalisasi lampiran.',
+                        'NO_ACTIVE_CRYPTO_SESSION',
+                        409
+                    );
+                }
+
+                if ($attachment->session_id !== null && (int) $attachment->session_id !== (int) $currentActiveSession->id) {
+                    throw new BchatAttachmentException(
+                        'Sesi kriptografi tempat lampiran ini diunggah sudah tidak aktif atau telah berganti generasi.',
+                        'CRYPTO_SESSION_MISMATCH',
+                        409
+                    );
+                }
+
+                if ($attachment->session_id === null) {
+                    $attachment->session_id = $currentActiveSession->id;
+                }
+
                 // Ambil seluruh chunk yang tersimpan
                 $chunks = BchatAttachmentChunk::where('attachment_id', $attachment->id)
                     ->orderBy('chunk_index', 'asc')
@@ -565,6 +624,12 @@ class BchatAttachmentController extends Controller
             return $this->errorResponse('Ruang obrolan tidak ditemukan.', 'ROOM_NOT_FOUND', 404);
         }
 
+        // Validasi perangkat aktif (B-CHAT Tahap 1B)
+        $deviceError = $this->validateActiveDevice($user);
+        if ($deviceError instanceof JsonResponse) {
+            return $deviceError;
+        }
+
         $isAuthorized = match ($action) {
             'upload'   => $this->attachmentPolicy->upload($user, $room),
             'download' => $this->attachmentPolicy->viewAny($user, $room),
@@ -592,6 +657,68 @@ class BchatAttachmentController extends Controller
             'message'    => $message,
             'error_code' => $errorCode,
         ], $httpStatus);
+    }
+
+    /**
+     * Memvalidasi bahwa pengguna memiliki perangkat aktif dan tepercaya,
+     * serta perangkat pemanggil tidak berstatus REVOKED atau UNTRUSTED.
+     */
+    protected function validateActiveDevice($user): ?JsonResponse
+    {
+        $requestDeviceUuid = request()->header('X-Bchat-Device-Uuid');
+        if ($requestDeviceUuid !== null && trim($requestDeviceUuid) !== '') {
+            $cleanUuid = strtolower(trim($requestDeviceUuid));
+            $device = BchatUserDevice::where('user_id', $user->id)
+                ->where('device_uuid', $cleanUuid)
+                ->first();
+
+            if (!$device || $device->status !== 'ACTIVE') {
+                return $this->errorResponse(
+                    'Perangkat tidak valid atau telah dicabut (REVOKED). Akses lampiran ditolak.',
+                    'DEVICE_NOT_ACTIVE',
+                    403
+                );
+            }
+
+            if (!$device->is_trusted) {
+                return $this->errorResponse(
+                    'Perangkat belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                    'DEVICE_NOT_TRUSTED',
+                    403
+                );
+            }
+
+            return null;
+        }
+
+        if (BchatUserDevice::where('user_id', $user->id)->exists()) {
+            $hasActive = BchatUserDevice::where('user_id', $user->id)
+                ->where('status', 'ACTIVE')
+                ->exists();
+
+            if (!$hasActive) {
+                return $this->errorResponse(
+                    'Pengguna tidak memiliki perangkat berstatus aktif. Akses lampiran ditolak.',
+                    'DEVICE_NOT_ACTIVE',
+                    403
+                );
+            }
+
+            $hasTrusted = BchatUserDevice::where('user_id', $user->id)
+                ->where('status', 'ACTIVE')
+                ->where('is_trusted', true)
+                ->exists();
+
+            if (!$hasTrusted) {
+                return $this->errorResponse(
+                    'Pengguna tidak memiliki perangkat tepercaya yang aktif. Lakukan pairing terlebih dahulu.',
+                    'DEVICE_NOT_TRUSTED',
+                    403
+                );
+            }
+        }
+
+        return null;
     }
 }
 

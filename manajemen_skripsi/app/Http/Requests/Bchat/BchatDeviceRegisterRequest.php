@@ -31,6 +31,7 @@ class BchatDeviceRegisterRequest extends FormRequest
             'pop_payload'                 => ['required', 'string', 'regex:/^[0-9a-f]{242}$/'],
             'pop_signature'               => ['required', 'string', 'regex:/^[0-9a-f]{128}$/'],
             'device_name'                 => ['nullable', 'string', 'max:100'],
+            'registration_mode'           => ['nullable', 'string', 'in:ADD_DEVICE,MANAGED_REPLACEMENT'],
             // Replacement confirmation fields (opsional pada registrasi pertama)
             'confirm_replacement'         => ['nullable', 'boolean'],
             'expected_active_device_uuid' => ['nullable', 'string', 'uuid'],

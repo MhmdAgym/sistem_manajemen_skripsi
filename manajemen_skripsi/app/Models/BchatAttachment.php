@@ -21,6 +21,7 @@ class BchatAttachment extends Model
         'attachment_uuid',
         'upload_session_id',
         'room_id',
+        'session_id',
         'message_id',
         'plaintext_bytes',
         'ciphertext_bytes',
@@ -34,6 +35,7 @@ class BchatAttachment extends Model
         return [
             'upload_session_id' => 'integer',
             'room_id'           => 'integer',
+            'session_id'        => 'integer',
             'message_id'        => 'integer',
             'plaintext_bytes'   => 'integer',
             'ciphertext_bytes'  => 'integer',
@@ -57,6 +59,14 @@ class BchatAttachment extends Model
     public function room(): BelongsTo
     {
         return $this->belongsTo(BchatRoom::class, 'room_id', 'id');
+    }
+
+    /**
+     * Relasi ke sesi kriptografi MLS (BchatRoomSession) yang menaungi lampiran ini.
+     */
+    public function session(): BelongsTo
+    {
+        return $this->belongsTo(BchatRoomSession::class, 'session_id', 'id');
     }
 
     /**

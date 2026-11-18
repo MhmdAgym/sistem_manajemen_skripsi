@@ -220,6 +220,14 @@ class BchatKeyPackageService
                     );
                 }
 
+                if (!$device->is_trusted) {
+                    throw new BchatKeyPackageException(
+                        'Perangkat belum berstatus tepercaya. Lakukan pairing terlebih dahulu sebelum mengunggah KeyPackage.',
+                        'DEVICE_NOT_TRUSTED',
+                        403
+                    );
+                }
+
                 // Hierarki 3: Kunci bchat_key_packages untuk memeriksa apakah hash sudah terdaftar sebelumnya
                 $hashes = array_column($preparedPackages, 'hash');
                 $existing = BchatKeyPackage::whereIn('key_package_hash', $hashes)
@@ -375,10 +383,11 @@ class BchatKeyPackageService
             );
         }
 
-        // 5. Verifikasi status lifecycle room (hanya diizinkan pada PENDING_WELCOME_ACK)
-        if ($room->status !== 'PENDING_WELCOME_ACK') {
+        // 5. Verifikasi status lifecycle room (diizinkan pada PENDING_WELCOME_ACK atau room ACTIVE dengan sesi PENDING)
+        $hasPendingSession = $room->sessions()->where('status', 'PENDING')->exists();
+        if ($room->status !== 'PENDING_WELCOME_ACK' && !($room->status === 'ACTIVE' && $hasPendingSession)) {
             throw new BchatKeyPackageException(
-                'Pengambilan KeyPackage partner hanya diizinkan pada ruang obrolan berstatus PENDING_WELCOME_ACK.',
+                'Pengambilan KeyPackage partner hanya diizinkan pada ruang obrolan berstatus PENDING_WELCOME_ACK atau memiliki sesi generasi baru berstatus PENDING.',
                 'INVALID_ROOM_STATUS',
                 409
             );
@@ -402,10 +411,14 @@ class BchatKeyPackageService
             );
         }
 
-        // 7. Verifikasi ketiadaan operasi Welcome yang sedang aktif
-        $activeChallenge = BchatWelcomeChallenge::where('room_id', $room->id)
-            ->where('operation_status', 'ACTIVE')
-            ->first();
+        // 7. Verifikasi ketiadaan operasi Welcome yang sedang aktif untuk sesi terkait
+        $activeChallengeQuery = BchatWelcomeChallenge::where('room_id', $room->id)
+            ->where('operation_status', 'ACTIVE');
+        if ($hasPendingSession) {
+            $pendingSession = $room->sessions()->where('status', 'PENDING')->first();
+            $activeChallengeQuery->where('session_id', $pendingSession?->id);
+        }
+        $activeChallenge = $activeChallengeQuery->first();
 
         if ($activeChallenge) {
             throw new BchatKeyPackageException(
@@ -425,11 +438,44 @@ class BchatKeyPackageService
             );
         }
 
-        // 9. Verifikasi ketersediaan perangkat aktif milik mitra
+        // 8b. Verifikasi perangkat aktif milik pemanggil (inisiator)
+        $callerDeviceQuery = BchatUserDevice::where('user_id', $user->id);
+        $requestDeviceUuid = request()->header('X-Bchat-Device-Uuid');
+        if ($requestDeviceUuid !== null && trim($requestDeviceUuid) !== '') {
+            $callerDeviceQuery->where('device_uuid', strtolower(trim($requestDeviceUuid)));
+        }
+        $callerDevice = $callerDeviceQuery->where('status', 'ACTIVE')->first();
+
+        if (!$callerDevice && BchatUserDevice::where('user_id', $user->id)->exists()) {
+            throw new BchatKeyPackageException(
+                'Perangkat pemanggil tidak aktif atau telah dicabut (REVOKED).',
+                'CALLER_DEVICE_NOT_ACTIVE',
+                403
+            );
+        }
+
+        if ($callerDevice && !$callerDevice->is_trusted) {
+            throw new BchatKeyPackageException(
+                'Perangkat pemanggil belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                'DEVICE_NOT_TRUSTED',
+                403
+            );
+        }
+
+        // 9. Verifikasi ketersediaan perangkat aktif dan tepercaya milik mitra
         $partnerId = (int) $partnerMember->user_id;
         $partnerDevice = BchatUserDevice::where('user_id', $partnerId)
             ->where('status', 'ACTIVE')
-            ->first();
+            ->where('is_trusted', true)
+            ->whereHas('keyPackages', fn ($q) => $q->where('is_consumed', false))
+            ->first()
+            ?? BchatUserDevice::where('user_id', $partnerId)
+                ->where('status', 'ACTIVE')
+                ->where('is_trusted', true)
+                ->first()
+            ?? BchatUserDevice::where('user_id', $partnerId)
+                ->where('status', 'ACTIVE')
+                ->first();
 
         if (!$partnerDevice) {
             throw new BchatKeyPackageException(

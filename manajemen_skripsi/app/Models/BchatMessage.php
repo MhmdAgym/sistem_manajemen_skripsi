@@ -26,6 +26,7 @@ class BchatMessage extends Model
      */
     protected $fillable = [
         'room_id',
+        'session_id',
         'server_sequence',
         'message_uuid',
         'sender_id',
@@ -44,6 +45,7 @@ class BchatMessage extends Model
     {
         return [
             'room_id'         => 'integer',
+            'session_id'      => 'integer',
             'server_sequence' => 'integer',
             'sender_id'       => 'integer',
             'epoch'           => 'integer',
@@ -61,6 +63,14 @@ class BchatMessage extends Model
     public function room(): BelongsTo
     {
         return $this->belongsTo(BchatRoom::class, 'room_id', 'id');
+    }
+
+    /**
+     * Relasi ke sesi kriptografi MLS (BchatRoomSession) yang menaungi pesan ini.
+     */
+    public function session(): BelongsTo
+    {
+        return $this->belongsTo(BchatRoomSession::class, 'session_id', 'id');
     }
 
     /**

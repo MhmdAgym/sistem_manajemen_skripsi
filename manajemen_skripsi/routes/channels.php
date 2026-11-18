@@ -1,6 +1,7 @@
 <?php
 
 use App\Models\BchatRoom;
+use App\Models\BchatUserDevice;
 use App\Models\User;
 use Illuminate\Support\Facades\Broadcast;
 use Illuminate\Support\Str;
@@ -43,6 +44,44 @@ Broadcast::channel('bchat.rooms.{roomUuid}', function (User $user, string $roomU
         return false;
     }
 
-    return $user->can('view', $room);
+    // Validasi otorisasi perangkat kriptografis (B-CHAT Tahap 2A.2 Hardening)
+    // Otorisasi WebSocket Reverb bchat.rooms.{roomUuid} wajib terikat pada tantangan bertanda tangan Ed25519:
+    // Header X-Bchat-Device-Uuid, X-Bchat-Challenge-Uuid, dan X-Bchat-Signature wajib valid.
+    $requestDeviceUuid = request()->header('X-Bchat-Device-Uuid') ?? request()->input('device_uuid');
+    $challengeUuid = request()->header('X-Bchat-Challenge-Uuid') ?? request()->input('challenge_uuid');
+    $signatureHex = request()->header('X-Bchat-Signature') ?? request()->input('signature');
+    $socketId = request()->input('socket_id');
+    $channelName = request()->input('channel_name') ?? "private-bchat.rooms.{$cleanRoomUuid}";
+
+    if (!$requestDeviceUuid || trim($requestDeviceUuid) === '') {
+        return false;
+    }
+
+    $cleanUuid = strtolower(trim($requestDeviceUuid));
+    if (!Str::isUuid($cleanUuid)) {
+        return false;
+    }
+
+    // Klaim UUID tanpa bukti tanda tangan tantangan kriptografis DITOLAK secara tegas (fail-closed)
+    if (!$challengeUuid || !$signatureHex || !$socketId) {
+        return false;
+    }
+
+    /** @var \App\Services\BchatWsAuthService $wsAuthService */
+    $wsAuthService = app(\App\Services\BchatWsAuthService::class);
+    $isVerified = $wsAuthService->verifyAndConsumeChallenge(
+        user: $user,
+        deviceUuid: $cleanUuid,
+        challengeUuid: (string) $challengeUuid,
+        signatureHex: (string) $signatureHex,
+        socketId: (string) $socketId,
+        channelName: (string) $channelName
+    );
+
+    if (!$isVerified) {
+        return false;
+    }
+
+    return (bool) $user->can('view', $room);
 }, ['guards' => ['sanctum']]);
 

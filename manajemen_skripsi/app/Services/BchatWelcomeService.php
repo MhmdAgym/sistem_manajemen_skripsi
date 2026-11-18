@@ -239,14 +239,25 @@ class BchatWelcomeService
         }
 
         // Pengecekan perangkat inisiator dan penerima
-        $initiatorDevice = BchatUserDevice::where('user_id', $initiatorId)
-            ->where('status', 'ACTIVE')
-            ->first();
+        $initiatorDeviceQuery = BchatUserDevice::where('user_id', $initiatorId);
+        $requestDeviceUuid = request()->header('X-Bchat-Device-Uuid');
+        if ($requestDeviceUuid !== null && trim($requestDeviceUuid) !== '') {
+            $initiatorDeviceQuery->where('device_uuid', strtolower(trim($requestDeviceUuid)));
+        }
+        $initiatorDevice = $initiatorDeviceQuery->where('status', 'ACTIVE')->first();
 
         if (!$initiatorDevice) {
             throw new BchatWelcomeException(
                 'Perangkat inisiator tidak aktif atau belum terdaftar.',
                 'INITIATOR_DEVICE_NOT_ACTIVE',
+                403
+            );
+        }
+
+        if (!$initiatorDevice->is_trusted) {
+            throw new BchatWelcomeException(
+                'Perangkat inisiator belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                'DEVICE_NOT_TRUSTED',
                 403
             );
         }
@@ -452,6 +463,26 @@ class BchatWelcomeService
                 $lockedInitMember->is_active = false;
                 $lockedInitMember->save();
 
+                // 2.1 Kaitkan atau buat Sesi Generasi 1 berstatus PENDING
+                $session = \App\Models\BchatRoomSession::where('room_id', $lockedRoom->id)
+                    ->whereIn('status', ['PENDING', 'ACTIVE'])
+                    ->latest('generation_number')
+                    ->first();
+
+                if (!$session) {
+                    $session = \App\Models\BchatRoomSession::create([
+                        'session_uuid'       => (string) Str::uuid(),
+                        'room_id'            => $lockedRoom->id,
+                        'generation_number'  => 1,
+                        'status'             => 'PENDING',
+                        'group_id_hash'      => $groupIdHash,
+                        'start_epoch'        => 1,
+                        'start_sequence'     => 1,
+                        'current_sequence'   => 0,
+                        'created_by_user_id' => $initiatorId,
+                    ]);
+                }
+
                 // 3. Buat operasi Welcome baru dan tantangan generasi 1
                 $welcomeOpUuid = (string) Str::uuid();
                 $challengeUuid = (string) Str::uuid();
@@ -460,6 +491,7 @@ class BchatWelcomeService
                 $welcomeChallenge = BchatWelcomeChallenge::create([
                     'welcome_operation_uuid' => $welcomeOpUuid,
                     'room_id'                => $lockedRoom->id,
+                    'session_id'             => $session->id,
                     'recipient_user_id'      => $recipientId,
                     'recipient_device_id'    => $lockedRecipDev->id,
                     'welcome_message'        => $binaryPayload,
@@ -639,15 +671,26 @@ class BchatWelcomeService
             );
         }
 
-        $requestingDevice = BchatUserDevice::where('user_id', $requestingUser->id)
-            ->where('status', 'ACTIVE')
-            ->first();
+        $requestingDeviceQuery = BchatUserDevice::where('user_id', $requestingUser->id);
+        $requestDeviceUuid = request()->header('X-Bchat-Device-Uuid');
+        if ($requestDeviceUuid !== null && trim($requestDeviceUuid) !== '') {
+            $requestingDeviceQuery->where('device_uuid', strtolower(trim($requestDeviceUuid)));
+        }
+        $requestingDevice = $requestingDeviceQuery->where('status', 'ACTIVE')->first();
 
         if (!$requestingDevice) {
             throw new BchatWelcomeException(
                 'Perangkat pemohon tidak aktif atau belum terdaftar.',
                 'RECIPIENT_DEVICE_NOT_ACTIVE',
                 422
+            );
+        }
+
+        if (!$requestingDevice->is_trusted) {
+            throw new BchatWelcomeException(
+                'Perangkat pemohon belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                'DEVICE_NOT_TRUSTED',
+                403
             );
         }
 

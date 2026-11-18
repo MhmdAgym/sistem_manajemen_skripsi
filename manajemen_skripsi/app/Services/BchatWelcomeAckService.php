@@ -243,6 +243,14 @@ class BchatWelcomeAckService
             );
         }
 
+        if (!$recipientDevice->is_trusted) {
+            throw new BchatWelcomeException(
+                'Perangkat penerima belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                'DEVICE_NOT_TRUSTED',
+                403
+            );
+        }
+
         // ---------------------------------------------------------------------
         // 3. EKSEKUSI TRANSAKSI ATOMIK DENGAN HIERARCHICAL LOCKING
         //    Hierarki: users -> penugasan_pembimbing -> bchat_rooms -> bchat_welcome_challenges -> bchat_user_devices -> bchat_room_members
@@ -373,6 +381,14 @@ class BchatWelcomeAckService
                     );
                 }
 
+                if (!$lockedDevice->is_trusted) {
+                    throw new BchatWelcomeException(
+                        'Perangkat penerima belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                        'DEVICE_NOT_TRUSTED',
+                        403
+                    );
+                }
+
                 if ((int) $lockedChallenge->recipient_device_id !== (int) $lockedDevice->id) {
                     throw new BchatWelcomeException(
                         'Perangkat penerima tidak cocok dengan tantangan aktif.',
@@ -486,6 +502,25 @@ class BchatWelcomeAckService
                 $lockedRoom->status = 'ACTIVE';
                 $lockedRoom->current_epoch = self::TARGET_EPOCH;
                 $lockedRoom->save();
+
+                // D.1 Aktivasi Sesi Kriptografi MLS Terkait
+                if ($lockedChallenge->session_id) {
+                    $session = \App\Models\BchatRoomSession::where('id', $lockedChallenge->session_id)->lockForUpdate()->first();
+                    if ($session && $session->status === 'PENDING') {
+                        $session->status = 'ACTIVE';
+                        $session->activated_at = $now;
+                        $session->start_epoch = self::TARGET_EPOCH;
+                        $session->save();
+                    }
+                } else {
+                    $session = \App\Models\BchatRoomSession::where('room_id', $lockedRoom->id)->where('status', 'PENDING')->lockForUpdate()->first();
+                    if ($session) {
+                        $session->status = 'ACTIVE';
+                        $session->activated_at = $now;
+                        $session->start_epoch = self::TARGET_EPOCH;
+                        $session->save();
+                    }
+                }
 
                 // E. Siarkan Sinyal WebSocket Reverb (After-Commit)
                 event(new BchatRoomActivated(

@@ -27,6 +27,7 @@ class BchatWelcomeChallenge extends Model
     protected $fillable = [
         'welcome_operation_uuid',
         'room_id',
+        'session_id',
         'recipient_user_id',
         'recipient_device_id',
         'welcome_message',
@@ -52,6 +53,7 @@ class BchatWelcomeChallenge extends Model
     {
         return [
             'room_id'              => 'integer',
+            'session_id'           => 'integer',
             'recipient_user_id'    => 'integer',
             'recipient_device_id'  => 'integer',
             'epoch'                => 'integer',
@@ -69,6 +71,14 @@ class BchatWelcomeChallenge extends Model
     public function room(): BelongsTo
     {
         return $this->belongsTo(BchatRoom::class, 'room_id', 'id');
+    }
+
+    /**
+     * Relasi ke sesi kriptografi MLS (BchatRoomSession) yang menaungi operasi Welcome ini.
+     */
+    public function session(): BelongsTo
+    {
+        return $this->belongsTo(BchatRoomSession::class, 'session_id', 'id');
     }
 
     /**

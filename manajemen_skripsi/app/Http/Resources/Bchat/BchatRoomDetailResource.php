@@ -91,6 +91,13 @@ class BchatRoomDetailResource extends JsonResource
                 'can_read_messages' => (bool) $this->user->can('readMessages', $room),
                 'can_handshake'     => (bool) $this->user->can('handshake', $room),
             ],
+            'active_session' => $room->activeSession ? [
+                'session_uuid'      => (string) $room->activeSession->session_uuid,
+                'generation_number' => (int) $room->activeSession->generation_number,
+                'status'            => (string) $room->activeSession->status,
+                'start_sequence'    => (int) $room->activeSession->start_sequence,
+                'current_sequence'  => (int) $room->activeSession->current_sequence,
+            ] : null,
             'created_at'    => $room->created_at?->toIso8601String(),
             'updated_at'    => $room->updated_at?->toIso8601String(),
         ];

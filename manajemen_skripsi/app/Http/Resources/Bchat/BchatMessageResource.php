@@ -34,6 +34,8 @@ class BchatMessageResource extends JsonResource
             'content_type'        => (int) $this->content_type,
             'ciphertext_payload'  => $ciphertextBase64,
             'payload_hash_sha256' => (string) $this->payload_hash_sha256,
+            'session_uuid'        => $this->session?->session_uuid,
+            'session_generation'  => $this->session?->generation_number,
             'client_sent_at'      => $this->client_sent_at?->toIso8601String(),
             'created_at'          => $this->created_at?->toIso8601String(),
         ];

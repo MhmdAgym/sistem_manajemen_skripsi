@@ -8,6 +8,7 @@ use App\Exceptions\BchatMessageException;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\Bchat\BchatSendMessageRequest;
 use App\Http\Resources\Bchat\BchatMessageResource;
+use App\Models\BchatUserDevice;
 use App\Services\BchatMessageService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -41,6 +42,11 @@ class BchatMessageController extends Controller
                 'message'    => 'Pengguna belum terautentikasi.',
                 'error_code' => 'UNAUTHENTICATED',
             ], 401);
+        }
+
+        $deviceError = $this->validateActiveDevice($request, $user);
+        if ($deviceError instanceof JsonResponse) {
+            return $deviceError;
         }
 
         try {
@@ -91,15 +97,24 @@ class BchatMessageController extends Controller
             ], 401);
         }
 
+        $deviceError = $this->validateActiveDevice($request, $user);
+        if ($deviceError instanceof JsonResponse) {
+            return $deviceError;
+        }
+
         $afterSequence = $request->has('after_sequence') ? (int) $request->query('after_sequence') : null;
         $limit = $request->has('limit') ? (int) $request->query('limit') : 50;
+        $sessionUuid = $request->has('session_uuid') ? (string) $request->query('session_uuid') : null;
+        $generationNumber = $request->has('generation_number') ? (int) $request->query('generation_number') : null;
 
         try {
             $messages = $this->messageService->getMessages(
                 user: $user,
                 roomUuid: $roomUuid,
                 afterSequence: $afterSequence,
-                limit: $limit
+                limit: $limit,
+                sessionUuid: $sessionUuid,
+                generationNumber: $generationNumber
             );
 
             return response()->json([
@@ -120,6 +135,69 @@ class BchatMessageController extends Controller
                 'error_code' => 'INTERNAL_SERVER_ERROR',
             ], 500);
         }
+    }
+
+    /**
+     * Memvalidasi bahwa pengguna memiliki perangkat aktif dan tepercaya,
+     * serta perangkat pemanggil tidak berstatus REVOKED atau UNTRUSTED.
+     */
+    protected function validateActiveDevice(Request $request, $user): ?JsonResponse
+    {
+        $requestDeviceUuid = $request->header('X-Bchat-Device-Uuid');
+        if ($requestDeviceUuid !== null && trim($requestDeviceUuid) !== '') {
+            $cleanUuid = strtolower(trim($requestDeviceUuid));
+            $device = BchatUserDevice::where('user_id', $user->id)
+                ->where('device_uuid', $cleanUuid)
+                ->first();
+
+            if (!$device || $device->status !== 'ACTIVE') {
+                return response()->json([
+                    'status'     => 'error',
+                    'message'    => 'Perangkat klien tidak valid atau telah dicabut (REVOKED). Operasi pesan ditolak.',
+                    'error_code' => 'DEVICE_NOT_ACTIVE',
+                ], 403);
+            }
+
+            if (!$device->is_trusted) {
+                return response()->json([
+                    'status'     => 'error',
+                    'message'    => 'Perangkat belum berstatus tepercaya. Lakukan pairing terlebih dahulu.',
+                    'error_code' => 'DEVICE_NOT_TRUSTED',
+                ], 403);
+            }
+
+            return null;
+        }
+
+        // Jika tidak ada header spesifik namun pengguna memiliki riwayat perangkat terdaftar
+        if (BchatUserDevice::where('user_id', $user->id)->exists()) {
+            $hasActive = BchatUserDevice::where('user_id', $user->id)
+                ->where('status', 'ACTIVE')
+                ->exists();
+
+            if (!$hasActive) {
+                return response()->json([
+                    'status'     => 'error',
+                    'message'    => 'Pengguna tidak memiliki perangkat berstatus aktif. Operasi pesan ditolak.',
+                    'error_code' => 'DEVICE_NOT_ACTIVE',
+                ], 403);
+            }
+
+            $hasTrusted = BchatUserDevice::where('user_id', $user->id)
+                ->where('status', 'ACTIVE')
+                ->where('is_trusted', true)
+                ->exists();
+
+            if (!$hasTrusted) {
+                return response()->json([
+                    'status'     => 'error',
+                    'message'    => 'Pengguna tidak memiliki perangkat tepercaya yang aktif. Lakukan pairing terlebih dahulu.',
+                    'error_code' => 'DEVICE_NOT_TRUSTED',
+                ], 403);
+            }
+        }
+
+        return null;
     }
 }
 

@@ -6,8 +6,10 @@ namespace App\Services;
 
 use App\Events\BchatMessageSent;
 use App\Exceptions\BchatMessageException;
+use App\Models\BchatAttachment;
 use App\Models\BchatMessage;
 use App\Models\BchatRoom;
+use App\Models\BchatRoomSession;
 use App\Models\User;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
@@ -92,6 +94,33 @@ class BchatMessageService
             );
         }
 
+        // Ekstraksi referensi lampiran (jika ada atau tipe manifest)
+        $attachmentUuids = [];
+        if (!empty($payload['attachment_uuids']) && is_array($payload['attachment_uuids'])) {
+            $attachmentUuids = array_values(array_filter($payload['attachment_uuids'], fn ($u) => is_string($u) && trim($u) !== ''));
+        } elseif (!empty($payload['attachment_uuid']) && is_string($payload['attachment_uuid']) && trim($payload['attachment_uuid']) !== '') {
+            $attachmentUuids = [trim($payload['attachment_uuid'])];
+        }
+        $attachmentUuids = array_map(fn ($u) => strtolower(trim((string) $u)), $attachmentUuids);
+
+        // Jika tipe ATTACHMENT_MANIFEST (2), wajib ada referensi lampiran
+        if ($contentType === 2 && empty($attachmentUuids)) {
+            throw new BchatMessageException(
+                'Pesan manifest lampiran wajib menyertakan referensi minimal satu lampiran.',
+                'MISSING_ATTACHMENT_REFERENCE',
+                422
+            );
+        }
+
+        // Validasi tidak ada referensi lampiran duplikat
+        if (!empty($attachmentUuids) && count($attachmentUuids) !== count(array_unique($attachmentUuids))) {
+            throw new BchatMessageException(
+                'Daftar lampiran mengandung UUID duplikat.',
+                'DUPLICATE_ATTACHMENT_REFERENCE',
+                422
+            );
+        }
+
         try {
             $result = DB::transaction(function () use (
                 $sender,
@@ -102,7 +131,8 @@ class BchatMessageService
                 $generation,
                 $contentType,
                 $rawCiphertext,
-                $clientSentAt
+                $clientSentAt,
+                $attachmentUuids
             ) {
                 // A. Kunci baris room secara eksklusif untuk serialisasi alokasi sequence
                 $lockedRoom = BchatRoom::where('id', $room->id)->lockForUpdate()->first();
@@ -112,6 +142,36 @@ class BchatMessageService
                         'ROOM_NOT_ACTIVE',
                         409
                     );
+                }
+
+                // A.1 Validasi Sesi Kriptografi MLS yang Aktif
+                $activeSession = BchatRoomSession::where('room_id', $lockedRoom->id)
+                    ->where('status', 'ACTIVE')
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$activeSession) {
+                    $hasAnySession = BchatRoomSession::where('room_id', $lockedRoom->id)->exists();
+                    if ($hasAnySession) {
+                        throw new BchatMessageException(
+                            'Ruang obrolan tidak memiliki sesi kriptografi yang aktif.',
+                            'NO_ACTIVE_CRYPTO_SESSION',
+                            409
+                        );
+                    }
+
+                    // Auto-create Generasi 1 aktif jika room legacy/fixture belum memiliki rekaman session
+                    $activeSession = BchatRoomSession::create([
+                        'session_uuid'       => (string) Str::uuid(),
+                        'room_id'            => $lockedRoom->id,
+                        'generation_number'  => 1,
+                        'status'             => 'ACTIVE',
+                        'group_id_hash'      => $lockedRoom->group_id_hash,
+                        'start_epoch'        => 1,
+                        'start_sequence'     => 1,
+                        'current_sequence'   => (int) $lockedRoom->current_sequence,
+                        'activated_at'       => now(),
+                    ]);
                 }
 
                 // B. Pengecekan Idempotensi (uk_msg_idempotency: room_id, sender_id, message_uuid)
@@ -162,9 +222,66 @@ class BchatMessageService
 
                 $nextSequence = ($maxSeq !== null) ? (int) $maxSeq + 1 : 1;
 
+                // D.1 Validasi Ketat Lampiran yang Direferensikan (jika ada)
+                $attachmentsToBind = [];
+                if (!empty($attachmentUuids)) {
+                    foreach ($attachmentUuids as $attUuid) {
+                        $attachment = BchatAttachment::where('attachment_uuid', $attUuid)
+                            ->lockForUpdate()
+                            ->first();
+
+                        if (!$attachment) {
+                            throw new BchatMessageException(
+                                "Lampiran [{$attUuid}] tidak ditemukan pada sistem.",
+                                'ATTACHMENT_NOT_FOUND',
+                                404
+                            );
+                        }
+
+                        // Validasi lampiran milik room yang sama
+                        if ((int) $attachment->room_id !== (int) $lockedRoom->id) {
+                            throw new BchatMessageException(
+                                "Lampiran [{$attUuid}] bukan milik ruang obrolan ini.",
+                                'ATTACHMENT_ROOM_MISMATCH',
+                                403
+                            );
+                        }
+
+                        // Validasi attachment.session_id sama persis dengan sesi aktif pesan saat ini
+                        if ((int) $attachment->session_id !== (int) $activeSession->id) {
+                            throw new BchatMessageException(
+                                "Lampiran [{$attUuid}] tidak berasal dari sesi kriptografi yang sama dengan pesan (mismatch generasi).",
+                                'ATTACHMENT_SESSION_MISMATCH',
+                                409
+                            );
+                        }
+
+                        // Validasi lampiran belum terikat ke pesan lain
+                        if ($attachment->message_id !== null) {
+                            throw new BchatMessageException(
+                                "Lampiran [{$attUuid}] sudah terikat ke pesan lain.",
+                                'ATTACHMENT_ALREADY_ATTACHED',
+                                409
+                            );
+                        }
+
+                        // Validasi status lampiran sah untuk dilampirkan
+                        if (!in_array($attachment->status, ['PENDING_MESSAGE', 'ATTACHED'], true)) {
+                            throw new BchatMessageException(
+                                "Status lampiran [{$attUuid}] tidak valid untuk dilampirkan (status: {$attachment->status}).",
+                                'INVALID_ATTACHMENT_STATUS',
+                                422
+                            );
+                        }
+
+                        $attachmentsToBind[] = $attachment;
+                    }
+                }
+
                 // E. Simpan Ciphertext secara Atomik
                 $message = BchatMessage::create([
                     'room_id'              => $lockedRoom->id,
+                    'session_id'           => $activeSession->id,
                     'server_sequence'      => $nextSequence,
                     'message_uuid'         => $cleanMsgUuid,
                     'sender_id'            => $sender->id,
@@ -176,9 +293,19 @@ class BchatMessageService
                     'client_sent_at'       => $clientSentAt,
                 ]);
 
-                // Update sequence pada room
+                // E.1 Ikat message_id ke seluruh lampiran tervalidasi secara konsisten & atomik
+                foreach ($attachmentsToBind as $att) {
+                    $att->message_id = $message->id;
+                    $att->status = 'ATTACHED';
+                    $att->save();
+                }
+
+                // Update sequence pada room dan active session
                 $lockedRoom->current_sequence = $nextSequence;
                 $lockedRoom->save();
+
+                $activeSession->current_sequence = $nextSequence;
+                $activeSession->save();
 
                 return [
                     'message'     => $message,
@@ -239,7 +366,9 @@ class BchatMessageService
         User $user,
         string $roomUuid,
         ?int $afterSequence = null,
-        int $limit = 50
+        int $limit = 50,
+        ?string $sessionUuid = null,
+        ?int $generationNumber = null
     ): Collection {
         $cleanRoomUuid = strtolower(trim($roomUuid));
         if (!Str::isUuid($cleanRoomUuid)) {
@@ -275,6 +404,17 @@ class BchatMessageService
 
         if ($afterSequence !== null && $afterSequence >= 0) {
             $query->where('server_sequence', '>', $afterSequence);
+        }
+
+        if ($sessionUuid !== null && trim($sessionUuid) !== '') {
+            $cleanSessionUuid = strtolower(trim($sessionUuid));
+            $query->whereHas('session', function ($q) use ($cleanSessionUuid) {
+                $q->where('session_uuid', $cleanSessionUuid);
+            });
+        } elseif ($generationNumber !== null && $generationNumber > 0) {
+            $query->whereHas('session', function ($q) use ($generationNumber) {
+                $q->where('generation_number', $generationNumber);
+            });
         }
 
         return $query->get();

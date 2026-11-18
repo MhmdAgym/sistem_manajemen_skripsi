@@ -34,6 +34,9 @@ class BchatUserDevice extends Model
         'public_key',
         'public_key_fingerprint',
         'status',
+        'is_trusted',
+        'trusted_at',
+        'trusted_by_device_id',
         'revoked_at',
         'revocation_reason',
         'last_active_at',
@@ -45,12 +48,15 @@ class BchatUserDevice extends Model
     protected function casts(): array
     {
         return [
-            'user_id'        => 'integer',
-            'key_version'    => 'integer',
-            'revoked_at'     => 'datetime',
-            'last_active_at' => 'datetime',
-            'created_at'     => 'datetime',
-            'updated_at'     => 'datetime',
+            'user_id'              => 'integer',
+            'key_version'          => 'integer',
+            'is_trusted'           => 'boolean',
+            'trusted_by_device_id' => 'integer',
+            'trusted_at'           => 'datetime',
+            'revoked_at'           => 'datetime',
+            'last_active_at'       => 'datetime',
+            'created_at'           => 'datetime',
+            'updated_at'           => 'datetime',
         ];
     }
 
@@ -79,11 +85,43 @@ class BchatUserDevice extends Model
     }
 
     /**
+     * Relasi ke perangkat tepercaya yang menyetujui perangkat ini (jika ada).
+     */
+    public function trustedByDevice(): BelongsTo
+    {
+        return $this->belongsTo(self::class, 'trusted_by_device_id', 'id');
+    }
+
+    /**
+     * Relasi ke sesi pairing di mana perangkat ini bertindak sebagai peminta (target).
+     */
+    public function targetPairings(): HasMany
+    {
+        return $this->hasMany(BchatDevicePairing::class, 'target_device_id', 'id');
+    }
+
+    /**
+     * Relasi ke sesi pairing yang disetujui oleh perangkat ini (approver).
+     */
+    public function approvedPairings(): HasMany
+    {
+        return $this->hasMany(BchatDevicePairing::class, 'approver_device_id', 'id');
+    }
+
+    /**
      * Scope untuk menyaring perangkat berstatus ACTIVE.
      */
     public function scopeActive(Builder $query): Builder
     {
         return $query->where('status', 'ACTIVE');
+    }
+
+    /**
+     * Scope untuk menyaring perangkat yang tepercaya (is_trusted = true).
+     */
+    public function scopeTrusted(Builder $query): Builder
+    {
+        return $query->where('is_trusted', true);
     }
 
     /**
@@ -108,6 +146,14 @@ class BchatUserDevice extends Model
     public function isActive(): bool
     {
         return $this->status === 'ACTIVE';
+    }
+
+    /**
+     * Cek apakah perangkat telah berstatus tepercaya (trusted).
+     */
+    public function isTrusted(): bool
+    {
+        return (bool) $this->is_trusted;
     }
 }
 

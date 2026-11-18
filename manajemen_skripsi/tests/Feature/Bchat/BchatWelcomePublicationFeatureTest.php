@@ -75,6 +75,8 @@ class BchatWelcomePublicationFeatureTest extends TestCase
             'public_key'             => bin2hex($publicKey),
             'public_key_fingerprint' => hash('sha256', $publicKey),
             'status'                 => $status,
+            'is_trusted'             => ($status === 'ACTIVE'),
+            'trusted_at'             => ($status === 'ACTIVE') ? now() : null,
             'last_active_at'         => now(),
         ]);
     }

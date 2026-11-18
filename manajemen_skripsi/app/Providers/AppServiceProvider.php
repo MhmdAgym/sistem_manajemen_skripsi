@@ -250,5 +250,6 @@ class AppServiceProvider extends ServiceProvider
         // Registrasi eksplisit Policy Modul Akademik B-CHAT
         Gate::policy(SkSkripsiDokumen::class, SkSkripsiDokumenPolicy::class);
         Gate::policy(PenugasanPembimbing::class, PenugasanPembimbingPolicy::class);
+        Gate::policy(\App\Models\BchatRoom::class, \App\Policies\BchatRoomPolicy::class);
     }
 }

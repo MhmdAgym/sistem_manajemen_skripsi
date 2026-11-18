@@ -7,6 +7,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class BchatRoom extends Model
 {
@@ -111,6 +112,30 @@ class BchatRoom extends Model
     }
 
     /**
+     * Relasi ke seluruh sesi kriptografi MLS (BchatRoomSession) dalam room ini.
+     */
+    public function sessions(): HasMany
+    {
+        return $this->hasMany(BchatRoomSession::class, 'room_id', 'id')->orderBy('generation_number', 'asc');
+    }
+
+    /**
+     * Relasi ke sesi aktif saat ini (tepat maksimal 1 sesi ACTIVE).
+     */
+    public function activeSession(): HasOne
+    {
+        return $this->hasOne(BchatRoomSession::class, 'room_id', 'id')->where('status', 'ACTIVE');
+    }
+
+    /**
+     * Relasi ke sesi terbaru berdasarkan generation_number.
+     */
+    public function latestSession(): HasOne
+    {
+        return $this->hasOne(BchatRoomSession::class, 'room_id', 'id')->latestOfMany('generation_number');
+    }
+
+    /**
      * Helper status room.
      */
     public function isActive(): bool
@@ -126,6 +151,11 @@ class BchatRoom extends Model
     public function isPendingWelcomeAck(): bool
     {
         return $this->status === 'PENDING_WELCOME_ACK';
+    }
+
+    public function hasActiveCryptoSession(): bool
+    {
+        return $this->activeSession()->exists();
     }
 }
 

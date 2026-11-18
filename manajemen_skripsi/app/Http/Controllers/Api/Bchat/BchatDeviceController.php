@@ -10,6 +10,7 @@ use App\Http\Requests\Bchat\BchatRegistrationNonceRequest;
 use App\Http\Requests\Bchat\BchatStepUpRequest;
 use App\Services\BchatDeviceService;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 
 class BchatDeviceController extends Controller
 {
@@ -181,6 +182,9 @@ class BchatDeviceController extends Controller
             $expectedActiveDeviceUuid = $request->filled('expected_active_device_uuid')
                 ? $request->string('expected_active_device_uuid')->value()
                 : null;
+            $registrationMode         = $request->filled('registration_mode')
+                ? $request->string('registration_mode')->value()
+                : 'MANAGED_REPLACEMENT';
 
             $result = $this->deviceService->registerDevice(
                 user: $user,
@@ -189,7 +193,8 @@ class BchatDeviceController extends Controller
                 signatureInput: $request->string('pop_signature')->value(),
                 deviceName: $deviceName,
                 confirmReplacement: $confirmReplacement,
-                expectedActiveDeviceUuid: $expectedActiveDeviceUuid
+                expectedActiveDeviceUuid: $expectedActiveDeviceUuid,
+                registrationMode: $registrationMode
             );
 
             return response()->json([
@@ -200,11 +205,68 @@ class BchatDeviceController extends Controller
                     'device_name'    => (string) $result['device_name'],
                     'key_version'    => (int) $result['key_version'],
                     'status'         => (string) $result['status'],
+                    'is_trusted'     => (bool) ($result['is_trusted'] ?? false),
+                    'trusted_at'     => $result['trusted_at'] ?? null,
                     'public_key'     => (string) $result['public_key'],
                     'registered_at'  => (string) $result['registered_at'],
                     'is_replacement' => (bool) $result['is_replacement'],
                 ],
             ], 201);
+        } catch (BchatDeviceException $e) {
+            return response()->json([
+                'status'     => 'error',
+                'message'    => $e->getMessage(),
+                'error_code' => $e->getErrorCode(),
+            ], $e->getHttpStatus());
+        } catch (\Throwable $e) {
+            return response()->json([
+                'status'     => 'error',
+                'message'    => 'Terjadi kesalahan sistem internal.',
+                'error_code' => 'INTERNAL_SERVER_ERROR',
+            ], 500);
+        }
+    }
+
+    /**
+     * [POST /api/bchat/devices/{deviceUuid}/revoke]
+     * Mencabut status aktif satu perangkat spesifik milik pengguna tanpa mencabut perangkat lainnya.
+     */
+    public function revoke(Request $request, string $deviceUuid): JsonResponse
+    {
+        $user = $request->user();
+
+        if (!$user) {
+            return response()->json([
+                'status'     => 'error',
+                'message'    => 'Pengguna belum terautentikasi.',
+                'error_code' => 'UNAUTHENTICATED',
+            ], 401);
+        }
+
+        try {
+            $reason = $request->filled('reason')
+                ? $request->string('reason')->value()
+                : 'USER_REVOCATION';
+            $password = $request->filled('password')
+                ? $request->string('password')->value()
+                : null;
+            $stepUpToken = $request->filled('step_up_token')
+                ? $request->string('step_up_token')->value()
+                : null;
+
+            $result = $this->deviceService->revokeDevice(
+                user: $user,
+                deviceUuid: $deviceUuid,
+                reason: $reason,
+                password: $password,
+                stepUpToken: $stepUpToken
+            );
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'Perangkat berhasil dicabut.',
+                'data'    => $result,
+            ], 200);
         } catch (BchatDeviceException $e) {
             return response()->json([
                 'status'     => 'error',

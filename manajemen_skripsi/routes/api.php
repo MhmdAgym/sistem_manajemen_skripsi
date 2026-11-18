@@ -27,12 +27,17 @@ use App\Http\Controllers\Mahasiswa\SkSkripsiDokumenMahasiswaController;
 use App\Http\Controllers\Admin\SkSkripsiDokumenAdminController;
 use App\Http\Controllers\Admin\PenugasanPembimbingAdminController;
 use App\Http\Controllers\Api\Bchat\BchatDeviceController;
+use App\Http\Controllers\Api\Bchat\BchatPairingController;
+use App\Http\Controllers\Api\Bchat\BchatTrustBootstrapController;
+use App\Http\Controllers\Api\Bchat\BchatWsAuthController;
 use App\Http\Controllers\Api\Bchat\BchatKeyPackageController;
 use App\Http\Controllers\Api\Bchat\BchatRoomController;
 use App\Http\Controllers\Api\Bchat\BchatWelcomeAckController;
 use App\Http\Controllers\Api\Bchat\BchatWelcomeController;
 use App\Http\Controllers\Api\Bchat\BchatMessageController;
+use App\Http\Controllers\Api\Bchat\BchatRoomSessionController;
 use App\Http\Controllers\Api\Bchat\BchatAttachmentController;
+use App\Http\Controllers\Api\Bchat\BchatHistoryTransferController;
 
 // ---------------------------------------------------------------------------
 // SANCTUM USER DETECTION & NOTIFIKASI AKADEMIK TERPUSAT
@@ -56,6 +61,30 @@ Route::middleware(['auth:sanctum'])->prefix('bchat/devices')->group(function () 
     Route::post('/registration-nonce', [BchatDeviceController::class, 'issueRegistrationNonce'])->middleware('throttle:10,1');
     Route::post('/register', [BchatDeviceController::class, 'register'])->middleware('throttle:10,1');
     Route::get('/status', [BchatDeviceController::class, 'status'])->middleware('throttle:30,1');
+    Route::post('/{deviceUuid}/revoke', [BchatDeviceController::class, 'revoke'])->middleware('throttle:10,1');
+    Route::get('/{deviceUuid}/trust-bootstrap/eligibility', [BchatTrustBootstrapController::class, 'checkEligibility'])->middleware('throttle:30,1');
+    Route::post('/{deviceUuid}/trust-bootstrap/challenge', [BchatTrustBootstrapController::class, 'issueChallenge'])->middleware('throttle:10,1');
+    Route::post('/{deviceUuid}/trust-bootstrap/verify', [BchatTrustBootstrapController::class, 'verify'])->middleware('throttle:10,1');
+});
+
+// ---------------------------------------------------------------------------
+// B-CHAT E2EE: TRUSTED DEVICE PAIRING PLANE (Tahap 2A)
+// ---------------------------------------------------------------------------
+Route::middleware(['auth:sanctum'])->prefix('bchat/pairing')->group(function () {
+    Route::post('/request', [BchatPairingController::class, 'request'])->middleware('throttle:10,1');
+    Route::get('/{pairingUuid}', [BchatPairingController::class, 'status'])->middleware('throttle:60,1');
+    Route::get('/{pairingUuid}/status', [BchatPairingController::class, 'status'])->middleware('throttle:60,1');
+    Route::post('/lookup', [BchatPairingController::class, 'lookup'])->middleware('throttle:20,1');
+    Route::post('/{pairingUuid}/approve', [BchatPairingController::class, 'approve'])->middleware('throttle:10,1');
+    Route::post('/{pairingUuid}/reject', [BchatPairingController::class, 'reject'])->middleware('throttle:10,1');
+    Route::post('/{pairingUuid}/cancel', [BchatPairingController::class, 'cancel'])->middleware('throttle:10,1');
+});
+
+// ---------------------------------------------------------------------------
+// B-CHAT E2EE: WEBSOCKET REVERB CRYPTOGRAPHIC AUTH CHALLENGE (Tahap 2A.2)
+// ---------------------------------------------------------------------------
+Route::middleware(['auth:sanctum'])->prefix('bchat/broadcasting')->group(function () {
+    Route::post('/challenge', [BchatWsAuthController::class, 'issueChallenge'])->middleware('throttle:30,1');
 });
 
 // ---------------------------------------------------------------------------
@@ -86,6 +115,22 @@ Route::middleware(['auth:sanctum'])->prefix('bchat/rooms')->group(function () {
     Route::get('/{roomUuid}/messages', [BchatMessageController::class, 'index'])
         ->middleware('throttle:60,1');
 
+    // B-CHAT E2EE Multi-Generation Session Plane
+    Route::post('/{roomUuid}/sessions/next', [BchatRoomSessionController::class, 'createNext'])
+        ->middleware('throttle:10,1');
+    Route::get('/{roomUuid}/sessions', [BchatRoomSessionController::class, 'index'])
+        ->middleware('throttle:60,1');
+    Route::get('/{roomUuid}/sessions/active', [BchatRoomSessionController::class, 'active'])
+        ->middleware('throttle:60,1');
+    Route::get('/{roomUuid}/sessions/pending', [BchatRoomSessionController::class, 'pending'])
+        ->middleware('throttle:60,1');
+    Route::post('/{roomUuid}/sessions/{sessionUuid}/welcome', [BchatRoomSessionController::class, 'publishWelcome'])
+        ->middleware('throttle:10,1');
+    Route::get('/{roomUuid}/sessions/{sessionUuid}/welcome-challenge', [BchatRoomSessionController::class, 'welcomeChallenge'])
+        ->middleware('throttle:30,1');
+    Route::post('/{roomUuid}/sessions/{sessionUuid}/ack', [BchatRoomSessionController::class, 'ack'])
+        ->middleware('throttle:10,1');
+
     // B-CHAT E2EE Attachment Transport Plane (Tahap 2)
     Route::post('/{roomUuid}/attachments/upload-session', [BchatAttachmentController::class, 'createUploadSession'])
         ->middleware('throttle:30,1');
@@ -95,6 +140,26 @@ Route::middleware(['auth:sanctum'])->prefix('bchat/rooms')->group(function () {
         ->middleware('throttle:30,1');
     Route::get('/{roomUuid}/attachments/{attachmentUuid}/chunks/{chunkIndex}', [BchatAttachmentController::class, 'downloadChunk'])
         ->middleware('throttle:120,1');
+
+    // B-CHAT E2EE History Transfer (Tahap 2B) — Inisiasi oleh Penerima
+    Route::post('/{roomUuid}/history-transfers', [BchatHistoryTransferController::class, 'store'])
+        ->middleware('throttle:20,1');
+});
+
+// B-CHAT E2EE History Transfer Plane (Tahap 2B) — Manajemen & Pengunduhan
+Route::middleware(['auth:sanctum'])->prefix('bchat/history-transfers')->group(function () {
+    Route::get('/pending', [BchatHistoryTransferController::class, 'pendingForSource'])
+        ->middleware('throttle:60,1');
+    Route::get('/{transferUuid}', [BchatHistoryTransferController::class, 'show'])
+        ->middleware('throttle:60,1');
+    Route::post('/{transferUuid}/upload', [BchatHistoryTransferController::class, 'uploadSnapshot'])
+        ->middleware('throttle:20,1');
+    Route::get('/{transferUuid}/download', [BchatHistoryTransferController::class, 'downloadSnapshot'])
+        ->middleware('throttle:60,1');
+    Route::post('/{transferUuid}/complete', [BchatHistoryTransferController::class, 'complete'])
+        ->middleware('throttle:20,1');
+    Route::post('/{transferUuid}/cancel', [BchatHistoryTransferController::class, 'cancel'])
+        ->middleware('throttle:20,1');
 });
 
 // ---------------------------------------------------------------------------
