@@ -111,6 +111,7 @@ export interface SendApplicationMessageParams {
   fencing: FencingRpcInput;
   clientMessageUuid?: string;
   contentType?: 1 | 2 | 3;
+  attachmentUuids?: string[];
 }
 
 export interface SendApplicationMessageResult {
@@ -426,6 +427,41 @@ export async function sendApplicationMessageFlow(
     throw new BchatMessageValidationError('Kredensial fencing wajib disertakan secara lengkap.');
   }
 
+  // Validasi referensi lampiran SEBELUM ENCRYPT_MESSAGE agar ratchet MLS tidak pernah maju
+  // ketika pesan manifest lampiran (contentType === 2) tidak memiliki referensi UUID v4 yang sah.
+  const contentType = params.contentType ?? 1;
+  const UUID_V4_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  let normalizedAttachmentUuids: string[] = [];
+
+  if (params.attachmentUuids !== undefined) {
+    if (!Array.isArray(params.attachmentUuids)) {
+      throw new BchatMessageValidationError(
+        'Daftar attachmentUuids harus berupa array UUID lampiran yang valid.'
+      );
+    }
+    normalizedAttachmentUuids = params.attachmentUuids.map((u) =>
+      typeof u === 'string' ? u.trim().toLowerCase() : ''
+    );
+    for (const attUuid of normalizedAttachmentUuids) {
+      if (!UUID_V4_REGEX.test(attUuid)) {
+        throw new BchatMessageValidationError(
+          `Format UUID lampiran tidak valid (${attUuid || 'kosong'}). Wajib UUID v4 kanonis.`
+        );
+      }
+    }
+    if (new Set(normalizedAttachmentUuids).size !== normalizedAttachmentUuids.length) {
+      throw new BchatMessageValidationError(
+        'Daftar referensi lampiran mengandung UUID duplikat.'
+      );
+    }
+  }
+
+  if (contentType === 2 && normalizedAttachmentUuids.length === 0) {
+    throw new BchatMessageValidationError(
+      'Pesan manifest lampiran wajib menyertakan referensi minimal satu UUID lampiran sebelum enkripsi.'
+    );
+  }
+
   const clientMessageUuid =
     params.clientMessageUuid ||
     (typeof crypto !== 'undefined' && crypto.randomUUID
@@ -465,7 +501,6 @@ export async function sendApplicationMessageFlow(
   const payloadHashSha256 = await computePayloadSha256(wireBytes);
 
   // 3. Susun request payload pengiriman
-  const contentType = params.contentType ?? 1;
   const clientSentAt = new Date().toISOString();
 
   const sendPayload: BchatSendMessageRequest = {
@@ -476,6 +511,9 @@ export async function sendApplicationMessageFlow(
     ciphertext_payload: payloadBase64,
     payload_hash_sha256: payloadHashSha256,
     client_sent_at: clientSentAt,
+    ...(normalizedAttachmentUuids.length > 0
+      ? { attachment_uuids: normalizedAttachmentUuids }
+      : {}),
   };
 
   // 4. Kirim ciphertext ke Backend REST API
@@ -526,11 +564,22 @@ export async function sendApplicationMessageFlow(
       isReplayed,
     };
   } catch (apiErr: any) {
-    // 6. Gagal: Jika ambigu/network error, tandai outbox sebagai 'in_transit' untuk safe retry
+    // 6. Gagal: bedakan penolakan deterministik 4xx (selain 408/409/429) sebagai 'failed'
+    // vs kegagalan transient/jaringan sebagai 'in_transit' agar ciphertext yang ditolak
+    // tidak pernah dikirim ulang secara otomatis tanpa pengawasan.
+    const isDeterministicClientRejection =
+      apiErr instanceof BchatApiError &&
+      apiErr.status >= 400 &&
+      apiErr.status < 500 &&
+      apiErr.status !== 408 &&
+      apiErr.status !== 409 &&
+      apiErr.status !== 429;
+    const failedOutboxStatus = isDeterministicClientRejection ? 'failed' : 'in_transit';
+
     try {
       await workerRpc.sendRequest('UPDATE_OUTBOX_STATUS', {
         clientMessageUuid,
-        status: 'in_transit',
+        status: failedOutboxStatus,
         errorMessage: apiErr?.message || 'Network dispatch failed',
         deviceUuid,
         fencing,

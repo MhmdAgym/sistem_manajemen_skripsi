@@ -395,6 +395,7 @@ export interface BchatSendMessageRequest {
     ciphertext_payload: string // Canonical Base64 encoded binary MLS ciphertext
     payload_hash_sha256: string // 64-character lowercase hex SHA-256 of raw ciphertext
     client_sent_at: string // ISO-8601 date string
+    attachment_uuids?: string[] // Wajib minimal 1 UUID v4 saat content_type === 2 (ATTACHMENT_MANIFEST)
 }
 
 export interface BchatMessageData {

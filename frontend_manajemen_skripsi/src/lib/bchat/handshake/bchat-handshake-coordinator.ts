@@ -290,6 +290,49 @@ export function findRecoverablePendingWelcomeOutbox(
   return validCandidates[0];
 }
 
+/**
+ * Mendeteksi keberadaan entri outbox Welcome yang belum acked namun rusak/korup/tidak valid
+ * (mis. payload kosong atau Base64 cacat), agar evaluasi tetap fail-closed bahkan bila
+ * lastProcessedSequence > 0 atau riwayat lokal sudah tersedia.
+ */
+export function hasInvalidPendingWelcomeOutbox(
+  messages: OutboxItemSummary[] | undefined | null,
+  roomUuid: string
+): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return false;
+  }
+  const normalizedRoomUuid = roomUuid.trim().toLowerCase();
+
+  return messages.some((m) => {
+    if (!m || m.messageType !== 'welcome') return false;
+    if (m.status !== 'pending' && m.status !== 'in_transit' && m.status !== 'failed') {
+      return false;
+    }
+    if (typeof m.roomUuid === 'string' && m.roomUuid.trim().toLowerCase() !== normalizedRoomUuid) {
+      return false;
+    }
+    return findRecoverablePendingWelcomeOutbox([m], roomUuid) === null;
+  });
+}
+
+function hasAnyWelcomeOutboxForRoom(
+  messages: OutboxItemSummary[] | undefined | null,
+  roomUuid: string
+): boolean {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return false;
+  }
+  const normalizedRoomUuid = roomUuid.trim().toLowerCase();
+  return messages.some(
+    (m) =>
+      Boolean(m) &&
+      m.messageType === 'welcome' &&
+      typeof m.roomUuid === 'string' &&
+      m.roomUuid.trim().toLowerCase() === normalizedRoomUuid
+  );
+}
+
 export type ActiveRoomFoundDecision =
   | { action: 'PROCEED_NORMAL_CHAT' }
   | {
@@ -315,12 +358,12 @@ export type ActiveRoomFoundDecision =
  * dan GroupState lokal ditemukan (FOUND).
  *
  * Invarian keamanan:
- * - Sesi normal yang sudah memiliki riwayat / cursor > 0 atau tanpa pending_session
- *   selalu masuk chat normal (PROCEED_NORMAL_CHAT) tanpa memicu inisiasi sesi baru.
  * - Sesi PENDING dengan action_type = PUBLISH_SESSION_WELCOME dan has_active_challenge = false
- *   pada perangkat inisiator (epoch 1, seq 0, tanpa riwayat lokal) DILARANG masuk chat normal:
- *   - Jika Welcome lokal valid tersedia di outbox -> RECOVER_PENDING_SESSION_WELCOME.
- *   - Jika Welcome lokal tidak tersedia / tidak valid -> FAIL_CLOSED_MISSING_PENDING_WELCOME.
+ *   pada perangkat mahasiswa WAJIB memeriksa outbox Welcome lokal meskipun lastProcessedSequence > 0
+ *   atau riwayat lokal sudah tersedia:
+ *   - Jika Welcome lokal valid tersedia dan belum acked -> RECOVER_PENDING_SESSION_WELCOME (blokir chat normal).
+ *   - Jika Welcome lokal rusak/korup atau GroupState tidak valid (atau fresh initiator tanpa Welcome) -> FAIL_CLOSED_MISSING_PENDING_WELCOME.
+ *   - Hanya perangkat operasional normal tanpa pending/corrupt Welcome di outbox (seq > 0 / riwayat > 0) yang masuk PROCEED_NORMAL_CHAT.
  */
 export function evaluateActiveRoomFoundState(params: {
   roomUuid: string;
@@ -345,13 +388,10 @@ export function evaluateActiveRoomFoundState(params: {
     (restoreRes.lastProcessedSequence ?? 0) === 0 &&
     localHistoryCount === 0;
 
-  if (!isFreshInitiatorGroupState) {
-    return { action: 'PROCEED_NORMAL_CHAT' };
-  }
-
   if (
     pendingSession.action_type === 'AWAIT_PARTNER_SESSION_ACK' &&
-    pendingSession.has_active_challenge === true
+    pendingSession.has_active_challenge === true &&
+    (isFreshInitiatorGroupState || hasAnyWelcomeOutboxForRoom(outboxMessages, roomUuid))
   ) {
     return {
       action: 'AWAIT_PARTNER_SESSION_ACK',
@@ -369,24 +409,38 @@ export function evaluateActiveRoomFoundState(params: {
       typeof restoreRes.groupIdHash === 'string' &&
       SHA256_HEX_REGEX.test(restoreRes.groupIdHash.trim().toLowerCase());
     const recoverableWelcome = findRecoverablePendingWelcomeOutbox(outboxMessages, roomUuid);
+    const hasCorruptWelcome = hasInvalidPendingWelcomeOutbox(outboxMessages, roomUuid);
 
-    if (hasValidGroupIdHash && recoverableWelcome) {
+    if (recoverableWelcome) {
+      if (hasValidGroupIdHash && restoreRes.epoch === '1') {
+        return {
+          action: 'RECOVER_PENDING_SESSION_WELCOME',
+          sessionUuid: pendingSession.session_uuid,
+          generationNumber: pendingSession.generation_number,
+          welcomeItem: recoverableWelcome,
+        };
+      }
+
       return {
-        action: 'RECOVER_PENDING_SESSION_WELCOME',
+        action: 'FAIL_CLOSED_MISSING_PENDING_WELCOME',
         sessionUuid: pendingSession.session_uuid,
         generationNumber: pendingSession.generation_number,
-        welcomeItem: recoverableWelcome,
+        reason: `GroupState lokal untuk sesi tertunda Generasi #${pendingSession.generation_number} tidak valid (epoch: ${restoreRes.epoch ?? 'kosong'}) atau tidak memiliki group_id_hash yang valid.`,
       };
     }
 
-    return {
-      action: 'FAIL_CLOSED_MISSING_PENDING_WELCOME',
-      sessionUuid: pendingSession.session_uuid,
-      generationNumber: pendingSession.generation_number,
-      reason: !hasValidGroupIdHash
-        ? `GroupState lokal untuk sesi tertunda Generasi #${pendingSession.generation_number} tidak memiliki group_id_hash yang valid.`
-        : `Sesi tertunda Generasi #${pendingSession.generation_number} belum menyelesaikan publikasi Welcome di server dan payload Welcome lokal yang valid tidak ditemukan di outbox perangkat ini.`,
-    };
+    if (hasCorruptWelcome || isFreshInitiatorGroupState) {
+      return {
+        action: 'FAIL_CLOSED_MISSING_PENDING_WELCOME',
+        sessionUuid: pendingSession.session_uuid,
+        generationNumber: pendingSession.generation_number,
+        reason: hasCorruptWelcome
+          ? `Payload Welcome lokal pada outbox untuk sesi tertunda Generasi #${pendingSession.generation_number} rusak atau tidak dapat diverifikasi.`
+          : !hasValidGroupIdHash
+            ? `GroupState lokal untuk sesi tertunda Generasi #${pendingSession.generation_number} tidak memiliki group_id_hash yang valid.`
+            : `Sesi tertunda Generasi #${pendingSession.generation_number} belum menyelesaikan publikasi Welcome di server dan payload Welcome lokal yang valid tidak ditemukan di outbox perangkat ini.`,
+      };
+    }
   }
 
   return { action: 'PROCEED_NORMAL_CHAT' };
@@ -1775,6 +1829,7 @@ export async function initiateNextSessionHandshakeFlow(
   // 3. Evaluasi state lokal (Outbox Welcome & GroupState) SEBELUM membuat sesi baru di server
   //    agar kondisi fail-closed tidak pernah menciptakan sesi PENDING liar maupun meregenerasi GroupState/Commit/Welcome.
   let existingWelcomeItem: OutboxItemSummary | null = null;
+  let hasCorruptWelcomeItem = false;
   try {
     const outboxRes = await workerRpc.sendRequest<GetRoomOutboxPayload, GetRoomOutboxResult>(
       'GET_ROOM_OUTBOX',
@@ -1784,8 +1839,12 @@ export async function initiateNextSessionHandshakeFlow(
       outboxRes?.messages,
       canonicalRoomUuid
     );
+    hasCorruptWelcomeItem =
+      !existingWelcomeItem &&
+      hasInvalidPendingWelcomeOutbox(outboxRes?.messages, canonicalRoomUuid);
   } catch {
     existingWelcomeItem = null;
+    hasCorruptWelcomeItem = false;
   }
 
   const preRestoreRes = await workerRpc.sendRequest<RestoreGroupStatePayload, RestoreGroupStateResult>(
@@ -1802,11 +1861,18 @@ export async function initiateNextSessionHandshakeFlow(
     const hasValidHash =
       typeof preRestoreRes.groupIdHash === 'string' &&
       SHA256_HEX_REGEX.test(preRestoreRes.groupIdHash.trim().toLowerCase());
+    // Jika sesi PENDING yang sama sudah ada di backend (has_active_challenge === false),
+    // izinkan publikasi ulang ciphertext Welcome asli dari outbox lokal meskipun lastProcessedSequence > 0,
+    // tanpa membuat sesi baru maupun meregenerasi GroupState/Commit/Welcome.
+    const isRecoveringExistingPendingSession =
+      existingPendingSession !== null && existingPendingSession.has_active_challenge === false;
+    const sequenceAllowed =
+      isRecoveringExistingPendingSession || (preRestoreRes.lastProcessedSequence ?? 0) === 0;
     if (
       preRestoreRes.status !== 'FOUND' ||
       !hasValidHash ||
       preRestoreRes.epoch !== '1' ||
-      (preRestoreRes.lastProcessedSequence ?? 0) !== 0
+      !sequenceAllowed
     ) {
       throw new BchatHandshakeCoordinatorError(
         `GroupState lokal tidak valid untuk publikasi ulang Welcome sesi (status: ${preRestoreRes?.status}, epoch: ${preRestoreRes?.epoch}, seq: ${preRestoreRes?.lastProcessedSequence ?? 0}).`,
@@ -1817,11 +1883,11 @@ export async function initiateNextSessionHandshakeFlow(
     if (
       existingPendingSession &&
       existingPendingSession.has_active_challenge === false &&
-      preRestoreRes.epoch === '1' &&
-      (preRestoreRes.lastProcessedSequence ?? 0) === 0
+      (hasCorruptWelcomeItem ||
+        (preRestoreRes.epoch === '1' && (preRestoreRes.lastProcessedSequence ?? 0) === 0))
     ) {
       throw new BchatHandshakeCoordinatorError(
-        `Sesi tertunda Generasi #${existingPendingSession.generation_number} belum menyelesaikan publikasi Welcome dan payload Welcome lokal yang valid tidak ditemukan di outbox. Publikasi dibatalkan secara aman (fail-closed) tanpa membuat sesi pengganti.`,
+        `Sesi tertunda Generasi #${existingPendingSession.generation_number} belum menyelesaikan publikasi Welcome dan payload Welcome lokal yang valid tidak ditemukan atau rusak di outbox. Publikasi dibatalkan secara aman (fail-closed) tanpa membuat sesi pengganti.`,
         'PENDING_WELCOME_OUTBOX_MISSING',
         undefined,
         {

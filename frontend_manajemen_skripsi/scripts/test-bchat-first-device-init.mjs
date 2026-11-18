@@ -258,6 +258,49 @@ const MOCK_MODULES = {
           return { data: { status: 'success', data: room.activeSession } };
         }
 
+        // POST /api/bchat/rooms/{roomUuid}/messages (enforces exact backend MISSING_ATTACHMENT_REFERENCE rule!)
+        const msgMatch = url.match(/^\\/api\\/bchat\\/rooms\\/([^/]+)\\/messages$/);
+        if (msgMatch) {
+          const roomUuid = decodeURIComponent(msgMatch[1]);
+          const room = h.rooms.get(roomUuid);
+          if (!room) throw makeAxiosError(404, 'Room not found', 'ROOM_NOT_FOUND');
+          room.messagePostCalls = (room.messagePostCalls || 0) + 1;
+          if (room.forceNextMessageError) {
+            const errSpec = room.forceNextMessageError;
+            room.forceNextMessageError = null;
+            throw makeAxiosError(errSpec.status, errSpec.message, errSpec.errorCode);
+          }
+          const attUuids = Array.isArray(payload?.attachment_uuids) ? payload.attachment_uuids : [];
+          if (payload?.content_type === 2 && attUuids.length === 0) {
+            throw makeAxiosError(
+              422,
+              'Pesan manifest lampiran wajib menyertakan referensi minimal satu lampiran.',
+              'MISSING_ATTACHMENT_REFERENCE'
+            );
+          }
+          room.currentSequence = (room.currentSequence || 0) + 1;
+          room.sentMessages = room.sentMessages || [];
+          room.sentMessages.push({ payload, server_sequence: room.currentSequence });
+          return {
+            data: {
+              status: 'success',
+              message: 'Pesan terenkripsi berhasil dikirim.',
+              data: {
+                server_sequence: room.currentSequence,
+                message_uuid: payload.message_uuid,
+                sender_id: room.initiatorUserId || 4,
+                epoch: payload.epoch,
+                generation: payload.generation,
+                content_type: payload.content_type,
+                ciphertext_payload: payload.ciphertext_payload,
+                payload_hash_sha256: payload.payload_hash_sha256,
+                client_sent_at: payload.client_sent_at,
+                created_at: new Date().toISOString(),
+              },
+            },
+          };
+        }
+
         throw makeAxiosError(404, 'Unhandled POST: ' + url, 'NOT_FOUND');
       },
     };
@@ -319,6 +362,11 @@ const MOCK_MODULES = {
       return withReadonlyTransaction(storeNames, cb);
     }
   `,
+  'mock://encrypted-history': `
+    export async function saveEncryptedHistoryItem() { return true; }
+    export async function getEncryptedHistoryItem() { return null; }
+    export async function loadEncryptedHistory() { return []; }
+  `,
 };
 
 // Register Node module hooks to transpile TS production files on the fly
@@ -329,6 +377,9 @@ registerHooks({
     }
     if (specifier === '@/lib/bchat/storage/bchat-idb-core') {
       return { shortCircuit: true, url: 'mock://idb-core' };
+    }
+    if (specifier === '@/lib/bchat/storage/bchat-encrypted-history') {
+      return { shortCircuit: true, url: 'mock://encrypted-history' };
     }
     if (specifier.startsWith('@/')) {
       const rel = specifier.slice(2);
@@ -385,8 +436,13 @@ const {
   evaluateActiveRoomFoundState,
   shouldPollIncomingHistoryTransfers,
   findRecoverablePendingWelcomeOutbox,
+  hasInvalidPendingWelcomeOutbox,
   isRateLimitPublishError,
 } = await import('@/lib/bchat/handshake/bchat-handshake-coordinator');
+const {
+  sendApplicationMessageFlow,
+  BchatMessageValidationError,
+} = await import('@/lib/bchat/message/bchat-message-coordinator');
 const { buildWelcomeAckPayload } = await import('@/lib/bchat/handshake/bchat-welcome-ack-builder');
 
 // Real ts-mls imports (identical to bchat-mls-poc.worker.ts)
@@ -1573,5 +1629,423 @@ test('8. GroupState FOUND pada sesi normal operasional (mis. Device 4 Gen 2) sel
     outboxMessages: [],
   });
   assert.equal(decisionOperationalWithPending.action, 'PROCEED_NORMAL_CHAT');
+});
+
+// ===========================================================================
+// TEST 9 (BUG 1): GroupState FOUND dengan seq > 0 & riwayat lokal tetap mendeteksi Pending Welcome Gen 3,
+//                 mempublikasikan ulang tanpa sesi/ciphertext baru, memblokir chat normal, dan fail-closed bila korup
+// ===========================================================================
+test('9. BUG 1: GroupState FOUND dengan seq > 0 tetap mendeteksi pending Welcome Gen 3, pulih tanpa Gen 4/regenerasi, dan fail-closed bila rusak', async () => {
+  harness.reset();
+  const mlsContext = await buildMlsContext();
+
+  const roomUuid = crypto.randomUUID();
+  const gen2SessionUuid = crypto.randomUUID();
+  const gen3SessionUuid = crypto.randomUUID();
+  const mhsDeviceUuid = crypto.randomUUID();
+  const dosenDeviceUuid = crypto.randomUUID();
+  const mhsUserId = 501;
+  const dosenUserId = 502;
+  const fencing = { ownerToken: 'tab_bug1_seq17', generation: '1' };
+
+  const dosenEd25519 = await crypto.webcrypto.subtle.generateKey('Ed25519', false, ['sign']);
+  const dosenPubRaw = new Uint8Array(await crypto.webcrypto.subtle.exportKey('raw', dosenEd25519.publicKey));
+  harness.deviceIdentityKeys.set(dosenDeviceUuid, {
+    key_id: `identity_key_${dosenDeviceUuid}`,
+    key_version: 1,
+    status: 'active',
+    algorithm: 'Ed25519',
+    crypto_key: dosenEd25519.privateKey,
+    created_at: Date.now(),
+    metadata: { key_type: 'DEVICE_IDENTITY', device_uuid: dosenDeviceUuid, user_id: String(dosenUserId) },
+  });
+
+  const mhsWorker = createRealMlsWorkerPeer({
+    role: 'mahasiswa',
+    identity: 'mhs.bug1@unuha.test',
+    deviceUuid: mhsDeviceUuid,
+    mlsContext,
+  });
+  const dosenWorker = createRealMlsWorkerPeer({
+    role: 'dosen',
+    identity: 'dosen.bug1@unuha.test',
+    deviceUuid: dosenDeviceUuid,
+    mlsContext,
+  });
+  const dosenKp = await dosenWorker.generateAndRegisterKeyPackage();
+
+  // Simulasikan kondisi aktual browser mahasiswa:
+  // GroupState lokal epoch 1 sudah terbentuk, Welcome outbox status 'failed', DAN lastProcessedSequence = 17 > 0 + riwayat lokal > 0!
+  await mhsWorker.sendRequest('GENERATE_KEY_PACKAGE', { deviceUuid: mhsDeviceUuid, fencing });
+  await mhsWorker.sendRequest('CREATE_GROUP', { roomUuid, deviceUuid: mhsDeviceUuid, fencing });
+  const commitRes = await mhsWorker.sendRequest('COMMIT_ADD_MEMBER', {
+    roomUuid,
+    deviceUuid: mhsDeviceUuid,
+    partnerKeyPackageBase64: dosenKp.key_package_data,
+    fencing,
+  });
+  await mhsWorker.sendRequest('UPDATE_OUTBOX_STATUS', { clientMessageUuid: commitRes.clientMessageUuidCommit, status: 'acked' });
+  await mhsWorker.sendRequest('UPDATE_OUTBOX_STATUS', { clientMessageUuid: commitRes.clientMessageUuidWelcome, status: 'failed' });
+  mhsWorker.setLastProcessedSequence(17);
+  mhsWorker.resetStats();
+
+  const originalWelcomeWire = commitRes.welcomeWireBase64;
+  const originalGroupIdHash = mhsWorker.getPersistedState().groupIdHash;
+
+  const pendingGen3 = {
+    session_uuid: gen3SessionUuid,
+    generation_number: 3,
+    status: 'PENDING',
+    start_sequence: 17,
+    current_sequence: 16,
+    created_by_user_id: mhsUserId,
+    has_active_challenge: false,
+    welcome_operation_uuid: null,
+    recipient_device_uuid: null,
+    expires_at: null,
+    action_required: true,
+    action_type: 'PUBLISH_SESSION_WELCOME',
+  };
+
+  // 9a. evaluateActiveRoomFoundState dengan lastProcessedSequence = 17 & localHistoryCount = 1 WAJIB mendeteksi RECOVER_PENDING_SESSION_WELCOME!
+  const decisionWithSeq17 = evaluateActiveRoomFoundState({
+    roomUuid,
+    myRole: 'mahasiswa',
+    pendingSession: pendingGen3,
+    restoreRes: { status: 'FOUND', epoch: '1', groupIdHash: originalGroupIdHash, lastProcessedSequence: 17 },
+    localHistoryCount: 1,
+    outboxMessages: mhsWorker.getOutbox(),
+  });
+  assert.equal(decisionWithSeq17.action, 'RECOVER_PENDING_SESSION_WELCOME');
+  assert.equal(decisionWithSeq17.sessionUuid, gen3SessionUuid);
+  assert.equal(decisionWithSeq17.welcomeItem.ciphertextWireBase64, originalWelcomeWire);
+
+  // 9b. Jika Welcome outbox KORUP saat seq = 17 & localHistoryCount = 1 -> WAJIB fail-closed (BUKAN PROCEED_NORMAL_CHAT)!
+  const corruptOutbox = [
+    {
+      clientMessageUuid: crypto.randomUUID(),
+      roomUuid,
+      status: 'failed',
+      ciphertextWireBase64: 'not-valid-base64!!!',
+      createdAt: Date.now(),
+      messageType: 'welcome',
+    },
+  ];
+  assert.equal(hasInvalidPendingWelcomeOutbox(corruptOutbox, roomUuid), true);
+  const decisionCorruptWithSeq17 = evaluateActiveRoomFoundState({
+    roomUuid,
+    myRole: 'mahasiswa',
+    pendingSession: pendingGen3,
+    restoreRes: { status: 'FOUND', epoch: '1', groupIdHash: originalGroupIdHash, lastProcessedSequence: 17 },
+    localHistoryCount: 1,
+    outboxMessages: corruptOutbox,
+  });
+  assert.equal(decisionCorruptWithSeq17.action, 'FAIL_CLOSED_MISSING_PENDING_WELCOME');
+
+  // 9c. Publikasi ulang Welcome Gen 3 saat lastProcessedSequence = 17 menggunakan UUID & ciphertext asli tanpa Gen 4 / regenerasi
+  const roomState = {
+    initiatorUserId: mhsUserId,
+    groupIdHash: originalGroupIdHash,
+    currentSequence: 17,
+    activeSession: { session_uuid: gen2SessionUuid, generation_number: 2, status: 'ACTIVE', start_sequence: 11, current_sequence: 17 },
+    pendingSession: { ...pendingGen3 },
+    archivedSessions: [],
+    activeChallenge: null,
+    partnerKeyPackage: {
+      recipient_user_id: String(dosenUserId),
+      recipient_device_uuid: dosenDeviceUuid,
+      key_package_hash: dosenKp.key_package_hash,
+      key_package_data: dosenKp.key_package_data,
+    },
+    createNextCalls: 0,
+    welcomePublishCalls: 0,
+    currentViewerRole: 'mahasiswa',
+    async verifyAckSignature(challenge, sigBase64) {
+      const built = buildWelcomeAckPayload({
+        roomUuid,
+        recipientUserId: dosenUserId,
+        welcomeOperationUuid: challenge.welcome_operation_uuid,
+        challengeUuid: challenge.challenge_uuid,
+        challengeGeneration: challenge.challenge_generation,
+        groupIdHash: challenge.group_id_hash,
+        epoch: BigInt(1),
+        challengeNonce: challenge.challenge_nonce,
+      });
+      const sigBytes = new Uint8Array(Buffer.from(sigBase64, 'base64'));
+      const pubKey = await crypto.webcrypto.subtle.importKey('raw', dosenPubRaw, 'Ed25519', false, ['verify']);
+      return crypto.webcrypto.subtle.verify('Ed25519', pubKey, sigBytes, built.payloadBytes);
+    },
+    buildDetail() {
+      const hasChal = Boolean(this.activeChallenge);
+      let pendingActionType = 'NONE';
+      let pendingActionReq = false;
+      if (this.pendingSession) {
+        if (!hasChal) {
+          pendingActionType = this.currentViewerRole === 'mahasiswa' ? 'PUBLISH_SESSION_WELCOME' : 'AWAIT_PARTNER_SESSION_WELCOME';
+          pendingActionReq = this.currentViewerRole === 'mahasiswa';
+        } else {
+          pendingActionType = this.currentViewerRole === 'dosen' ? 'FETCH_SESSION_CHALLENGE_AND_ACK' : 'AWAIT_PARTNER_SESSION_ACK';
+          pendingActionReq = this.currentViewerRole === 'dosen';
+        }
+      }
+      return {
+        room_uuid: roomUuid,
+        status: 'ACTIVE',
+        group_id_hash: this.groupIdHash,
+        my_membership: { role: this.currentViewerRole, is_initiator: this.currentViewerRole === 'mahasiswa', is_active: true, joined_at_epoch: 1 },
+        partner: { name: 'Dosen', role: 'dosen_pembimbing', has_active_device: true, has_key_package: true, is_active: true },
+        action_hint: { action_required: false, action_type: 'NONE' },
+        handshake_context: { has_active_challenge: false, welcome_operation_uuid: null, epoch: null, action_required: false, action_type: 'NONE' },
+        capabilities: { can_send_messages: true, can_read_messages: true, can_handshake: false },
+        active_session: this.activeSession,
+        pending_session: this.pendingSession
+          ? {
+              ...this.pendingSession,
+              has_active_challenge: hasChal,
+              welcome_operation_uuid: this.activeChallenge?.welcome_operation_uuid ?? null,
+              recipient_device_uuid: this.activeChallenge?.recipient_device_uuid ?? null,
+              expires_at: this.activeChallenge?.expires_at ?? null,
+              action_required: pendingActionReq,
+              action_type: pendingActionType,
+            }
+          : null,
+      };
+    },
+  };
+  harness.rooms.set(roomUuid, roomState);
+
+  const pubRes = await initiateNextSessionHandshakeFlow(mhsWorker, roomUuid, mhsDeviceUuid, { fencing });
+  assert.equal(pubRes.status, 'AWAITING_ACK');
+  assert.equal(pubRes.sessionUuid, gen3SessionUuid);
+  assert.equal(roomState.createNextCalls, 0, 'Tidak boleh membuat Gen 4');
+  assert.equal(roomState.welcomePublishCalls, 1);
+  assert.equal(roomState.activeChallenge.welcome_message, originalWelcomeWire, 'Harus memakai ciphertext Welcome asli');
+  assert.deepEqual(mhsWorker.getStats(), { generateKpCalls: 0, createGroupCalls: 0, commitCalls: 0 });
+
+  // 9d. Setelah Welcome terpublikasi (has_active_challenge = true), mahasiswa tetap tertahan di AWAIT_PARTNER_SESSION_ACK meski seq = 17
+  const decisionAwaitAck = evaluateActiveRoomFoundState({
+    roomUuid,
+    myRole: 'mahasiswa',
+    pendingSession: roomState.buildDetail().pending_session,
+    restoreRes: { status: 'FOUND', epoch: '1', groupIdHash: originalGroupIdHash, lastProcessedSequence: 17 },
+    localHistoryCount: 1,
+    outboxMessages: mhsWorker.getOutbox(),
+  });
+  assert.equal(decisionAwaitAck.action, 'AWAIT_PARTNER_SESSION_ACK');
+
+  // 9e. Dosen menerima Welcome & mengirim Ed25519 ACK -> Gen 3 ACTIVE!
+  roomState.currentViewerRole = 'dosen';
+  const ackRes = await completePendingSessionHandshakeFlow(dosenWorker, roomUuid, dosenDeviceUuid, {
+    fencing,
+    userId: dosenUserId,
+    expectedSessionUuid: gen3SessionUuid,
+  });
+  assert.equal(ackRes.sessionStatus, 'ACTIVE');
+  assert.equal(ackRes.generationNumber, 3);
+
+  // 9f. Kontrak UI BchatProposalChat.tsx: tidak membatasi GET_ROOM_OUTBOX ke seq === 0 & tidak mengunci layar recovery/waiting ke messages.length === 0
+  const chatSrc = fs.readFileSync(path.join(SRC_ROOT, 'components/bchat/BchatProposalChat.tsx'), 'utf8');
+  assert.doesNotMatch(chatSrc, /unrecoverableMode === 'PENDING_WELCOME_RECOVERY' &&\s*messages\.length === 0/);
+  assert.doesNotMatch(chatSrc, /if \(waitingState && messages\.length === 0\)/);
+  assert.match(chatSrc, /attachmentUuids = manifestAttachments\.map\(\(a\) => a\.attachmentUuid\)/);
+});
+
+// ===========================================================================
+// TEST 10 (BUG 2): Pengiriman pesan teks, 1 lampiran, multi-lampiran, guard pre-encrypt, & outbox 4xx vs 5xx
+// ===========================================================================
+test('10. BUG 2: sendApplicationMessageFlow mengirim attachment_uuids untuk 1 & multi lampiran, memblokir sebelum ENCRYPT_MESSAGE bila kosong, dan menjaga ratchet saat HTTP gagal', async () => {
+  harness.reset();
+  const roomUuid = crypto.randomUUID();
+  const deviceUuid = crypto.randomUUID();
+  const fencing = { ownerToken: 'tab_bug2_msg', generation: '1' };
+
+  const roomState = {
+    initiatorUserId: 4,
+    currentSequence: 17,
+    messagePostCalls: 0,
+    sentMessages: [],
+    forceNextMessageError: null,
+  };
+  harness.rooms.set(roomUuid, roomState);
+
+  let encryptCalls = 0;
+  const outboxStatusUpdates = [];
+  const fakeWorker = {
+    async sendRequest(action, payload) {
+      if (action === 'ENCRYPT_MESSAGE') {
+        encryptCalls += 1;
+        const wire = Buffer.from(`fake_mls_ct_${encryptCalls}_${payload.clientMessageUuid}`);
+        return {
+          ciphertextWireBase64: wire.toString('base64'),
+          epoch: '1',
+          stateRevision: String(encryptCalls + 1),
+        };
+      }
+      if (action === 'UPDATE_OUTBOX_STATUS') {
+        outboxStatusUpdates.push({ clientMessageUuid: payload.clientMessageUuid, status: payload.status });
+        return { success: true };
+      }
+      throw new Error(`Unexpected worker action: ${action}`);
+    },
+  };
+
+  // 10a. Pesan teks biasa (contentType = 1) berhasil tanpa attachment_uuids
+  const textRes = await sendApplicationMessageFlow({
+    roomUuid,
+    plaintext: 'Pesan teks biasa tetap berhasil',
+    deviceUuid,
+    workerRpc: fakeWorker,
+    fencing,
+    contentType: 1,
+  });
+  assert.equal(textRes.messageData.server_sequence, 18);
+  assert.equal(roomState.sentMessages[0].payload.content_type, 1);
+  assert.equal('attachment_uuids' in roomState.sentMessages[0].payload, false);
+  assert.equal(encryptCalls, 1);
+
+  // 10b. Pesan dengan 1 lampiran (contentType = 2) menyertakan attachment_uuids tepat 1 UUID v4
+  const att1 = crypto.randomUUID();
+  const singleAttRes = await sendApplicationMessageFlow({
+    roomUuid,
+    plaintext: JSON.stringify({ version: '1.0.0', type: 'ATTACHMENT_MANIFEST', text: 'Satu file', attachments: [{ attachmentUuid: att1 }] }),
+    deviceUuid,
+    workerRpc: fakeWorker,
+    fencing,
+    contentType: 2,
+    attachmentUuids: [att1.toUpperCase()],
+  });
+  assert.equal(singleAttRes.messageData.server_sequence, 19);
+  assert.equal(roomState.sentMessages[1].payload.content_type, 2);
+  assert.deepEqual(roomState.sentMessages[1].payload.attachment_uuids, [att1.toLowerCase()]);
+  assert.equal(encryptCalls, 2);
+
+  // 10c. Pesan dengan beberapa lampiran (contentType = 2) menyertakan seluruh attachment_uuids
+  const att2 = crypto.randomUUID();
+  const att3 = crypto.randomUUID();
+  const att4 = crypto.randomUUID();
+  const multiAttRes = await sendApplicationMessageFlow({
+    roomUuid,
+    plaintext: JSON.stringify({ version: '1.0.0', type: 'ATTACHMENT_MANIFEST', text: 'Tiga file', attachments: [{ attachmentUuid: att2 }, { attachmentUuid: att3 }, { attachmentUuid: att4 }] }),
+    deviceUuid,
+    workerRpc: fakeWorker,
+    fencing,
+    contentType: 2,
+    attachmentUuids: [att2, att3, att4],
+  });
+  assert.equal(multiAttRes.messageData.server_sequence, 20);
+  assert.deepEqual(roomState.sentMessages[2].payload.attachment_uuids, [att2, att3, att4]);
+  assert.equal(encryptCalls, 3);
+
+  // 10d. Pesan lampiran tanpa UUID / array kosong / format invalid / duplikat ditolak SEBELUM ENCRYPT_MESSAGE (ratchet tidak maju!)
+  const encryptBeforeInvalid = encryptCalls;
+  const postsBeforeInvalid = roomState.messagePostCalls;
+
+  await assert.rejects(
+    () =>
+      sendApplicationMessageFlow({
+        roomUuid,
+        plaintext: '{"type":"ATTACHMENT_MANIFEST"}',
+        deviceUuid,
+        workerRpc: fakeWorker,
+        fencing,
+        contentType: 2,
+      }),
+    (err) => err instanceof BchatMessageValidationError
+  );
+  await assert.rejects(
+    () =>
+      sendApplicationMessageFlow({
+        roomUuid,
+        plaintext: '{"type":"ATTACHMENT_MANIFEST"}',
+        deviceUuid,
+        workerRpc: fakeWorker,
+        fencing,
+        contentType: 2,
+        attachmentUuids: [],
+      }),
+    (err) => err instanceof BchatMessageValidationError
+  );
+  await assert.rejects(
+    () =>
+      sendApplicationMessageFlow({
+        roomUuid,
+        plaintext: '{"type":"ATTACHMENT_MANIFEST"}',
+        deviceUuid,
+        workerRpc: fakeWorker,
+        fencing,
+        contentType: 2,
+        attachmentUuids: ['bukan-uuid-v4'],
+      }),
+    (err) => err instanceof BchatMessageValidationError
+  );
+  await assert.rejects(
+    () =>
+      sendApplicationMessageFlow({
+        roomUuid,
+        plaintext: '{"type":"ATTACHMENT_MANIFEST"}',
+        deviceUuid,
+        workerRpc: fakeWorker,
+        fencing,
+        contentType: 2,
+        attachmentUuids: [att2, att2],
+      }),
+    (err) => err instanceof BchatMessageValidationError
+  );
+
+  assert.equal(encryptCalls, encryptBeforeInvalid, 'ENCRYPT_MESSAGE dilarang dipanggil bila referensi lampiran tidak valid');
+  assert.equal(roomState.messagePostCalls, postsBeforeInvalid, 'HTTP POST dilarang dikirim bila referensi lampiran tidak valid');
+
+  // 10e. Kegagalan HTTP 422 deterministik menandai outbox 'failed' (bukan 'in_transit') tanpa auto-retry/re-encrypt;
+  //      kegagalan HTTP 503 transient menandai outbox 'in_transit' tanpa auto-retry/re-encrypt.
+  const msgUuid422 = crypto.randomUUID();
+  roomState.forceNextMessageError = { status: 422, message: 'Lampiran tidak valid', errorCode: 'ATTACHMENT_SESSION_MISMATCH' };
+  const encBefore422 = encryptCalls;
+  const postsBefore422 = roomState.messagePostCalls;
+  await assert.rejects(
+    () =>
+      sendApplicationMessageFlow({
+        roomUuid,
+        plaintext: '{"type":"ATTACHMENT_MANIFEST"}',
+        deviceUuid,
+        workerRpc: fakeWorker,
+        fencing,
+        clientMessageUuid: msgUuid422,
+        contentType: 2,
+        attachmentUuids: [crypto.randomUUID()],
+      }),
+    (err) => err?.httpStatus === 422
+  );
+  assert.equal(encryptCalls, encBefore422 + 1, 'Tidak boleh ada re-enkripsi otomatis saat 422');
+  assert.equal(roomState.messagePostCalls, postsBefore422 + 1, 'Tidak boleh ada auto-retry HTTP saat 422');
+  assert.equal(
+    outboxStatusUpdates.find((u) => u.clientMessageUuid === msgUuid422)?.status,
+    'failed',
+    'Penolakan 422 deterministik wajib menandai outbox sebagai failed'
+  );
+
+  const msgUuid503 = crypto.randomUUID();
+  roomState.forceNextMessageError = { status: 503, message: 'Service Unavailable', errorCode: 'TEMPORARY_UNAVAILABLE' };
+  const encBefore503 = encryptCalls;
+  const postsBefore503 = roomState.messagePostCalls;
+  await assert.rejects(
+    () =>
+      sendApplicationMessageFlow({
+        roomUuid,
+        plaintext: 'Uji transient 503',
+        deviceUuid,
+        workerRpc: fakeWorker,
+        fencing,
+        clientMessageUuid: msgUuid503,
+        contentType: 1,
+      }),
+    (err) => err?.httpStatus === 503
+  );
+  assert.equal(encryptCalls, encBefore503 + 1, 'Tidak boleh ada re-enkripsi otomatis saat 503');
+  assert.equal(roomState.messagePostCalls, postsBefore503 + 1, 'Tidak boleh ada auto-retry HTTP saat 503');
+  assert.equal(
+    outboxStatusUpdates.find((u) => u.clientMessageUuid === msgUuid503)?.status,
+    'in_transit',
+    'Error transient 503 menandai outbox sebagai in_transit'
+  );
 });
 

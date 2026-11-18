@@ -770,14 +770,17 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       // atau masih menunggu ACK dosen.
       if (restoreRes.status === 'FOUND') {
         let outboxMessages: OutboxItemSummary[] | undefined;
+        // Selalu periksa GET_ROOM_OUTBOX ketika ada pending_session berstatus PENDING pada peran mahasiswa
+        // (termasuk saat lastProcessedSequence > 0 atau riwayat lokal sudah tersedia) agar Welcome
+        // tertunda yang belum dipublikasikan/di-ACK tidak terlewatkan.
         if (
           pendingSession !== null &&
           pendingSession.status === 'PENDING' &&
-          pendingSession.action_type === 'PUBLISH_SESSION_WELCOME' &&
-          pendingSession.has_active_challenge === false &&
-          restoreRes.epoch === '1' &&
-          (restoreRes.lastProcessedSequence ?? 0) === 0 &&
-          localHistoryItems.length === 0
+          currentDetail.my_membership?.role === 'mahasiswa' &&
+          ((pendingSession.action_type === 'PUBLISH_SESSION_WELCOME' &&
+            pendingSession.has_active_challenge === false) ||
+            (pendingSession.action_type === 'AWAIT_PARTNER_SESSION_ACK' &&
+              pendingSession.has_active_challenge === true))
         ) {
           try {
             const outboxRes = await workerClient.sendRequest<
@@ -1443,6 +1446,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
 
       let messageContentType: 1 | 2 = 1;
       let finalPlaintext = text;
+      let attachmentUuids: string[] = [];
 
       if (hasPendingFiles) {
         messageContentType = 2; // ATTACHMENT_MANIFEST
@@ -1502,6 +1506,8 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           });
         }
 
+        attachmentUuids = manifestAttachments.map((a) => a.attachmentUuid);
+
         const manifest: BchatAttachmentManifest = {
           version: '1.0.0',
           type: 'ATTACHMENT_MANIFEST',
@@ -1520,6 +1526,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         fencing: fencingRef.current,
         clientMessageUuid,
         contentType: messageContentType,
+        ...(messageContentType === 2 ? { attachmentUuids } : {}),
       });
 
       const newMsgItem: DecryptedMessageItem = {
@@ -1744,7 +1751,8 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
   }
 
   // Layar Tunggu (Mahasiswa menunggu konfirmasi dosen, Dosen menunggu inisiasi mahasiswa, dsb.)
-  if (waitingState && messages.length === 0) {
+  // Wajib memblokir masuk ruang chat normal meskipun riwayat lokal sudah tersedia (mis. saat menunggu ACK Gen 3).
+  if (waitingState) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[500px] p-8 text-center bg-white rounded-3xl border border-slate-100 shadow-sm space-y-4 max-w-lg mx-auto my-12 font-sans">
         <div className="relative">
@@ -1784,11 +1792,11 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
   }
 
   // Layar Pemulihan Partial State: Room ACTIVE + GroupState lokal FOUND + Pending Session (PUBLISH_SESSION_WELCOME)
-  // Memblokir masuk ke ruang chat normal hingga publikasi Welcome sesi tertunda selesai dan dikonfirmasi dosen.
+  // Memblokir masuk ke ruang chat normal hingga publikasi Welcome sesi tertunda selesai dan dikonfirmasi dosen,
+  // termasuk bila lastProcessedSequence > 0 atau riwayat lokal sudah tersedia.
   if (
     isUnrecoverableActiveRoom &&
-    unrecoverableMode === 'PENDING_WELCOME_RECOVERY' &&
-    messages.length === 0
+    unrecoverableMode === 'PENDING_WELCOME_RECOVERY'
   ) {
     const targetGen =
       pendingWelcomeRecoveryInfo?.generationNumber ??
