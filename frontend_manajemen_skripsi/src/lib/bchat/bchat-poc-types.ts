@@ -17,6 +17,7 @@ export type WorkerRpcAction =
   | 'CREATE_GROUP'
   | 'COMMIT_ADD_MEMBER'
   | 'JOIN_WELCOME'
+  | 'PROCESS_COMMIT'
   | 'ENCRYPT_MESSAGE'
   | 'DECRYPT_MESSAGE'
   | 'RESTORE_GROUP_STATE'
@@ -69,6 +70,17 @@ export interface JoinWelcomePayload {
   roomUuid?: string;
   deviceUuid?: string;
   fencing?: FencingRpcInput;
+  isRecovery?: boolean;
+}
+
+export interface ProcessCommitPayload {
+  commitWireBase64: string;
+  roomUuid: string;
+  deviceUuid?: string;
+  fencing?: FencingRpcInput;
+  expectedFromEpoch?: string;
+  expectedToEpoch?: string;
+  commitUuid?: string;
 }
 
 export interface EncryptMessagePayload {
@@ -168,6 +180,14 @@ export interface JoinWelcomeResult {
   epoch: string;
   groupIdHash: string;
   stateRevision?: string;
+}
+
+export interface ProcessCommitResult {
+  roomUuid: string;
+  deviceUuid: string;
+  epoch: string;
+  stateRevision: string;
+  actionTaken: string;
 }
 
 export interface EncryptMessageResult {

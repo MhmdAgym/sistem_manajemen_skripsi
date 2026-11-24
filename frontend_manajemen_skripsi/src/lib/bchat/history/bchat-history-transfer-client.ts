@@ -3,6 +3,9 @@
  */
 
 import axios from '@/lib/axios';
+import { parseBchatApiError, BchatApiError } from '@/lib/bchat/api/bchat-api-client';
+
+export { BchatApiError, parseBchatApiError };
 
 export interface BchatHistoryTransferData {
   transfer_uuid: string;
@@ -55,29 +58,41 @@ export async function requestHistoryTransfer(
   },
   deviceUuid: string
 ): Promise<{ data: BchatHistoryTransferData }> {
-  const res = await axios.post(`/api/bchat/rooms/${roomUuid}/history-transfers`, payload, {
-    headers: { 'X-Bchat-Device-Uuid': deviceUuid },
-  });
-  return res.data;
+  try {
+    const res = await axios.post(`/api/bchat/rooms/${roomUuid}/history-transfers`, payload, {
+      headers: { 'X-Bchat-Device-Uuid': deviceUuid },
+    });
+    return res.data;
+  } catch (err) {
+    throw parseBchatApiError(err);
+  }
 }
 
 export async function fetchPendingHistoryTransfers(
   deviceUuid: string
 ): Promise<{ data: BchatHistoryTransferData[] }> {
-  const res = await axios.get('/api/bchat/history-transfers/pending', {
-    headers: { 'X-Bchat-Device-Uuid': deviceUuid },
-  });
-  return res.data;
+  try {
+    const res = await axios.get('/api/bchat/history-transfers/pending', {
+      headers: { 'X-Bchat-Device-Uuid': deviceUuid },
+    });
+    return res.data;
+  } catch (err) {
+    throw parseBchatApiError(err);
+  }
 }
 
 export async function fetchHistoryTransferDetail(
   transferUuid: string,
   deviceUuid: string
 ): Promise<{ data: BchatHistoryTransferData }> {
-  const res = await axios.get(`/api/bchat/history-transfers/${transferUuid}`, {
-    headers: { 'X-Bchat-Device-Uuid': deviceUuid },
-  });
-  return res.data;
+  try {
+    const res = await axios.get(`/api/bchat/history-transfers/${transferUuid}`, {
+      headers: { 'X-Bchat-Device-Uuid': deviceUuid },
+    });
+    return res.data;
+  } catch (err) {
+    throw parseBchatApiError(err);
+  }
 }
 
 export async function uploadHistoryTransferSnapshot(
@@ -93,20 +108,28 @@ export async function uploadHistoryTransferSnapshot(
   },
   deviceUuid: string
 ): Promise<{ data: BchatHistoryTransferData }> {
-  const res = await axios.post(`/api/bchat/history-transfers/${transferUuid}/upload`, payload, {
-    headers: { 'X-Bchat-Device-Uuid': deviceUuid },
-  });
-  return res.data;
+  try {
+    const res = await axios.post(`/api/bchat/history-transfers/${transferUuid}/upload`, payload, {
+      headers: { 'X-Bchat-Device-Uuid': deviceUuid },
+    });
+    return res.data;
+  } catch (err) {
+    throw parseBchatApiError(err);
+  }
 }
 
 export async function downloadHistoryTransferSnapshot(
   transferUuid: string,
   deviceUuid: string
 ): Promise<{ data: DownloadSnapshotResponseData }> {
-  const res = await axios.get(`/api/bchat/history-transfers/${transferUuid}/download`, {
-    headers: { 'X-Bchat-Device-Uuid': deviceUuid },
-  });
-  return res.data;
+  try {
+    const res = await axios.get(`/api/bchat/history-transfers/${transferUuid}/download`, {
+      headers: { 'X-Bchat-Device-Uuid': deviceUuid },
+    });
+    return res.data;
+  } catch (err) {
+    throw parseBchatApiError(err);
+  }
 }
 
 export async function completeHistoryTransfer(
@@ -116,10 +139,14 @@ export async function completeHistoryTransfer(
   },
   deviceUuid: string
 ): Promise<{ data: BchatHistoryTransferData }> {
-  const res = await axios.post(`/api/bchat/history-transfers/${transferUuid}/complete`, payload, {
-    headers: { 'X-Bchat-Device-Uuid': deviceUuid },
-  });
-  return res.data;
+  try {
+    const res = await axios.post(`/api/bchat/history-transfers/${transferUuid}/complete`, payload, {
+      headers: { 'X-Bchat-Device-Uuid': deviceUuid },
+    });
+    return res.data;
+  } catch (err) {
+    throw parseBchatApiError(err);
+  }
 }
 
 export async function cancelHistoryTransfer(
@@ -127,11 +154,15 @@ export async function cancelHistoryTransfer(
   reason: string,
   deviceUuid: string
 ): Promise<{ data: BchatHistoryTransferData }> {
-  const res = await axios.post(
-    `/api/bchat/history-transfers/${transferUuid}/cancel`,
-    { reason },
-    { headers: { 'X-Bchat-Device-Uuid': deviceUuid } }
-  );
-  return res.data;
+  try {
+    const res = await axios.post(
+      `/api/bchat/history-transfers/${transferUuid}/cancel`,
+      { reason },
+      { headers: { 'X-Bchat-Device-Uuid': deviceUuid } }
+    );
+    return res.data;
+  } catch (err) {
+    throw parseBchatApiError(err);
+  }
 }
 

@@ -26,6 +26,7 @@ import {
   withReadwriteTransaction,
   idbGet,
   idbPut,
+  idbGetAll,
   BchatStorageError,
   BchatTransactionError,
 } from './bchat-idb-core';
@@ -245,6 +246,7 @@ export interface JoinGroupAndConsumeParams {
   expectedPreviousRevision: string | null;
   ciphersuiteId?: number;
   fencing: FencingCredentials;
+  allowRecoveryReuse?: boolean;
 }
 
 export interface JoinGroupAndConsumeResult extends PersistGroupStateResult {
@@ -1403,6 +1405,17 @@ export async function getPendingPrivateKeyPackage(
 }
 
 /**
+ * Mengambil seluruh PendingKeyPackageRecord untuk perangkat tertentu.
+ */
+export async function listPendingKeyPackages(
+  deviceUuid: string
+): Promise<PendingKeyPackageRecord[]> {
+  const canonicalDeviceUuid = normalizeCanonicalUuid(deviceUuid, 'deviceUuid');
+  const all = await idbGetAll<PendingKeyPackageRecord>(BCAT_STORES.PENDING_KEY_PACKAGES);
+  return all.filter((r) => r.device_uuid?.toLowerCase() === canonicalDeviceUuid.toLowerCase());
+}
+
+/**
  * Membaca tab lease aktif untuk perangkat tertentu dari IndexedDB.
  */
 export async function getActiveTabLease(
@@ -1715,7 +1728,7 @@ export async function joinGroupAndConsumePackage(
           throw explicitAbortError;
         }
 
-        if (pendingRec.metadata?.status === 'consumed') {
+        if (pendingRec.metadata?.status === 'consumed' && !params.allowRecoveryReuse) {
           explicitAbortError = new BchatPersistenceError(
             `Pending KeyPackage dengan hash [${params.keyPackageHash}] sudah pernah dikonsumsi (CONSUMED). Anti-reuse triggered.`
           );
@@ -1793,6 +1806,7 @@ export async function joinGroupAndConsumePackage(
           status: 'consumed',
           consumed_at: now,
           room_uuid: canonicalRoomUuid,
+          updated_at: now,
         };
         pendingStore.put(pendingRec);
       }

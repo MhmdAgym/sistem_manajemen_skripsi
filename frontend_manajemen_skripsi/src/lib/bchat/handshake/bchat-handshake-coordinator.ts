@@ -28,6 +28,7 @@
 import {
   fetchRoomDetail,
   fetchPartnerKeyPackage,
+  fetchDeviceKeyPackage,
   publishWelcome,
   fetchOrRotateWelcomeChallenge,
   submitWelcomeAck,
@@ -36,6 +37,11 @@ import {
   publishSessionWelcome,
   fetchSessionWelcomeChallenge,
   submitSessionWelcomeAck,
+  publishCommitRelay,
+  fetchPendingCommits,
+  submitCommitAck,
+  submitCommitWelcomeAck,
+  getDeviceStatus,
   BchatApiError,
 } from '@/lib/bchat/api/bchat-api-client';
 import type {
@@ -50,6 +56,8 @@ import type {
   BchatSessionWelcomePublishRequest,
   BchatSessionWelcomeChallengeResponseData,
   BchatSessionWelcomeAckRequest,
+  BchatCommitItem,
+  BchatPublishCommitRequest,
 } from '@/lib/bchat/api/bchat-api-types';
 import type { BchatWorkerClient } from '@/lib/bchat/bchat-poc-rpc';
 import type {
@@ -61,6 +69,8 @@ import type {
   CommitAddMemberResult,
   JoinWelcomePayload,
   JoinWelcomeResult,
+  ProcessCommitPayload,
+  ProcessCommitResult,
   UpdateOutboxStatusPayload,
   UpdateOutboxStatusResult,
   GetRoomOutboxPayload,
@@ -71,14 +81,18 @@ import type {
   FencingRpcInput,
 } from '@/lib/bchat/bchat-poc-types';
 import { getActiveDeviceIdentityKey } from '@/lib/bchat/device/bchat-device-registration';
-import { withReadonlyTransaction } from '@/lib/bchat/storage/bchat-idb-core';
+import { normalizeCanonicalUuid } from '@/lib/bchat/storage/bchat-storage-aad';
+import { withReadonlyTransaction, idbGet } from '@/lib/bchat/storage/bchat-idb-core';
+import { listPendingKeyPackages } from '@/lib/bchat/storage/bchat-mls-persistence';
 import {
   BCAT_STORES,
   type PendingKeyPackageRecord,
+  type GroupStateRecord,
 } from '@/lib/bchat/storage/bchat-idb-schema';
 import {
   buildWelcomeAckPayload,
   signWelcomeAckWithDeviceIdentity,
+  signCanonicalCommitAck,
   CANONICAL_UUID_REGEX,
   DECIMAL_STRING_REGEX,
   SHA256_HEX_REGEX,
@@ -472,7 +486,8 @@ export function shouldPollIncomingHistoryTransfers(
     typeof ctx.userId === 'number' &&
     ctx.userId > 0 &&
     ctx.onboardingGate === 'PASSED' &&
-    ctx.connectionStatus === 'CONNECTED' &&
+    ctx.connectionStatus !== 'ERROR' &&
+    ctx.connectionStatus !== 'INITIALIZING' &&
     ctx.hasTransferSourceDevices === true &&
     ctx.hasLocalGroupState === true &&
     ctx.isUnrecoverableActiveRoom === false &&
@@ -2639,3 +2654,517 @@ export async function completePendingSessionHandshakeFlow(
     'SESSION_WELCOME_ACK_EXHAUSTED'
   );
 }
+
+// -----------------------------------------------------------------------------
+// MULTI-DEVICE COMMIT RELAY COORDINATOR (OPSI B)
+// -----------------------------------------------------------------------------
+
+export interface MultiDeviceCommitRelayInitiateResult {
+  initiated: boolean;
+  reason?: string;
+  commitUuid?: string;
+  fromEpoch?: number;
+  toEpoch?: number;
+  addedDeviceUuid?: string;
+  status?: string;
+}
+
+export interface ProcessPendingCommitRelayResult {
+  processed: boolean;
+  reason?: string;
+  commitUuid?: string;
+  type?: 'COMMIT_ACK' | 'WELCOME_ACK';
+  isComplete?: boolean;
+  status?: string;
+  newEpoch?: number;
+}
+
+/**
+ * Memeriksa keberadaan perangkat kedua yang aktif dan tepercaya, lalu menerbitkan
+ * Commit Add Member MLS untuk mengaktifkannya secara simultan (Opsi B).
+ */
+export async function checkAndInitiateMultiDeviceCommitRelayFlow(
+  workerClient: BchatWorkerClient,
+  roomUuid: string,
+  activeDeviceUuid: string,
+  options?: {
+    fencing?: FencingRpcInput;
+    userId?: number;
+  }
+): Promise<MultiDeviceCommitRelayInitiateResult> {
+  const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid');
+  const cleanActiveDevUuid = normalizeCanonicalUuid(activeDeviceUuid, 'activeDeviceUuid');
+
+  // 1. Verifikasi bahwa perangkat saat ini memiliki GroupState aktif
+  const restoreRes = await workerClient.restoreGroupState({
+    deviceUuid: cleanActiveDevUuid,
+    roomUuid: cleanRoomUuid,
+    fencing: options?.fencing,
+  });
+
+  if (restoreRes.status !== 'FOUND') {
+    return { initiated: false, reason: 'LOCAL_GROUP_STATE_NOT_FOUND' };
+  }
+
+  // 2. Ambil detail room untuk mengetahui epoch aktif saat ini
+  const roomRes = await fetchRoomDetail(cleanRoomUuid);
+  const roomDetail = roomRes.data;
+  if (!roomDetail || roomDetail.status !== 'ACTIVE') {
+    return { initiated: false, reason: 'ROOM_NOT_ACTIVE' };
+  }
+
+  // 3. Ambil riwayat commit MLS room lengkap dan cek status transisi aktif
+  // Invarian: Jangan membuat commit ganda saat transisi sedang berlangsung (PENDING_ACKS)
+  // dan jangan menambahkan perangkat yang secara kriptografis sudah menjadi anggota grup MLS.
+  const currentEpochNum = parseInt(roomDetail.current_epoch, 10);
+  let allCommits: BchatCommitItem[] = [];
+  try {
+    const pendingCommitsRes = await fetchPendingCommits(cleanRoomUuid, cleanActiveDevUuid, 0);
+    allCommits = pendingCommitsRes.data || [];
+  } catch (commitsErr: any) {
+    // FAIL-CLOSED: Jika riwayat keanggotaan/commit tidak dapat diverifikasi, gagalkan secara aman
+    return {
+      initiated: false,
+      reason: `MEMBERSHIP_VERIFICATION_FAILED: ${commitsErr?.message || 'Gagal memverifikasi riwayat commit room'}`,
+    };
+  }
+
+  const hasPendingTransition = allCommits.some(
+    (c) => c.status === 'PENDING_ACKS'
+  );
+  if (hasPendingTransition) {
+    return { initiated: false, reason: 'TRANSITION_ALREADY_PENDING' };
+  }
+
+  // FAIL-CLOSED: Jika room sudah berada pada epoch > 1 tetapi riwayat commit kosong
+  if (currentEpochNum > 1 && allCommits.length === 0) {
+    return {
+      initiated: false,
+      reason: 'MEMBERSHIP_VERIFICATION_FAILED: Room telah berada pada epoch > 1 tetapi riwayat commit tidak ditemukan.',
+    };
+  }
+
+  // 4. Periksa daftar perangkat akun pengguna ini melalui getDeviceStatus
+  const devStatusRes = await getDeviceStatus();
+  const activeList =
+    devStatusRes.data.active_devices ??
+    (devStatusRes.data.active_device ? [devStatusRes.data.active_device] : []);
+
+  // Cari perangkat sekunder yang sudah ACTIVE dan is_trusted === true
+  const candidateSecondaryDevices = activeList.filter(
+    (d) =>
+      d.status === 'ACTIVE' &&
+      d.is_trusted === true &&
+      d.device_uuid.toLowerCase() !== cleanActiveDevUuid.toLowerCase()
+  );
+
+  if (candidateSecondaryDevices.length === 0) {
+    return { initiated: false, reason: 'NO_SECONDARY_TRUSTED_DEVICE' };
+  }
+
+  // 5. Verifikasi Keanggotaan MLS Aktual: Himpun seluruh identitas perangkat anggota MLS room
+  const existingMlsMemberDeviceUuids = new Set<string>();
+  existingMlsMemberDeviceUuids.add(cleanActiveDevUuid.toLowerCase());
+
+  // Anggota dari riwayat commit yang telah disahkan (status ACTIVE)
+  for (const c of allCommits) {
+    if (c.status === 'ACTIVE') {
+      if (c.sender_device_uuid) {
+        existingMlsMemberDeviceUuids.add(c.sender_device_uuid.toLowerCase());
+      }
+      if (c.added_device_uuid) {
+        existingMlsMemberDeviceUuids.add(c.added_device_uuid.toLowerCase());
+      }
+    }
+  }
+
+  // Anggota dari penyimpanan lokal IndexedDB (jika perangkat sekunder ada di IDB yang sama)
+  for (const cand of candidateSecondaryDevices) {
+    const candUuid = cand.device_uuid.toLowerCase();
+    try {
+      const localGs = await idbGet<GroupStateRecord>(BCAT_STORES.GROUP_STATES, [candUuid, cleanRoomUuid]);
+      if (localGs && localGs.status === 'active') {
+        existingMlsMemberDeviceUuids.add(candUuid);
+      }
+    } catch {
+      // Abaikan jika IDB get gagal (fail-closed: tidak menganggap perangkat sebagai anggota jika get gagal)
+    }
+  }
+
+  // Filter perangkat sekunder yang benar-benar BELUM menjadi anggota MLS
+  const unaddedCandidates = candidateSecondaryDevices.filter(
+    (d) => !existingMlsMemberDeviceUuids.has(d.device_uuid.toLowerCase())
+  );
+
+  if (unaddedCandidates.length === 0) {
+    return {
+      initiated: false,
+      reason: 'ALL_TRUSTED_DEVICES_ALREADY_MEMBERS',
+    };
+  }
+
+  // Ambil kandidat pertama yang belum ditambahkan
+  const targetDevice = unaddedCandidates[0];
+  const targetDeviceUuid = normalizeCanonicalUuid(targetDevice.device_uuid, 'targetDeviceUuid');
+
+  // 6. Ambil KeyPackage aktif milik target device
+  let kpRes;
+  try {
+    kpRes = await fetchDeviceKeyPackage(cleanRoomUuid, targetDeviceUuid);
+  } catch (kpErr: any) {
+    return {
+      initiated: false,
+      reason: `KEY_PACKAGE_UNAVAILABLE: ${kpErr?.message || 'KeyPackage tidak tersedia untuk perangkat kedua'}`,
+    };
+  }
+
+  const keyPackageData = kpRes.data;
+  if (!keyPackageData || !keyPackageData.key_package_data || !keyPackageData.key_package_hash) {
+    return { initiated: false, reason: 'KEY_PACKAGE_PAYLOAD_INVALID' };
+  }
+
+  // 6. Panggil Worker COMMIT_ADD_MEMBER untuk menghasilkan MLS Commit & Welcome wireformat
+  const commitRes = await workerClient.sendRequest<CommitAddMemberPayload, CommitAddMemberResult>(
+    'COMMIT_ADD_MEMBER',
+    {
+      partnerKeyPackageBase64: keyPackageData.key_package_data,
+      roomUuid: cleanRoomUuid,
+      deviceUuid: cleanActiveDevUuid,
+      fencing: options?.fencing,
+    }
+  );
+
+  if (!commitRes || !commitRes.commitWireBase64 || !commitRes.welcomeWireBase64) {
+    throw new BchatHandshakeCoordinatorError(
+      'Worker gagal menghasilkan Commit & Welcome wireformat untuk penambahan perangkat kedua.',
+      'COMMIT_GENERATION_FAILED'
+    );
+  }
+
+  const targetEpochNum = parseInt(commitRes.epoch, 10);
+
+  // 7. Terbitkan Commit ke backend (status PENDING_ACKS)
+  const publishRes = await publishCommitRelay(cleanRoomUuid, {
+    device_uuid: cleanActiveDevUuid,
+    from_epoch: currentEpochNum,
+    to_epoch: targetEpochNum,
+    commit_wire_base64: commitRes.commitWireBase64,
+    welcome_wire_base64: commitRes.welcomeWireBase64,
+    added_device_uuid: targetDeviceUuid,
+    key_package_hash: keyPackageData.key_package_hash,
+  });
+
+  return {
+    initiated: true,
+    commitUuid: publishRes.data.commit_uuid,
+    fromEpoch: currentEpochNum,
+    toEpoch: targetEpochNum,
+    addedDeviceUuid: targetDeviceUuid,
+    status: publishRes.data.status,
+  };
+}
+
+/**
+ * Mengambil dan memproses Commit tertunda (baik sebagai perangkat lama yang memproses Commit,
+ * maupun sebagai perangkat baru yang memproses Welcome).
+ */
+export async function processPendingCommitRelayFlow(
+  workerClient: BchatWorkerClient,
+  roomUuid: string,
+  activeDeviceUuid: string,
+  options?: {
+    fencing?: FencingRpcInput;
+    userId?: number;
+    activeSessionUuid?: string;
+  }
+): Promise<ProcessPendingCommitRelayResult> {
+  const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid');
+  const cleanActiveDevUuid = normalizeCanonicalUuid(activeDeviceUuid, 'activeDeviceUuid');
+
+  // 1. Ambil daftar commit tertunda untuk perangkat ini
+  let pendingCommitsRes;
+  try {
+    pendingCommitsRes = await fetchPendingCommits(cleanRoomUuid, cleanActiveDevUuid);
+  } catch (err: any) {
+    return { processed: false, reason: `FETCH_COMMITS_FAILED: ${err?.message}` };
+  }
+
+  const commits = pendingCommitsRes.data || [];
+  if (commits.length === 0) {
+    return { processed: false, reason: 'NO_PENDING_COMMITS' };
+  }
+
+  // Cari commit yang berstatus PENDING_ACKS atau belum di-ACK
+  const targetCommit = commits.find((c) => c.status === 'PENDING_ACKS') || commits[0];
+  if (!targetCommit) {
+    return { processed: false, reason: 'NO_APPLICABLE_COMMIT' };
+  }
+
+  const commitUuid = targetCommit.commit_uuid;
+  const toEpoch = parseInt(targetCommit.to_epoch, 10);
+
+  // Resolusi sessionUuid untuk canonical signature
+  let sessionUuid = options?.activeSessionUuid;
+  if (!sessionUuid) {
+    try {
+      const roomRes = await fetchRoomDetail(cleanRoomUuid);
+      sessionUuid = roomRes.data?.active_session?.session_uuid;
+    } catch {
+      // Abaikan
+    }
+  }
+  if (!sessionUuid) {
+    sessionUuid = '00000000-0000-0000-0000-000000000000';
+  }
+
+  const isAddedDevice =
+    !!targetCommit.added_device_uuid &&
+    targetCommit.added_device_uuid.toLowerCase() === cleanActiveDevUuid.toLowerCase();
+
+  // KASUS A: Perangkat ini adalah PERANGKAT BARU (Sasaran Penambahan via Welcome)
+  if (isAddedDevice) {
+    // Ambil welcome wire bytes dari commit record
+    const welcomeWire = (targetCommit as any).welcome_wire_base64;
+    if (!welcomeWire) {
+      return { processed: false, reason: 'WELCOME_WIRE_MISSING' };
+    }
+
+    // Panggil Worker JOIN_WELCOME
+    const joinRes = await workerClient.sendRequest<JoinWelcomePayload, JoinWelcomeResult>(
+      'JOIN_WELCOME',
+      {
+        welcomeWireBase64: welcomeWire,
+        roomUuid: cleanRoomUuid,
+        deviceUuid: cleanActiveDevUuid,
+        fencing: options?.fencing,
+      }
+    );
+
+    if (!joinRes) {
+      throw new BchatHandshakeCoordinatorError(
+        'Worker JOIN_WELCOME gagal memproses pesan Welcome.',
+        'JOIN_WELCOME_FAILED'
+      );
+    }
+
+    // Susun canonical payload WELCOME_ACK dan tanda tangani
+    const canonicalPayload = `WELCOME_ACK:${cleanRoomUuid}:${sessionUuid}:${commitUuid}:${cleanActiveDevUuid}:${toEpoch}`;
+    const signatureHex = await signCanonicalCommitAck(canonicalPayload, cleanActiveDevUuid);
+
+    // Kirim WELCOME_ACK ke backend
+    const ackRes = await submitCommitWelcomeAck(cleanRoomUuid, commitUuid, {
+      device_uuid: cleanActiveDevUuid,
+      acked_epoch: toEpoch,
+      signature: signatureHex,
+    });
+
+    return {
+      processed: true,
+      commitUuid,
+      type: 'WELCOME_ACK',
+      isComplete: ackRes.data.is_complete,
+      status: ackRes.data.status,
+      newEpoch: toEpoch,
+    };
+  }
+
+  // KASUS B: Perangkat ini adalah PERANGKAT LAMA (Anggota MLS yang memproses Commit)
+  else {
+    const commitWire = targetCommit.commit_wire_base64;
+    if (!commitWire) {
+      return { processed: false, reason: 'COMMIT_WIRE_MISSING' };
+    }
+
+    // Panggil Worker PROCESS_COMMIT
+    const procRes = await workerClient.sendRequest<ProcessCommitPayload, ProcessCommitResult>(
+      'PROCESS_COMMIT',
+      {
+        commitWireBase64: commitWire,
+        roomUuid: cleanRoomUuid,
+        deviceUuid: cleanActiveDevUuid,
+        fencing: options?.fencing,
+        expectedFromEpoch: targetCommit.from_epoch,
+        expectedToEpoch: targetCommit.to_epoch,
+        commitUuid,
+      }
+    );
+
+    if (!procRes) {
+      throw new BchatHandshakeCoordinatorError(
+        'Worker PROCESS_COMMIT gagal memproses pesan Commit.',
+        'PROCESS_COMMIT_FAILED'
+      );
+    }
+
+    // Susun canonical payload COMMIT_ACK dan tanda tangani
+    const canonicalPayload = `COMMIT_ACK:${cleanRoomUuid}:${sessionUuid}:${commitUuid}:${cleanActiveDevUuid}:${toEpoch}`;
+    const signatureHex = await signCanonicalCommitAck(canonicalPayload, cleanActiveDevUuid);
+
+    // Kirim COMMIT_ACK ke backend
+    const ackRes = await submitCommitAck(cleanRoomUuid, commitUuid, {
+      device_uuid: cleanActiveDevUuid,
+      acked_epoch: toEpoch,
+      signature: signatureHex,
+    });
+
+    return {
+      processed: true,
+      commitUuid,
+      type: 'COMMIT_ACK',
+      isComplete: ackRes.data.is_complete,
+      status: ackRes.data.status,
+      newEpoch: toEpoch,
+    };
+  }
+}
+
+// -----------------------------------------------------------------------------
+// WELCOME RECOVERY FLOW (PEMULIHAN SESI MLS TANPA MUTASI BACKEND)
+// -----------------------------------------------------------------------------
+
+export interface RecoverActiveWelcomeOptions {
+  fencing?: FencingRpcInput;
+  activeSessionUuid?: string;
+  expectedEpoch?: number;
+}
+
+export interface RecoverActiveWelcomeResult {
+  recovered: boolean;
+  reason?: string;
+  epoch?: number;
+  commitUuid?: string;
+}
+
+/**
+ * Memulihkan sesi MLS aktif (Welcome Recovery) untuk perangkat yang kehilangan
+ * GroupState lokal namun masih memiliki private KeyPackage yang cocok.
+ * Operasi ini murni pemulihan lokal; tidak menerbitkan Commit, Welcome, atau ACK baru ke backend.
+ */
+export async function recoverActiveWelcomeFlow(
+  workerClient: BchatWorkerClient,
+  roomUuid: string,
+  activeDeviceUuid: string,
+  options?: RecoverActiveWelcomeOptions
+): Promise<RecoverActiveWelcomeResult> {
+  const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid');
+  const cleanActiveDevUuid = normalizeCanonicalUuid(activeDeviceUuid, 'activeDeviceUuid');
+
+  // 1. Ambil daftar commit aktif dengan include_active_welcome = true
+  let commitsRes;
+  try {
+    commitsRes = await fetchPendingCommits(cleanRoomUuid, cleanActiveDevUuid, undefined, true);
+  } catch (err: any) {
+    return { recovered: false, reason: `FETCH_COMMITS_FAILED: ${err?.message}` };
+  }
+
+  const commits = commitsRes.data || [];
+  if (commits.length === 0) {
+    return { recovered: false, reason: 'NO_COMMITS_RETURNED' };
+  }
+
+  // Cari commit aktif di mana perangkat ini adalah added_device dan memiliki welcome_wire_base64
+  const targetCommit = commits.find(
+    (c) =>
+      !!c.added_device_uuid &&
+      c.added_device_uuid.toLowerCase() === cleanActiveDevUuid.toLowerCase() &&
+      c.status === 'ACTIVE' &&
+      !!(c as any).welcome_wire_base64
+  );
+
+  if (!targetCommit) {
+    return { recovered: false, reason: 'NO_ACTIVE_WELCOME_FOR_DEVICE' };
+  }
+
+  const welcomeWire = (targetCommit as any).welcome_wire_base64;
+  const commitToEpoch = parseInt(targetCommit.to_epoch, 10);
+  const targetKeyPackageHash = (targetCommit as any).key_package_hash?.toLowerCase();
+
+  // 2. Pastikan private KeyPackage yang cocok tersedia secara lokal di IndexedDB
+  const localPackages = await listPendingKeyPackages(cleanActiveDevUuid);
+  if (!localPackages || localPackages.length === 0) {
+    return { recovered: false, reason: 'NO_LOCAL_KEYPACKAGES_FOUND' };
+  }
+
+  const matchedPackage = targetKeyPackageHash
+    ? localPackages.find((p) => p.key_package_hash.toLowerCase() === targetKeyPackageHash)
+    : localPackages[0];
+
+  if (!matchedPackage) {
+    return { recovered: false, reason: 'MATCHING_KEYPACKAGE_NOT_FOUND' };
+  }
+
+  // 3. Kirim Welcome ke MLS Worker untuk diproses secara lokal
+  let joinRes: JoinWelcomeResult;
+  try {
+    joinRes = await workerClient.sendRequest<JoinWelcomePayload, JoinWelcomeResult>(
+      'JOIN_WELCOME',
+      {
+        welcomeWireBase64: welcomeWire,
+        roomUuid: cleanRoomUuid,
+        deviceUuid: cleanActiveDevUuid,
+        keyPackageHash: matchedPackage.key_package_hash,
+        fencing: options?.fencing,
+        isRecovery: true,
+      }
+    );
+  } catch (workerErr: any) {
+    return { recovered: false, reason: `WORKER_JOIN_FAILED: ${workerErr?.message}` };
+  }
+
+  if (!joinRes || !joinRes.epoch) {
+    return { recovered: false, reason: 'INVALID_JOIN_RESULT' };
+  }
+
+  let recoveredEpoch = parseInt(joinRes.epoch, 10);
+
+  // Validasi hasil pemrosesan: epoch hasil join harus cocok dengan to_epoch commit
+  if (recoveredEpoch !== commitToEpoch) {
+    return {
+      recovered: false,
+      reason: `EPOCH_MISMATCH: recovered ${recoveredEpoch} vs commit ${commitToEpoch}`,
+    };
+  }
+
+  // 4. Jika room telah maju ke epoch yang lebih tinggi (room.current_epoch > recoveredEpoch),
+  // kejar perubahan epoch melalui transisi MLS yang sah (PROCESS_COMMIT berurutan).
+  if (typeof options?.expectedEpoch === 'number' && options.expectedEpoch > recoveredEpoch) {
+    try {
+      const laterCommitsRes = await fetchPendingCommits(cleanRoomUuid, cleanActiveDevUuid, recoveredEpoch);
+      const subsequentCommits = (laterCommitsRes.data || []).sort(
+        (a, b) => parseInt(a.to_epoch, 10) - parseInt(b.to_epoch, 10)
+      );
+
+      for (const nextCommit of subsequentCommits) {
+        if (!nextCommit.commit_wire_base64) continue;
+        const procRes = await workerClient.sendRequest<ProcessCommitPayload, ProcessCommitResult>(
+          'PROCESS_COMMIT',
+          {
+            commitWireBase64: nextCommit.commit_wire_base64,
+            roomUuid: cleanRoomUuid,
+            deviceUuid: cleanActiveDevUuid,
+            fencing: options?.fencing,
+            expectedFromEpoch: nextCommit.from_epoch,
+            expectedToEpoch: nextCommit.to_epoch,
+            commitUuid: nextCommit.commit_uuid,
+          }
+        );
+        if (procRes && procRes.epoch) {
+          recoveredEpoch = parseInt(procRes.epoch, 10);
+        }
+      }
+    } catch (catchUpErr: any) {
+      return { recovered: false, reason: `EPOCH_CATCHUP_FAILED: ${catchUpErr?.message}` };
+    }
+  }
+
+  return {
+    recovered: true,
+    epoch: recoveredEpoch,
+    commitUuid: targetCommit.commit_uuid,
+  };
+}
+
+if (typeof window !== 'undefined') {
+  (window as any).recoverActiveWelcomeFlow = recoverActiveWelcomeFlow;
+}
+

@@ -7,6 +7,7 @@ namespace App\Services;
 use App\Events\BchatMessageSent;
 use App\Exceptions\BchatMessageException;
 use App\Models\BchatAttachment;
+use App\Models\BchatCommit;
 use App\Models\BchatMessage;
 use App\Models\BchatRoom;
 use App\Models\BchatRoomSession;
@@ -14,6 +15,7 @@ use App\Models\User;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Throwable;
 
@@ -172,6 +174,23 @@ class BchatMessageService
                         'current_sequence'   => (int) $lockedRoom->current_sequence,
                         'activated_at'       => now(),
                     ]);
+                }
+
+                // A.2 Validasi Gate Transisi Dua Fase (Two-Phase Commit Relay)
+                // Jika ruang obrolan sedang dalam proses transisi keanggotaan/epoch (PENDING_ACKS),
+                // pengiriman pesan DIBLOKIR secara fail-closed hingga seluruh perangkat memberikan ACK valid.
+                if (Schema::hasTable('bchat_commits')) {
+                    $pendingCommit = BchatCommit::where('room_id', $lockedRoom->id)
+                        ->where('status', 'PENDING_ACKS')
+                        ->first();
+
+                    if ($pendingCommit) {
+                        throw new BchatMessageException(
+                            "Ruang obrolan sedang dalam proses transisi epoch [{$pendingCommit->from_epoch} -> {$pendingCommit->to_epoch}]. Pengiriman pesan ditangguhkan hingga seluruh anggota menyelesaikan sinkronisasi.",
+                            'ROOM_TRANSITIONING_EPOCH',
+                            409
+                        );
+                    }
                 }
 
                 // B. Pengecekan Idempotensi (uk_msg_idempotency: room_id, sender_id, message_uuid)

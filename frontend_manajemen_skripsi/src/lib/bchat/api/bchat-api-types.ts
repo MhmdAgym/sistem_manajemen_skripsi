@@ -550,4 +550,68 @@ export interface BchatPairingApprovalResultData {
     approved_at: string
 }
 
+// -----------------------------------------------------------------------------
+// 15. COMMIT RELAY (MULTI-DEVICE OPSI B)
+// -----------------------------------------------------------------------------
+
+export interface BchatPublishCommitRequest {
+    device_uuid: string
+    from_epoch: number
+    to_epoch: number
+    commit_wire_base64: string
+    added_device_uuid?: string
+    key_package_hash?: string
+    welcome_wire_base64?: string
+    commit_uuid?: string
+}
+
+export interface BchatPublishCommitResponseData {
+    commit_uuid: string
+    room_uuid: string
+    from_epoch: string
+    to_epoch: string
+    commit_hash: string
+    status: 'PENDING_ACKS' | 'ACTIVE' | 'ABORTED' | 'SUPERSEDED'
+    added_device_uuid?: string | null
+    welcome_operation_uuid?: string | null
+    created_at?: string | null
+}
+
+export interface BchatCommitItem {
+    commit_uuid: string
+    from_epoch: string
+    to_epoch: string
+    commit_wire_base64: string
+    welcome_wire_base64?: string | null
+    key_package_hash?: string | null
+    commit_hash: string
+    status: 'PENDING_ACKS' | 'ACTIVE' | 'ABORTED' | 'SUPERSEDED'
+    sender_device_uuid?: string | null
+    added_device_uuid?: string | null
+    welcome_operation_uuid?: string | null
+    created_at?: string | null
+}
+
+export interface BchatCommitAckRequest {
+    device_uuid: string
+    acked_epoch: number
+    signature: string
+}
+
+export interface BchatCommitAckResponseData {
+    success: boolean
+    is_replayed?: boolean
+    status: 'PENDING_ACKS' | 'ACTIVE'
+    is_complete: boolean
+    message: string
+}
+
+export interface BchatDeviceKeyPackageResponseData {
+    device_uuid: string
+    user_id: string
+    key_package_hash: string
+    key_package_data: string
+}
+
+
 

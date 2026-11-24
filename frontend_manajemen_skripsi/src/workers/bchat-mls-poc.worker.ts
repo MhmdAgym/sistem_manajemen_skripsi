@@ -29,6 +29,7 @@ import { createApplicationMessage } from '../../node_modules/ts-mls/dist/src/cre
 import { processMessage } from '../../node_modules/ts-mls/dist/src/processMessages.js';
 import { mlsMessageEncoder, mlsMessageDecoder } from '../../node_modules/ts-mls/dist/src/message.js';
 import { mlsExporter } from '../../node_modules/ts-mls/dist/src/keySchedule.js';
+import { acceptAll } from '../../node_modules/ts-mls/dist/src/incomingMessageAction.js';
 import { encode } from '../../node_modules/ts-mls/dist/src/codec/tlsEncoder.js';
 import { decode } from '../../node_modules/ts-mls/dist/src/codec/tlsDecoder.js';
 import { defaultCredentialTypes } from '../../node_modules/ts-mls/dist/src/defaultCredentialType.js';
@@ -36,6 +37,7 @@ import { defaultProposalTypes } from '../../node_modules/ts-mls/dist/src/default
 import { wireformats } from '../../node_modules/ts-mls/dist/src/wireformat.js';
 import { bytesToBase64, base64ToBytes } from '../../node_modules/ts-mls/dist/src/util/byteArray.js';
 import { unsafeTestingAuthenticationService } from '../../node_modules/ts-mls/dist/src/authenticationService.js';
+import { defaultClientConfig } from '../../node_modules/ts-mls/dist/src/clientConfig.js';
 import type { MlsContext } from '../../node_modules/ts-mls/dist/src/mlsContext.js';
 import type { CiphersuiteImpl } from '../../node_modules/ts-mls/dist/src/crypto/ciphersuite.js';
 import { makeGenericHpke } from '../../node_modules/ts-mls/dist/src/crypto/implementation/hpke.js';
@@ -51,6 +53,7 @@ import {
   persistGroupStateAndProtocolOutbox,
   savePendingKeyPackage,
   getPendingPrivateKeyPackage,
+  listPendingKeyPackages,
   joinGroupAndConsumePackage,
   getOutboxMessage,
   updateOutboxMessageStatus,
@@ -80,6 +83,8 @@ import type {
   CommitAddMemberResult,
   JoinWelcomePayload,
   JoinWelcomeResult,
+  ProcessCommitPayload,
+  ProcessCommitResult,
   EncryptMessagePayload,
   EncryptMessageResult,
   DecryptMessagePayload,
@@ -152,6 +157,18 @@ function areUint8ArraysEqual(a: Uint8Array, b: Uint8Array): boolean {
   }
   return true;
 }
+
+const multiDeviceClientConfig = {
+  ...defaultClientConfig,
+  keyPackageEqualityConfig: {
+    compareKeyPackages(a: any, b: any) {
+      return areUint8ArraysEqual(a.leafNode.signaturePublicKey, b.leafNode.signaturePublicKey);
+    },
+    compareKeyPackageToLeafNode(a: any, b: any) {
+      return areUint8ArraysEqual(a.leafNode.signaturePublicKey, b.signaturePublicKey);
+    },
+  },
+};
 
 /**
  * Konversi string UUID kanonis (36 karakter bertanda hubung) ke 16 byte biner mentah (Big-Endian).
@@ -390,6 +407,7 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
         mlsContext = {
           cipherSuite: cs,
           authService: unsafeTestingAuthenticationService,
+          clientConfig: multiDeviceClientConfig as any,
         };
 
         currentRole = initPayload.role;
@@ -642,14 +660,14 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
       }
 
       // ---------------------------------------------------------------------
-      // 4. COMMIT_ADD_MEMBER: Commit Add Proposal & Buat Welcome (Mahasiswa)
+      // 4. COMMIT_ADD_MEMBER: Commit Add Proposal & Buat Welcome (Mahasiswa / Dosen)
       // ---------------------------------------------------------------------
       case 'COMMIT_ADD_MEMBER': {
         if (!mlsContext || !clientState) {
-          throw new Error('Grup MLS belum dibuat pada peer mahasiswa.');
+          throw new Error('Grup MLS belum dibuat pada peer aktif.');
         }
-        if (currentRole !== 'mahasiswa') {
-          throw new Error('Hanya peer mahasiswa yang diizinkan memanggil COMMIT_ADD_MEMBER.');
+        if (currentRole !== 'mahasiswa' && currentRole !== 'dosen') {
+          throw new Error('Hanya peer aktif yang diizinkan memanggil COMMIT_ADD_MEMBER.');
         }
 
         const commitPayload = payload as CommitAddMemberPayload;
@@ -794,14 +812,14 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
       }
 
       // ---------------------------------------------------------------------
-      // 5. JOIN_WELCOME: Dosen bergabung ke grup dari Welcome
+      // 5. JOIN_WELCOME: Peer bergabung ke grup dari Welcome (Dosen / Mahasiswa)
       // ---------------------------------------------------------------------
       case 'JOIN_WELCOME': {
         if (!mlsContext) {
-          throw new Error('MLS context belum diinisialisasi pada peer dosen.');
+          throw new Error('MLS context belum diinisialisasi pada peer.');
         }
-        if (currentRole !== 'dosen') {
-          throw new Error('Hanya peer dosen yang diizinkan memanggil JOIN_WELCOME.');
+        if (currentRole !== 'dosen' && currentRole !== 'mahasiswa') {
+          throw new Error('Hanya peer terdaftar yang diizinkan memanggil JOIN_WELCOME.');
         }
 
         const joinPayload = payload as JoinWelcomePayload;
@@ -847,16 +865,29 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
           keyPkgHash = await computeSha256Hex(publicBytes);
         }
 
+        // Jika keyPkgHash belum disediakan, cari di pending_key_packages lokal
+        if (!keyPkgHash) {
+          const pendingList = await listPendingKeyPackages(canonicalDeviceUuid);
+          if (pendingList.length > 0) {
+            const candidate = joinPayload.isRecovery
+              ? pendingList[0]
+              : pendingList.find((p) => p.metadata?.status !== 'consumed') || pendingList[0];
+            if (candidate) {
+              keyPkgHash = candidate.key_package_hash;
+            }
+          }
+        }
+
         if (!keyPkgHash) {
           throw new Error('JOIN_WELCOME: keyPackageHash tidak ditemukan pada payload maupun memori lokal.');
         }
 
-        // Verifikasi PrivateKeyPackage DURABLE di IndexedDB (wajib tersimpan durable dan belum consumed)
+        // Verifikasi PrivateKeyPackage DURABLE di IndexedDB (wajib tersimpan durable)
         const loaded = await getPendingPrivateKeyPackage(canonicalDeviceUuid, keyPkgHash);
         if (!loaded) {
           throw new Error(`JOIN_WELCOME: Pending KeyPackage [${keyPkgHash}] tidak ditemukan pada pending_key_packages durable storage.`);
         }
-        if (loaded.status === 'consumed') {
+        if (loaded.status === 'consumed' && !joinPayload.isRecovery) {
           throw new Error(`JOIN_WELCOME: Pending KeyPackage [${keyPkgHash}] sudah dikonsumsi sebelumnya (anti-reuse).`);
         }
         if (!loaded.publicPackage && !keyPkg?.publicPackage) {
@@ -874,7 +905,7 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
           throw new Error('Pesan wireformat bukan bertipe mls_welcome yang valid.');
         }
 
-        // Dosen bergabung menggunakan privateKeyPackage miliknya sendiri
+        // Dosen/Peer bergabung menggunakan privateKeyPackage miliknya sendiri
         const candidateState = await joinGroup({
           context: mlsContext,
           welcome: (decodedMsg as any).welcome,
@@ -886,6 +917,13 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
         const roomUuidFromGroup = new TextDecoder().decode(candidateState.groupContext.groupId);
         const roomUuid = joinPayload.roomUuid ?? currentRoomUuid ?? roomUuidFromGroup;
         const canonicalRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid');
+
+        // Validasi identitas room: GroupId di Welcome WAJIB sama dengan roomUuid target
+        if (roomUuidFromGroup.toLowerCase() !== canonicalRoomUuid.toLowerCase()) {
+          throw new Error(
+            `JOIN_WELCOME: Room UUID di dalam Welcome GroupContext (${roomUuidFromGroup}) tidak cocok dengan target room (${canonicalRoomUuid}).`
+          );
+        }
 
         // SATU transaksi atomik multi-store [tab_leases, group_states, pending_key_packages]
         let newRevision: string;
@@ -900,6 +938,7 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
               ownerToken: fencing.ownerToken,
               generation: fencing.generation,
             },
+            allowRecoveryReuse: !!joinPayload.isRecovery,
           });
           newRevision = persistRes.stateRevision;
           currentDeviceUuid = canonicalDeviceUuid;
@@ -925,6 +964,154 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
         };
 
         const response: WorkerRpcResponse<JoinWelcomeResult> = {
+          requestId,
+          action,
+          success: true,
+          data: result,
+        };
+        self.postMessage(response);
+        break;
+      }
+
+      // ---------------------------------------------------------------------
+      // 5b. PROCESS_COMMIT: Anggota eksisting memproses Commit masuk (RFC 9420)
+      // ---------------------------------------------------------------------
+      case 'PROCESS_COMMIT': {
+        if (!mlsContext || !clientState) {
+          throw new Error('Grup MLS belum diinisialisasi pada perangkat ini.');
+        }
+
+        const procPayload = payload as ProcessCommitPayload;
+        if (!procPayload?.commitWireBase64) {
+          throw new Error('PROCESS_COMMIT membutuhkan commitWireBase64.');
+        }
+
+        // Resolusi roomUuid
+        const roomUuid = procPayload.roomUuid ?? currentRoomUuid;
+        if (!roomUuid) {
+          throw new Error('PROCESS_COMMIT membutuhkan roomUuid.');
+        }
+        const canonicalRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid');
+
+        // Resolusi deviceUuid
+        let deviceUuid: string | null = null;
+        if (procPayload && 'deviceUuid' in procPayload && procPayload.deviceUuid) {
+          deviceUuid = procPayload.deviceUuid;
+        } else {
+          deviceUuid = currentDeviceUuid;
+        }
+        if (!deviceUuid) {
+          throw new Error('PROCESS_COMMIT: identitas device tidak tersedia.');
+        }
+        const canonicalDeviceUuid = normalizeCanonicalUuid(deviceUuid, 'deviceUuid');
+
+        // Resolusi fencing
+        let fencing: FencingCredentials | null = null;
+        if (procPayload && 'fencing' in procPayload && procPayload.fencing?.ownerToken && procPayload.fencing?.generation) {
+          fencing = procPayload.fencing;
+        } else {
+          fencing = currentFencing;
+        }
+        if (!fencing) {
+          throw new Error('PROCESS_COMMIT: fencing credentials tidak tersedia.');
+        }
+
+        const curEpochBig = clientState.groupContext.epoch;
+        const curEpochStr = curEpochBig.toString();
+
+        // Idempotency check: jika expectedToEpoch diberikan dan currentEpoch sudah >= expectedToEpoch
+        if (procPayload.expectedToEpoch && BigInt(curEpochStr) >= BigInt(procPayload.expectedToEpoch)) {
+          const idempotentRes: ProcessCommitResult = {
+            roomUuid: canonicalRoomUuid,
+            deviceUuid: canonicalDeviceUuid,
+            epoch: curEpochStr,
+            stateRevision: currentStateRevision ?? '',
+            actionTaken: 'accept_idempotent',
+          };
+          const response: WorkerRpcResponse<ProcessCommitResult> = {
+            requestId,
+            action,
+            success: true,
+            data: idempotentRes,
+          };
+          self.postMessage(response);
+          break;
+        }
+
+        // Validasi expectedFromEpoch jika dikirim
+        if (procPayload.expectedFromEpoch && curEpochStr !== procPayload.expectedFromEpoch) {
+          throw new Error(`PROCESS_COMMIT: Epoch saat ini [${curEpochStr}] tidak sesuai dengan expectedFromEpoch [${procPayload.expectedFromEpoch}].`);
+        }
+
+        // Dekode commit message dari base64
+        const commitBytes = base64ToBytes(procPayload.commitWireBase64);
+        const decodedCommit = decode(mlsMessageDecoder, commitBytes);
+        if (!decodedCommit) {
+          throw new Error('PROCESS_COMMIT: Gagal mendekode commitWireBase64.');
+        }
+
+        // Proses commit via ts-mls
+        let recvResult;
+        try {
+          recvResult = await processMessage({
+            context: mlsContext,
+            state: clientState,
+            message: decodedCommit as any,
+            callback: acceptAll,
+          });
+        } catch (procErr: any) {
+          throw new Error(`PROCESS_COMMIT gagal memproses pesan Commit: ${procErr?.message || procErr}`);
+        }
+
+        if (recvResult.kind !== 'newState') {
+          throw new Error(`PROCESS_COMMIT: Hasil pemrosesan bukan newState (kind: ${(recvResult as any).kind}).`);
+        }
+
+        const candidateState = recvResult.newState;
+        const newEpochStr = candidateState.groupContext.epoch.toString();
+
+        // Verifikasi bahwa epoch benar-benar bertambah maju
+        if (BigInt(newEpochStr) <= BigInt(curEpochStr)) {
+          throw new Error(`PROCESS_COMMIT: Epoch hasil transisi [${newEpochStr}] tidak lebih besar dari epoch sebelumnya [${curEpochStr}].`);
+        }
+
+        // Simpan GroupState baru secara ATOMIK
+        let newRevision: string;
+        try {
+          const persistRes = await persistGroupState({
+            deviceUuid: canonicalDeviceUuid,
+            roomUuid: canonicalRoomUuid,
+            state: candidateState,
+            expectedPreviousRevision: currentStateRevision,
+            fencing: {
+              ownerToken: fencing.ownerToken,
+              generation: fencing.generation,
+            },
+          });
+          newRevision = persistRes.stateRevision;
+          currentDeviceUuid = canonicalDeviceUuid;
+          currentRoomUuid = canonicalRoomUuid;
+          currentFencing = fencing;
+          currentStateRevision = newRevision;
+        } catch (persistErr: any) {
+          // FAIL-CLOSED: Penguncian sesi mutlak jika persistensi group state gagal
+          lockSession(`PROCESS_COMMIT persistensi gagal: ${persistErr?.message || 'Unknown error'}`);
+          throw persistErr;
+        }
+
+        // Adopsi state hanya setelah persistensi berhasil
+        clientState = candidateState;
+        currentEpoch = newEpochStr;
+
+        const result: ProcessCommitResult = {
+          roomUuid: canonicalRoomUuid,
+          deviceUuid: canonicalDeviceUuid,
+          epoch: newEpochStr,
+          stateRevision: newRevision,
+          actionTaken: recvResult.actionTaken,
+        };
+
+        const response: WorkerRpcResponse<ProcessCommitResult> = {
           requestId,
           action,
           success: true,
@@ -1107,6 +1294,9 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
         });
 
         if (recvResult.kind !== 'applicationMessage') {
+          if ((recvResult as any).kind === 'newState') {
+            throw new Error('Pesan yang diterima adalah Commit/Proposal MLS. Gunakan aksi PROCESS_COMMIT untuk memproses transisi epoch.');
+          }
           throw new Error(`Pesan yang diterima bukan applicationMessage (kind: ${(recvResult as any).kind}).`);
         }
 
@@ -1343,6 +1533,7 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
           mlsContext = {
             cipherSuite: cs,
             authService: unsafeTestingAuthenticationService,
+            clientConfig: multiDeviceClientConfig as any,
           };
         }
 

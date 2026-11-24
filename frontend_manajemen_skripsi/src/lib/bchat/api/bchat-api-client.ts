@@ -15,6 +15,7 @@
  */
 
 import axios from '@/lib/axios'
+import { normalizeCanonicalUuid } from '@/lib/bchat/storage/bchat-storage-aad'
 import type {
     BchatSuccessResponse,
     BchatStepUpRequest,
@@ -46,6 +47,12 @@ import type {
     BchatSendMessageRequest,
     BchatMessageData,
     BchatFetchMessagesQuery,
+    BchatPublishCommitRequest,
+    BchatPublishCommitResponseData,
+    BchatCommitItem,
+    BchatCommitAckRequest,
+    BchatCommitAckResponseData,
+    BchatDeviceKeyPackageResponseData,
 } from './bchat-api-types'
 
 function buildDeviceHeaders(deviceUuid?: string): Record<string, string> | undefined {
@@ -552,6 +559,108 @@ export async function fetchMessages(
 }
 
 // -----------------------------------------------------------------------------
+// 15. COMMIT RELAY API (MULTI-DEVICE OPSI B)
+// -----------------------------------------------------------------------------
+
+export async function fetchDeviceKeyPackage(
+    roomUuid: string,
+    deviceUuid: string
+): Promise<BchatSuccessResponse<BchatDeviceKeyPackageResponseData>> {
+    const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid')
+    const cleanDeviceUuid = normalizeCanonicalUuid(deviceUuid, 'deviceUuid')
+    try {
+        const res = await axios.get<BchatSuccessResponse<BchatDeviceKeyPackageResponseData>>(
+            `/api/bchat/rooms/${cleanRoomUuid}/devices/${cleanDeviceUuid}/key-package`,
+            { headers: buildDeviceHeaders(deviceUuid) }
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+export async function publishCommitRelay(
+    roomUuid: string,
+    payload: BchatPublishCommitRequest
+): Promise<BchatSuccessResponse<BchatPublishCommitResponseData>> {
+    const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid')
+    try {
+        const res = await axios.post<BchatSuccessResponse<BchatPublishCommitResponseData>>(
+            `/api/bchat/rooms/${cleanRoomUuid}/commits`,
+            payload,
+            { headers: buildDeviceHeaders(payload.device_uuid) }
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+export async function fetchPendingCommits(
+    roomUuid: string,
+    deviceUuid: string,
+    sinceEpoch?: number,
+    includeActiveWelcome?: boolean
+): Promise<BchatSuccessResponse<BchatCommitItem[]>> {
+    const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid')
+    const params = new URLSearchParams()
+    params.set('device_uuid', deviceUuid)
+    if (typeof sinceEpoch === 'number') {
+        params.set('since_epoch', sinceEpoch.toString())
+    }
+    if (includeActiveWelcome) {
+        params.set('include_active_welcome', 'true')
+    }
+    try {
+        const res = await axios.get<BchatSuccessResponse<BchatCommitItem[]>>(
+            `/api/bchat/rooms/${cleanRoomUuid}/commits?${params.toString()}`,
+            { headers: buildDeviceHeaders(deviceUuid) }
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+export async function submitCommitAck(
+    roomUuid: string,
+    commitUuid: string,
+    payload: BchatCommitAckRequest
+): Promise<BchatSuccessResponse<BchatCommitAckResponseData>> {
+    const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid')
+    const cleanCommitUuid = normalizeCanonicalUuid(commitUuid, 'commitUuid')
+    try {
+        const res = await axios.post<BchatSuccessResponse<BchatCommitAckResponseData>>(
+            `/api/bchat/rooms/${cleanRoomUuid}/commits/${cleanCommitUuid}/ack`,
+            payload,
+            { headers: buildDeviceHeaders(payload.device_uuid) }
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+export async function submitCommitWelcomeAck(
+    roomUuid: string,
+    commitUuid: string,
+    payload: BchatCommitAckRequest
+): Promise<BchatSuccessResponse<BchatCommitAckResponseData>> {
+    const cleanRoomUuid = normalizeCanonicalUuid(roomUuid, 'roomUuid')
+    const cleanCommitUuid = normalizeCanonicalUuid(commitUuid, 'commitUuid')
+    try {
+        const res = await axios.post<BchatSuccessResponse<BchatCommitAckResponseData>>(
+            `/api/bchat/rooms/${cleanRoomUuid}/commits/${cleanCommitUuid}/welcome-ack`,
+            payload,
+            { headers: buildDeviceHeaders(payload.device_uuid) }
+        )
+        return res.data
+    } catch (err) {
+        throw parseBchatApiError(err)
+    }
+}
+
+// -----------------------------------------------------------------------------
 // UNIFIED CLIENT EXPORT
 // -----------------------------------------------------------------------------
 
@@ -565,6 +674,7 @@ export const bchatApiClient = {
     fetchRooms,
     fetchRoomDetail,
     fetchPartnerKeyPackage,
+    fetchDeviceKeyPackage,
     publishWelcome,
     fetchOrRotateWelcomeChallenge,
     submitWelcomeAck,
@@ -575,6 +685,10 @@ export const bchatApiClient = {
     submitSessionWelcomeAck,
     sendMessage,
     fetchMessages,
+    publishCommitRelay,
+    fetchPendingCommits,
+    submitCommitAck,
+    submitCommitWelcomeAck,
 }
 
 export default bchatApiClient

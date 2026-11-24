@@ -46,6 +46,7 @@ import {
   fetchRooms,
   fetchRoomDetail,
   getDeviceStatus,
+  fetchPendingCommits,
 } from '@/lib/bchat/api/bchat-api-client';
 import type {
   BchatRoomSummary,
@@ -66,6 +67,9 @@ import {
   completePendingSessionHandshakeFlow,
   evaluateActiveRoomFoundState,
   shouldPollIncomingHistoryTransfers,
+  checkAndInitiateMultiDeviceCommitRelayFlow,
+  processPendingCommitRelayFlow,
+  recoverActiveWelcomeFlow,
   BchatHandshakeCoordinatorError,
 } from '@/lib/bchat/handshake/bchat-handshake-coordinator';
 import type {
@@ -242,6 +246,11 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     outboxStatus: string;
   } | null>(null);
   const [hasLocalGroupState, setHasLocalGroupState] = useState<boolean>(false);
+  const hasLocalGroupStateRef = useRef<boolean>(false);
+  const [isTransitioningEpoch, setIsTransitioningEpoch] = useState<boolean>(false);
+  const isTransitioningEpochRef = useRef<boolean>(false);
+  const commitRelayInProgressRef = useRef<boolean>(false);
+  const hasAttemptedRecoveryRef = useRef<boolean>(false);
   const [hasTransferSourceDevices, setHasTransferSourceDevices] = useState<boolean>(false);
   const [isInitiatingSession, setIsInitiatingSession] = useState<boolean>(false);
   const [sessionInitError, setSessionInitError] = useState<string | null>(null);
@@ -278,6 +287,16 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     const isNearBottom = scrollHeight - scrollTop - clientHeight < 120;
     setShowScrollBottom(!isNearBottom);
   };
+
+  // Sinkronkan ref status MLS GroupState lokal untuk mencegah stale closure pada subscriber
+  useEffect(() => {
+    hasLocalGroupStateRef.current = hasLocalGroupState;
+  }, [hasLocalGroupState]);
+
+  // Sinkronkan ref status transisi epoch multi-device
+  useEffect(() => {
+    isTransitioningEpochRef.current = isTransitioningEpoch;
+  }, [isTransitioningEpoch]);
 
   // Test Harness Hook untuk pengujian otomatis (dev / test port 3001)
   useEffect(() => {
@@ -323,6 +342,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
     setUnrecoverableMode('NONE');
     setPendingWelcomeRecoveryInfo(null);
     setHasLocalGroupState(false);
+    hasAttemptedRecoveryRef.current = false;
     setSessionInitError(null);
     setShowNewSessionConfirm(false);
 
@@ -847,11 +867,118 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
         }
 
         setHasLocalGroupState(true);
+        hasLocalGroupStateRef.current = true;
+
+        // Periksa apakah terdapat transisi Commit Relay Opsi B yang sedang berlangsung
+        try {
+          const pendingCommitsRes = await fetchPendingCommits(roomUuid, activeDevUuid);
+          const pendingCommits = pendingCommitsRes.data || [];
+          const activeTransition = pendingCommits.find((c) => c.status === 'PENDING_ACKS');
+          if (activeTransition) {
+            setIsTransitioningEpoch(true);
+            await processPendingCommitRelayFlow(
+              workerClient,
+              roomUuid,
+              activeDevUuid,
+              { fencing, activeSessionUuid: currentDetail.active_session?.session_uuid, userId: Number(currentUser.id) }
+            );
+          } else {
+            // Jika tidak ada transisi berjalan, cek apakah ada perangkat kedua terverifikasi yang perlu di-relay (Opsi B)
+            if (!commitRelayInProgressRef.current) {
+              commitRelayInProgressRef.current = true;
+              checkAndInitiateMultiDeviceCommitRelayFlow(
+                workerClient,
+                roomUuid,
+                activeDevUuid,
+                { fencing, userId: Number(currentUser.id) }
+              ).then((initResult) => {
+                if (initResult.initiated) {
+                  setIsTransitioningEpoch(true);
+                  setStatusDetail('Menerbitkan transisi penambahan perangkat multi-device (MLS Commit)...');
+                }
+              }).catch((_initErr) => {
+                // Abaikan kesalahan inisiasi jika prasyarat belum terpenuhi
+              }).finally(() => {
+                commitRelayInProgressRef.current = false;
+              });
+            }
+          }
+        } catch {
+          // Abaikan kegagalan jaringan awal
+        }
       } else if (restoreRes.status === 'NOT_FOUND') {
-        // Jika sudah ada riwayat lokal yang diimpor, tampilkan riwayat dan aktifkan mode baca
-        if (localHistoryItems.length > 0) {
+        // Periksa apakah terdapat Welcome dari Commit Relay Opsi B yang menargetkan perangkat ini
+        let joinedViaCommitRelay = false;
+        try {
+          const commitRelayRes = await processPendingCommitRelayFlow(
+            workerClient,
+            roomUuid,
+            activeDevUuid,
+            { fencing, activeSessionUuid: currentDetail.active_session?.session_uuid, userId: Number(currentUser.id) }
+          );
+          if (commitRelayRes.processed && commitRelayRes.type === 'WELCOME_ACK') {
+            joinedViaCommitRelay = true;
+            if (commitRelayRes.isComplete || commitRelayRes.status === 'ACTIVE') {
+              setHasLocalGroupState(true);
+              hasLocalGroupStateRef.current = true;
+              setIsTransitioningEpoch(false);
+              setStatusDetail('Bergabung ke sesi aman E2EE via MLS Commit Relay');
+            } else {
+              setIsTransitioningEpoch(true);
+              setStatusDetail('Menunggu konfirmasi ACK perangkat lain (Two-Phase Gate)...');
+            }
+          }
+        } catch (_relayErr) {
+          // Abaikan jika operasi Welcome belum tersedia
+        }
+
+        // Welcome Recovery: Pemulihan untuk perangkat yang sudah terdaftar tetapi kehilangan GroupState lokal
+        if (!joinedViaCommitRelay && !hasAttemptedRecoveryRef.current) {
+          hasAttemptedRecoveryRef.current = true;
+          try {
+            setStatusDetail('Memeriksa ketersediaan pemulihan sesi aman (Welcome Recovery)...');
+            const recoveryRes = await recoverActiveWelcomeFlow(
+              workerClient,
+              roomUuid,
+              activeDevUuid,
+              {
+                fencing,
+                activeSessionUuid: currentDetail.active_session?.session_uuid,
+                expectedEpoch: currentDetail.current_epoch ? parseInt(String(currentDetail.current_epoch), 10) : undefined,
+              }
+            );
+
+            if (recoveryRes.recovered) {
+              // Verifikasi kesiapan GroupState sebelum menonaktifkan mode read-only
+              const verifyRestore = await workerClient.restoreGroupState({
+                deviceUuid: activeDevUuid,
+                roomUuid,
+                fencing,
+              });
+
+              if (verifyRestore.status === 'FOUND') {
+                joinedViaCommitRelay = true;
+                setHasLocalGroupState(true);
+                hasLocalGroupStateRef.current = true;
+                setIsTransitioningEpoch(false);
+                setStatusDetail('Sesi aman E2EE berhasil dipulihkan (Welcome Recovery)');
+              } else {
+                console.warn('[B-CHAT] Verifikasi GroupState pasca pemulihan belum siap, tetap dalam Read-Only.');
+              }
+            }
+          } catch (recErr: any) {
+            console.warn('[B-CHAT] Welcome Recovery tidak dapat diselesaikan:', recErr?.message);
+          }
+        }
+
+        if (joinedViaCommitRelay) {
+          // Berhasil bergabung via Welcome: lanjutkan ke pemuatan riwayat pesan & subscriber
+        } else if (localHistoryItems.length > 0) {
+          // Jika sudah ada riwayat lokal yang diimpor, tampilkan riwayat dan aktifkan mode baca (Read-Only History)
           setConnectionStatus('CONNECTED');
-          setStatusDetail('Riwayat obrolan aman dimuat dari penyimpanan lokal');
+          setHasLocalGroupState(false);
+          hasLocalGroupStateRef.current = false;
+          setStatusDetail('Riwayat obrolan aman dimuat dari penyimpanan lokal (Read-Only History)');
           // Tetap lanjutkan inisialisasi subscriber agar multi-device realtime sync bekerja
         } else {
           // 7a. Jika ada pending_session untuk perangkat dosen (FETCH_SESSION_CHALLENGE_AND_ACK):
@@ -897,6 +1024,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
                 );
               }
               setHasLocalGroupState(true);
+              hasLocalGroupStateRef.current = true;
             } catch (sessionAckErr: any) {
               if (sessionIdRef.current !== currentSessionId) return;
               setConnectionStatus('ERROR');
@@ -1052,7 +1180,11 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           setConnectionStatus(mapSubscriptionStateToConnectionStatus(status));
           if (status === 'SUBSCRIBED') {
             if (!subscriberRef.current?.getIsRecoveryRequired()) {
-              setStatusDetail('Terhubung aman via E2EE');
+              setStatusDetail(
+                hasLocalGroupStateRef.current
+                  ? 'Terhubung aman via E2EE'
+                  : 'Riwayat obrolan aman dimuat dari penyimpanan lokal (Read-Only History)'
+              );
             }
           } else if (status === 'CONNECTING') {
             setStatusDetail(detail || 'Menghubungkan saluran real-time...');
@@ -1062,6 +1194,31 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             setStatusDetail(detail || 'Gangguan saluran WebSocket');
           } else {
             setStatusDetail(detail || 'Saluran real-time terputus');
+          }
+        },
+        onCommitPublished: async (_signal) => {
+          if (sessionIdRef.current !== currentSessionId) return;
+          setIsTransitioningEpoch(true);
+          try {
+            const relayRes = await processPendingCommitRelayFlow(
+              workerClient,
+              roomUuid,
+              activeDevUuid,
+              { fencing, activeSessionUuid, userId: Number(currentUser.id) }
+            );
+            if (relayRes.processed) {
+              if (relayRes.isComplete || relayRes.status === 'ACTIVE') {
+                setIsTransitioningEpoch(false);
+                setHasLocalGroupState(true);
+                hasLocalGroupStateRef.current = true;
+                const refreshed = await fetchRoomDetail(roomUuid).catch(() => null);
+                if (refreshed?.data && sessionIdRef.current === currentSessionId) {
+                  setRoomDetail(refreshed.data);
+                }
+              }
+            }
+          } catch (_err: any) {
+            // Abaikan kesalahan sinyal Commit jika terjadi gangguan jaringan transien
           }
         },
         onMessageDecrypted: (newMsg: DecryptedMessageItem) => {
@@ -1133,7 +1290,11 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           `Pemulihan dibutuhkan untuk pesan urutan #${currentRecState.failedSequence}. Pesan baru tetap dapat diproses.`
         );
       } else if (currentSubState === 'SUBSCRIBED') {
-        setStatusDetail('Terhubung aman via E2EE');
+        setStatusDetail(
+          hasLocalGroupStateRef.current
+            ? 'Terhubung aman via E2EE'
+            : 'Riwayat obrolan aman dimuat dari penyimpanan lokal (Read-Only History)'
+        );
       } else if (currentSubState === 'CONNECTING' || currentSubState === 'RECONNECTING') {
         setStatusDetail('Menghubungkan saluran real-time E2EE...');
       } else if (currentSubState === 'DISCONNECTED') {
@@ -1194,6 +1355,67 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       }
     };
   }, [user?.id, onboardingGate, initializeChatSession]);
+
+  // Polling penyelesaian transisi commit relay jika sedang PENDING_ACKS (Two-Phase Gate Opsi B)
+  useEffect(() => {
+    if (!isTransitioningEpoch || !roomSummary || !deviceUuid) return;
+
+    let isMounted = true;
+    const intervalId = setInterval(async () => {
+      try {
+        const res = await fetchPendingCommits(roomSummary.room_uuid, deviceUuid);
+        const commits = res.data || [];
+        const hasPending = commits.some((c) => c.status === 'PENDING_ACKS');
+        if (!hasPending) {
+          if (!isMounted) return;
+          setIsTransitioningEpoch(false);
+          const detailRes = await fetchRoomDetail(roomSummary.room_uuid);
+          if (detailRes?.data && isMounted) {
+            setRoomDetail(detailRes.data);
+          }
+          if (workerClientRef.current && fencingRef.current) {
+            const restoreRes = await workerClientRef.current.restoreGroupState({
+              deviceUuid,
+              roomUuid: roomSummary.room_uuid,
+              fencing: fencingRef.current,
+            });
+            if (restoreRes.status === 'FOUND' && isMounted) {
+              setHasLocalGroupState(true);
+              hasLocalGroupStateRef.current = true;
+              setStatusDetail('Terhubung aman via E2EE');
+            }
+          }
+        }
+      } catch {
+        // Abaikan kegagalan jaringan transien
+      }
+    }, 3000);
+
+    return () => {
+      isMounted = false;
+      clearInterval(intervalId);
+    };
+  }, [isTransitioningEpoch, roomSummary, deviceUuid]);
+
+  // Perbarui deteksi perangkat sumber tepercaya setelah proses pairing atau perubahan perangkat
+  const refreshTransferSourceDevices = useCallback(async () => {
+    if (!deviceUuid) return;
+    try {
+      const devStatusRes = await getDeviceStatus();
+      const activeList =
+        devStatusRes.data.active_devices ??
+        (devStatusRes.data.active_device ? [devStatusRes.data.active_device] : []);
+      const eligibleSources = activeList.filter(
+        (d) =>
+          d.device_uuid.toLowerCase() !== deviceUuid.toLowerCase() &&
+          d.status === 'ACTIVE' &&
+          d.is_trusted === true
+      );
+      setHasTransferSourceDevices(eligibleSources.length > 0);
+    } catch {
+      // Abaikan kegagalan sementara saat memuat status perangkat
+    }
+  }, [deviceUuid]);
 
   // Polling deteksi transfer riwayat masuk untuk perangkat sumber yang eligible (Tahap 2B)
   // HANYA berjalan bila perangkat sudah lulus onboarding, terhubung dengan GroupState lokal valid,
@@ -1529,6 +1751,7 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
 
     if (
       isSending ||
+      isTransitioningEpoch ||
       !roomSummary ||
       !deviceUuid ||
       !workerClientRef.current ||
@@ -1536,6 +1759,20 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       roomDetail?.status !== 'ACTIVE' ||
       connectionStatus !== 'CONNECTED'
     ) {
+      return;
+    }
+
+    if (isTransitioningEpoch) {
+      setSendError(
+        'Ruang obrolan sedang menyinkronkan transisi kunci multi-device (MLS Commit Relay). Pengiriman pesan ditahan sementara.'
+      );
+      return;
+    }
+
+    if (!hasLocalGroupState) {
+      setSendError(
+        'Perangkat ini berada dalam status Read-Only History dan belum memiliki MLS GroupState aktif untuk mengirim pesan.'
+      );
       return;
     }
 
@@ -1734,7 +1971,11 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       const updatedState = subscriberRef.current.getRecoveryState();
       setRecoveryState(updatedState);
       if (!updatedState.isRecoveryRequired) {
-        setStatusDetail('Terhubung aman via E2EE');
+        setStatusDetail(
+          hasLocalGroupStateRef.current
+            ? 'Terhubung aman via E2EE'
+            : 'Riwayat obrolan aman dimuat dari penyimpanan lokal (Read-Only History)'
+        );
       }
     } finally {
       setIsRetryingRecovery(false);
@@ -2337,17 +2578,25 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           {/* Connection Status Pill */}
           <div
             className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold border transition ${
-              connectionStatus === 'CONNECTED'
+              connectionStatus === 'CONNECTED' && !hasLocalGroupState
+                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                : connectionStatus === 'CONNECTED'
                 ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                 : connectionStatus === 'RECONNECTING'
                 ? 'bg-amber-50 text-amber-700 border-amber-200 animate-pulse'
                 : 'bg-rose-50 text-rose-700 border-rose-200'
             }`}
-            title={statusDetail}
+            title={
+              connectionStatus === 'CONNECTED' && !hasLocalGroupState
+                ? 'Perangkat dalam mode Read-Only History (belum memiliki MLS GroupState aktif)'
+                : statusDetail
+            }
           >
             <span
               className={`w-2 h-2 rounded-full ${
-                connectionStatus === 'CONNECTED'
+                connectionStatus === 'CONNECTED' && !hasLocalGroupState
+                  ? 'bg-amber-500'
+                  : connectionStatus === 'CONNECTED'
                   ? 'bg-emerald-500'
                   : connectionStatus === 'RECONNECTING'
                   ? 'bg-amber-500'
@@ -2355,7 +2604,9 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
               }`}
             />
             <span className="inline">
-              {connectionStatus === 'CONNECTED'
+              {connectionStatus === 'CONNECTED' && !hasLocalGroupState
+                ? 'Read-Only History'
+                : connectionStatus === 'CONNECTED'
                 ? 'Terhubung'
                 : connectionStatus === 'RECONNECTING'
                 ? 'Menghubungkan...'
@@ -2469,8 +2720,14 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             msg.plaintext === '[Format Corrupt]' ||
             (!!msg.error && /integritas|sha-256|hash|base64|tamper/i.test(msg.error));
 
+          const isReadOnlyHistoryUnavailable =
+            !isIntegrityError &&
+            ((!!msg.error && /state grup belum aktif|read-only|read_only/i.test(msg.error)) ||
+              (!hasLocalGroupState && (msg.plaintext === '[Dekripsi Gagal]' || !!msg.error)));
+
           const isPastRatchetUnavailable =
             !isIntegrityError &&
+            !isReadOnlyHistoryUnavailable &&
             (msg.plaintext === '[Dekripsi Gagal]' ||
               (!!msg.error &&
                 /past|generation|ratchet|expired|kunci|dekripsi mls gagal/i.test(msg.error)));
@@ -2500,6 +2757,33 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
                   )}
                   <div className="flex items-center justify-between mt-1 pt-1 border-t border-rose-200/60 text-[10px] text-rose-400">
                     <span>Sequence #{msg.server_sequence}</span>
+                    <span>{timeStr}</span>
+                  </div>
+                </div>
+              </div>
+            );
+          }
+
+          // Kasus 1B: Pesan Tidak Dapat Didekripsi karena Perangkat Read-Only History
+          if (isReadOnlyHistoryUnavailable) {
+            return (
+              <div
+                key={`${msg.server_sequence}_${msg.message_uuid}`}
+                data-bchat-message-bubble="true"
+                data-bchat-sequence={msg.server_sequence}
+                data-bchat-status="readonly-history-unavailable"
+                className={`flex flex-col ${isSelf ? 'items-end' : 'items-start'}`}
+              >
+                <div className="max-w-[85%] sm:max-w-[70%] px-4 py-2.5 rounded-2xl text-xs leading-relaxed transition-all shadow-xs bg-slate-50 border border-dashed border-amber-300 text-slate-700 rounded-bl-xs">
+                  <div className="flex items-center gap-1.5 text-amber-800 font-semibold mb-1 text-[11px]">
+                    <Lock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                    <span>Pesan Terenkripsi (Perangkat Read-Only History)</span>
+                  </div>
+                  <p data-bchat-message-text="true" className="whitespace-pre-wrap break-words text-slate-600 italic">
+                    Perangkat ini berada dalam status Read-Only History dan belum memiliki MLS GroupState aktif untuk mendekripsi pesan baru.
+                  </p>
+                  <div className="flex items-center justify-between mt-1 pt-1 border-t border-slate-200 text-[10px] text-slate-400">
+                    <span>Sequence #{msg.server_sequence} • Epoch {msg.epoch}</span>
                     <span>{timeStr}</span>
                   </div>
                 </div>
@@ -2824,6 +3108,38 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
           </div>
         )}
 
+        {/* Banner Transisi Epoch Multi-Device (Opsi B) */}
+        {isTransitioningEpoch && (
+          <div
+            data-bchat-transitioning-banner="true"
+            className="mb-2.5 p-3 bg-blue-50/90 border border-blue-200 rounded-2xl text-xs space-y-1 text-blue-900"
+          >
+            <div className="flex items-center gap-1.5 font-semibold text-blue-800">
+              <RefreshCw className="w-3.5 h-3.5 text-blue-600 shrink-0 animate-spin" />
+              <span>Sinkronisasi Transisi Kunci (MLS Commit Relay)</span>
+            </div>
+            <p className="text-[11px] text-blue-700 leading-relaxed">
+              Ruang obrolan sedang menyinkronkan penambahan perangkat baru secara aman. Pengiriman pesan ditahan sementara hingga seluruh perangkat mengonfirmasi transisi epoch.
+            </p>
+          </div>
+        )}
+
+        {/* Banner Khusus Perangkat Read-Only History */}
+        {!hasLocalGroupState && !isTransitioningEpoch && connectionStatus === 'CONNECTED' && roomDetail?.status === 'ACTIVE' && (
+          <div
+            data-bchat-readonly-banner="true"
+            className="mb-2.5 p-3 bg-amber-50/90 border border-amber-200 rounded-2xl text-xs space-y-1 text-amber-900"
+          >
+            <div className="flex items-center gap-1.5 font-semibold text-amber-800">
+              <Lock className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <span>Mode Baca Riwayat (Read-Only History)</span>
+            </div>
+            <p className="text-[11px] text-amber-700 leading-relaxed">
+              Perangkat ini hanya dapat membaca riwayat obrolan yang telah disinkronkan. Pengiriman dan dekripsi pesan baru dinonaktifkan karena perangkat belum terdaftar dalam sesi MLS aktif.
+            </p>
+          </div>
+        )}
+
         <form onSubmit={handleSendMessage} className="flex items-end gap-2">
           {/* Hidden Native File Input */}
           <input
@@ -2840,12 +3156,20 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             onClick={() => fileInputRef.current?.click()}
             disabled={
               isSending ||
+              isTransitioningEpoch ||
               connectionStatus !== 'CONNECTED' ||
               roomDetail?.status !== 'ACTIVE' ||
+              !hasLocalGroupState ||
               pendingFiles.length >= ATTACHMENT_CANONICAL.MAX_ATTACHMENT_COUNT
             }
             className="p-3 text-slate-500 hover:text-emerald-600 hover:bg-slate-100 rounded-2xl transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0 flex items-center justify-center cursor-pointer"
-            title="Pilih Lampiran Berkas (Maks. 5 berkas, 10 MB per berkas, total 25 MB)"
+            title={
+              isTransitioningEpoch
+                ? 'Pengiriman lampiran ditahan selama transisi multi-device'
+                : !hasLocalGroupState
+                ? 'Pengiriman lampiran dinonaktifkan pada perangkat Read-Only History'
+                : 'Pilih Lampiran Berkas (Maks. 5 berkas, 10 MB per berkas, total 25 MB)'
+            }
           >
             <Paperclip className="w-4 h-4" />
           </button>
@@ -2855,12 +3179,22 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
               onKeyDown={handleKeyDown}
-              disabled={isSending || connectionStatus !== 'CONNECTED' || roomDetail?.status !== 'ACTIVE'}
+              disabled={
+                isSending ||
+                isTransitioningEpoch ||
+                connectionStatus !== 'CONNECTED' ||
+                roomDetail?.status !== 'ACTIVE' ||
+                !hasLocalGroupState
+              }
               placeholder={
-                connectionStatus === 'OFFLINE'
+                isTransitioningEpoch
+                  ? 'Menyinkronkan transisi kunci perangkat baru (pengiriman ditahan sementara)...'
+                  : connectionStatus === 'OFFLINE'
                   ? 'Koneksi terputus. Menunggu jaringan...'
                   : roomDetail?.status !== 'ACTIVE'
                   ? 'Ruang obrolan belum aktif...'
+                  : !hasLocalGroupState
+                  ? 'Perangkat dalam mode baca riwayat (belum memiliki sesi MLS aktif)...'
                   : pendingFiles.length > 0
                   ? 'Tambahkan pesan pendamping lampiran (opsional)...'
                   : 'Ketik pesan konsultasi proposal... (Enter untuk kirim, Shift+Enter untuk baris baru)'
@@ -2875,11 +3209,21 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             disabled={
               (!inputText.trim() && pendingFiles.length === 0) ||
               isSending ||
+              isTransitioningEpoch ||
               connectionStatus !== 'CONNECTED' ||
-              roomDetail?.status !== 'ACTIVE'
+              roomDetail?.status !== 'ACTIVE' ||
+              !hasLocalGroupState
             }
             className="p-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl shadow-sm transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0 flex items-center justify-center cursor-pointer"
-            title={pendingFiles.length > 0 ? 'Kirim Lampiran E2EE' : 'Kirim Pesan E2EE'}
+            title={
+              isTransitioningEpoch
+                ? 'Pengiriman ditahan selama sinkronisasi transisi multi-device'
+                : !hasLocalGroupState
+                ? 'Pengiriman dinonaktifkan pada perangkat Read-Only History'
+                : pendingFiles.length > 0
+                ? 'Kirim Lampiran E2EE'
+                : 'Kirim Pesan E2EE'
+            }
           >
             {isSending ? (
               <Loader2 className="w-4 h-4 animate-spin" />
@@ -2893,7 +3237,11 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
       {/* MODAL MANAJEMEN PERANGKAT (TAHAP 1B) */}
       <BchatDeviceManagementModal
         isOpen={isDeviceModalOpen}
-        onClose={() => setIsDeviceModalOpen(false)}
+        onClose={() => {
+          setIsDeviceModalOpen(false);
+          refreshTransferSourceDevices();
+        }}
+        onDevicesChanged={refreshTransferSourceDevices}
         currentDeviceUuid={deviceUuid}
         onRequestHistoryTransfer={() => {
           setIsDeviceModalOpen(false);

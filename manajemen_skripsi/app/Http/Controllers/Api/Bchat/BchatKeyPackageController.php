@@ -111,5 +111,49 @@ class BchatKeyPackageController extends Controller
             ], 500);
         }
     }
+
+    /**
+     * [GET /api/bchat/rooms/{roomUuid}/devices/{deviceUuid}/key-package]
+     *
+     * Mengambil satu KeyPackage aktif milik perangkat spesifik anggota room (Multi-Device Commit Relay).
+     */
+    public function fetchDeviceKeyPackage(Request $request, string $roomUuid, string $deviceUuid): JsonResponse
+    {
+        $user = $request->user();
+
+        if (!$user) {
+            return response()->json([
+                'status'     => 'error',
+                'message'    => 'Pengguna belum terautentikasi.',
+                'error_code' => 'UNAUTHENTICATED',
+            ], 401);
+        }
+
+        try {
+            $result = $this->keyPackageService->fetchDeviceKeyPackage(
+                user: $user,
+                roomUuid: $roomUuid,
+                deviceUuid: $deviceUuid
+            );
+
+            return response()->json([
+                'status'  => 'success',
+                'message' => 'KeyPackage perangkat berhasil diambil.',
+                'data'    => $result,
+            ], 200);
+        } catch (BchatKeyPackageException $e) {
+            return response()->json([
+                'status'     => 'error',
+                'message'    => $e->getMessage(),
+                'error_code' => $e->getErrorCode(),
+            ], $e->getHttpStatus());
+        } catch (Throwable $e) {
+            return response()->json([
+                'status'     => 'error',
+                'message'    => 'Terjadi kesalahan sistem internal: ' . $e->getMessage(),
+                'error_code' => 'INTERNAL_SERVER_ERROR',
+            ], 500);
+        }
+    }
 }
 

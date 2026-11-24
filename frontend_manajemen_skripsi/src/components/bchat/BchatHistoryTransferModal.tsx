@@ -34,7 +34,7 @@ import {
   Clock,
   Check,
 } from 'lucide-react';
-import { getDeviceStatus, BchatApiError } from '@/lib/bchat/api/bchat-api-client';
+import { getDeviceStatus, BchatApiError, parseBchatApiError } from '@/lib/bchat/api/bchat-api-client';
 import type { BchatActiveDeviceInfo } from '@/lib/bchat/api/bchat-api-types';
 import { getActiveDeviceIdentityKey, findActiveLocalDevice } from '@/lib/bchat/device/bchat-device-registration';
 import {
@@ -107,6 +107,8 @@ export function BchatHistoryTransferModal({
   // Shared State
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [secondsRemaining, setSecondsRemaining] = useState<number>(600);
+  const [isCancelling, setIsCancelling] = useState<boolean>(false);
+  const [isClosing, setIsClosing] = useState<boolean>(false);
 
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -129,6 +131,11 @@ export function BchatHistoryTransferModal({
   // Muat daftar perangkat tepercaya lain saat modal dibuka dalam mode Request
   useEffect(() => {
     if (!isOpen || isIncomingMode) return;
+
+    // Pertahankan status dan transfer aktif bila sedang dalam alur persetujuan/impor
+    if (activeTransfer && (recipientStep === 'WAITING_APPROVAL' || recipientStep === 'IMPORTING')) {
+      return;
+    }
 
     let isMounted = true;
     setIsLoadingDevices(true);
@@ -155,7 +162,8 @@ export function BchatHistoryTransferModal({
       })
       .catch((err) => {
         if (!isMounted) return;
-        setErrorMsg(err.message || 'Gagal memuat daftar perangkat tepercaya.');
+        const parsed = parseBchatApiError(err);
+        setErrorMsg(parsed.message || 'Gagal memuat daftar perangkat tepercaya.');
       })
       .finally(() => {
         if (isMounted) setIsLoadingDevices(false);
@@ -164,7 +172,7 @@ export function BchatHistoryTransferModal({
     return () => {
       isMounted = false;
     };
-  }, [isOpen, isIncomingMode, currentDeviceUuid]);
+  }, [isOpen, isIncomingMode, currentDeviceUuid, activeTransfer, recipientStep]);
 
   // Ambil private key Ed25519 lokal perangkat ini dari Keystore IndexedDB
   const getLocalPrivateKey = async (): Promise<CryptoKey> => {
@@ -247,8 +255,15 @@ export function BchatHistoryTransferModal({
         }
       }, 2500);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Gagal mengirim permintaan transfer.';
-      setErrorMsg(msg);
+      const parsed = parseBchatApiError(err);
+      if (parsed.errorCode === 'TRANSFER_ALREADY_PENDING' || parsed.status === 409) {
+        setErrorMsg(
+          parsed.message ||
+            'Masih terdapat sesi transfer riwayat yang aktif untuk ruang obrolan ini. Harap tunggu hingga sesi sebelumnya selesai atau kedaluwarsa.'
+        );
+      } else {
+        setErrorMsg(parsed.message || 'Gagal mengirim permintaan transfer.');
+      }
     } finally {
       setIsLoadingDevices(false);
     }
@@ -271,27 +286,45 @@ export function BchatHistoryTransferModal({
         onTransferSuccess(res.importedCount);
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Gagal mendekripsi atau mengimpor riwayat.';
-      setErrorMsg(msg);
+      const parsed = parseBchatApiError(err);
+      setErrorMsg(parsed.message || 'Gagal mendekripsi atau mengimpor riwayat.');
       setRecipientStep('SELECT_SOURCE');
     }
   };
 
   const handleCancelRequest = async () => {
-    clearTimers();
-    if (activeTransfer) {
-      try {
-        await cancelHistoryTransfer(
-          activeTransfer.transfer_uuid,
-          currentDeviceUuid,
-          'Dibatalkan oleh perangkat penerima'
-        );
-      } catch (_e) {
-        // Abaikan kesalahan koneksi saat pembatalan
-      }
+    if (!activeTransfer || isCancelling) {
+      clearTimers();
+      setRecipientStep('SELECT_SOURCE');
+      setActiveTransfer(null);
+      return;
     }
-    setRecipientStep('SELECT_SOURCE');
-    setActiveTransfer(null);
+
+    setIsCancelling(true);
+    setErrorMsg(null);
+    try {
+      await cancelHistoryTransfer(
+        activeTransfer.transfer_uuid,
+        'Dibatalkan oleh perangkat penerima',
+        currentDeviceUuid
+      );
+      clearTimers();
+      setActiveTransfer(null);
+      setRecipientStep('SELECT_SOURCE');
+    } catch (err: unknown) {
+      const parsed = parseBchatApiError(err);
+      if (parsed.status === 404 || parsed.errorCode === 'TRANSFER_NOT_FOUND') {
+        clearTimers();
+        setActiveTransfer(null);
+        setRecipientStep('SELECT_SOURCE');
+        return;
+      }
+      setErrorMsg(
+        `Gagal membatalkan transfer: ${parsed.message || 'Kesalahan jaringan'}. Sesi transfer masih aktif di server.`
+      );
+    } finally {
+      setIsCancelling(false);
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -299,7 +332,7 @@ export function BchatHistoryTransferModal({
   // ---------------------------------------------------------------------------
 
   const handleApproveAndExport = async () => {
-    if (!incomingTransfer) return;
+    if (!incomingTransfer || isExporting) return;
 
     setIsExporting(true);
     setErrorMsg(null);
@@ -320,30 +353,80 @@ export function BchatHistoryTransferModal({
         onClose();
       }, 2000);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Gagal mengekspor riwayat obrolan.';
-      setErrorMsg(msg);
+      const parsed = parseBchatApiError(err);
+      setErrorMsg(parsed.message || 'Gagal mengekspor riwayat obrolan.');
     } finally {
       setIsExporting(false);
     }
   };
 
   const handleRejectIncoming = async () => {
-    if (!incomingTransfer) return;
+    if (!incomingTransfer || isExporting) return;
     setIsExporting(true);
+    setErrorMsg(null);
     try {
       await cancelHistoryTransfer(
         incomingTransfer.transfer_uuid,
-        currentDeviceUuid,
-        'Ditolak oleh pengguna perangkat sumber'
+        'Ditolak oleh pengguna perangkat sumber',
+        currentDeviceUuid
       );
       if (onIncomingHandled) onIncomingHandled();
       onClose();
-    } catch (_e) {
-      if (onIncomingHandled) onIncomingHandled();
-      onClose();
+    } catch (err: unknown) {
+      const parsed = parseBchatApiError(err);
+      if (parsed.status === 404 || parsed.errorCode === 'TRANSFER_NOT_FOUND') {
+        if (onIncomingHandled) onIncomingHandled();
+        onClose();
+        return;
+      }
+      setErrorMsg(`Gagal menolak transfer: ${parsed.message || 'Kesalahan jaringan'}. Silakan coba lagi.`);
     } finally {
       setIsExporting(false);
     }
+  };
+
+  // Penanganan penutupan modal dengan pembatalan transfer aktif jika masih menunggu persetujuan
+  const handleRequestClose = async () => {
+    if (isExporting || isClosing || isCancelling) return;
+
+    // Jika sedang dalam tahap menunggu persetujuan dan ada transfer aktif milik perangkat ini
+    if (
+      recipientStep === 'WAITING_APPROVAL' &&
+      activeTransfer &&
+      activeTransfer.recipient_device_uuid === currentDeviceUuid
+    ) {
+      setIsClosing(true);
+      setErrorMsg(null);
+      try {
+        await cancelHistoryTransfer(
+          activeTransfer.transfer_uuid,
+          'Dibatalkan karena dialog ditutup oleh pengguna',
+          currentDeviceUuid
+        );
+        clearTimers();
+        setActiveTransfer(null);
+        setRecipientStep('SELECT_SOURCE');
+        setIsClosing(false);
+        onClose();
+      } catch (err: unknown) {
+        setIsClosing(false);
+        const parsed = parseBchatApiError(err);
+        if (parsed.status === 404 || parsed.errorCode === 'TRANSFER_NOT_FOUND') {
+          clearTimers();
+          setActiveTransfer(null);
+          setRecipientStep('SELECT_SOURCE');
+          onClose();
+          return;
+        }
+        setErrorMsg(
+          `Gagal membatalkan transfer di server: ${parsed.message || 'Kesalahan jaringan'}. Sesi transfer masih aktif. Harap batalkan permintaan sebelum menutup.`
+        );
+      }
+      return;
+    }
+
+    clearTimers();
+    onClose();
   };
 
   if (!isOpen) return null;
@@ -388,15 +471,12 @@ export function BchatHistoryTransferModal({
             </div>
           </div>
           <button
-            onClick={() => {
-              clearTimers();
-              onClose();
-            }}
-            disabled={isExporting}
-            className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer"
+            onClick={handleRequestClose}
+            disabled={isExporting || isClosing || isCancelling}
+            className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer disabled:opacity-50"
             title="Tutup dialog"
           >
-            <X className="w-5 h-5" />
+            {isClosing ? <Loader2 className="w-5 h-5 animate-spin" /> : <X className="w-5 h-5" />}
           </button>
         </div>
 
@@ -611,9 +691,11 @@ export function BchatHistoryTransferModal({
                   <div className="pt-2">
                     <button
                       onClick={handleCancelRequest}
-                      className="px-4 py-2 text-xs font-semibold text-rose-600 hover:bg-rose-50 rounded-xl transition cursor-pointer border border-rose-200"
+                      disabled={isCancelling || isClosing}
+                      className="px-4 py-2 text-xs font-semibold text-rose-600 hover:bg-rose-50 rounded-xl transition cursor-pointer border border-rose-200 disabled:opacity-50 inline-flex items-center gap-1.5"
                     >
-                      Batalkan Permintaan
+                      {isCancelling && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                      <span>{isCancelling ? 'Membatalkan...' : 'Batalkan Permintaan'}</span>
                     </button>
                   </div>
                 </div>
