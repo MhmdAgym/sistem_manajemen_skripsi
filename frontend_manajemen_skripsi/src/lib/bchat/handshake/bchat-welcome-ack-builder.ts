@@ -542,3 +542,27 @@ export async function computePayloadSha256Hex(payloadBytes: Uint8Array): Promise
   const digest = await subtle.digest('SHA-256', toArrayBuffer(payloadBytes));
   return bytesToHex(new Uint8Array(digest));
 }
+
+/**
+ * Menandatangani payload kanonis COMMIT_ACK / WELCOME_ACK (Multi-Device Commit Relay Opsi B).
+ * Mengembalikan tanda tangan Ed25519 detached sebagai hex string (128 karakter hex / 64 byte).
+ */
+export async function signCanonicalCommitAck(
+  canonicalPayload: string,
+  deviceUuid: string
+): Promise<string> {
+  const canonicalDeviceUuid = deviceUuid.trim().toLowerCase();
+  const identityRecord = await getActiveDeviceIdentityKey(canonicalDeviceUuid);
+
+  if (!identityRecord || !identityRecord.crypto_key) {
+    throw new BchatWelcomeAckBuilderError(
+      `Kunci identitas aktif untuk perangkat [${canonicalDeviceUuid}] tidak ditemukan di Keystore.`,
+      'IDENTITY_KEY_NOT_FOUND'
+    );
+  }
+
+  const subtle = getCryptoSubtle();
+  const payloadBytes = new TextEncoder().encode(canonicalPayload);
+  const sigBuf = await subtle.sign('Ed25519', identityRecord.crypto_key, toArrayBuffer(payloadBytes));
+  return bytesToHex(new Uint8Array(sigBuf));
+}

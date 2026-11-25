@@ -60,6 +60,7 @@ export interface BchatDeviceManagementModalProps {
   currentDeviceUuid: string | null;
   onDeviceRevoked?: (revokedUuid: string) => void;
   onRequestHistoryTransfer?: (sourceDevice: BchatActiveDeviceInfo) => void;
+  onDevicesChanged?: () => void;
 }
 
 function getDeviceIcon(name: string) {
@@ -103,6 +104,7 @@ export function BchatDeviceManagementModal({
   currentDeviceUuid,
   onDeviceRevoked,
   onRequestHistoryTransfer,
+  onDevicesChanged,
 }: BchatDeviceManagementModalProps) {
   // State data perangkat
   const [isLoading, setIsLoading] = useState<boolean>(true);
@@ -230,6 +232,9 @@ export function BchatDeviceManagementModal({
       if (onDeviceRevoked) {
         onDeviceRevoked(revokedUuid);
       }
+      if (onDevicesChanged) {
+        onDevicesChanged();
+      }
     } catch (err) {
       if (err instanceof BchatApiError) {
         if (err.errorCode === 'INVALID_CREDENTIALS') {
@@ -292,6 +297,10 @@ export function BchatDeviceManagementModal({
 
       // Muat ulang daftar perangkat agar status is_trusted langsung ter-update
       await loadDevices();
+
+      if (onDevicesChanged) {
+        onDevicesChanged();
+      }
     } catch (err) {
       if (err instanceof BchatApiError) {
         setLookupError(err.message || 'Gagal menyetujui pairing perangkat.');

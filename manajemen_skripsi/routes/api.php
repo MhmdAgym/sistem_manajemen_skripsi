@@ -38,6 +38,7 @@ use App\Http\Controllers\Api\Bchat\BchatMessageController;
 use App\Http\Controllers\Api\Bchat\BchatRoomSessionController;
 use App\Http\Controllers\Api\Bchat\BchatAttachmentController;
 use App\Http\Controllers\Api\Bchat\BchatHistoryTransferController;
+use App\Http\Controllers\Api\Bchat\BchatCommitRelayController;
 
 // ---------------------------------------------------------------------------
 // SANCTUM USER DETECTION & NOTIFIKASI AKADEMIK TERPUSAT
@@ -106,6 +107,8 @@ Route::middleware(['auth:sanctum'])->prefix('bchat/rooms')->group(function () {
         ->middleware('throttle:60,1,bchat_room_read');
     Route::get('/{roomUuid}/partner-key-package', [BchatKeyPackageController::class, 'fetchPartnerKeyPackage'])
         ->middleware('throttle:60,1,bchat_partner_kp');
+    Route::get('/{roomUuid}/devices/{deviceUuid}/key-package', [BchatKeyPackageController::class, 'fetchDeviceKeyPackage'])
+        ->middleware('throttle:60,1,bchat_device_kp');
     Route::post('/{roomUuid}/welcome', [BchatWelcomeController::class, 'publish'])
         ->middleware('throttle:10,1,bchat_handshake_welcome');
     Route::post('/{roomUuid}/welcome-challenge', [BchatWelcomeController::class, 'challenge'])
@@ -146,6 +149,16 @@ Route::middleware(['auth:sanctum'])->prefix('bchat/rooms')->group(function () {
     // B-CHAT E2EE History Transfer (Tahap 2B) — Inisiasi oleh Penerima
     Route::post('/{roomUuid}/history-transfers', [BchatHistoryTransferController::class, 'store'])
         ->middleware('throttle:20,1,bchat_history_transfer_write');
+
+    // B-CHAT E2EE Commit Relay Plane (Multi-Device MLS)
+    Route::post('/{roomUuid}/commits', [BchatCommitRelayController::class, 'publish'])
+        ->middleware('throttle:30,1,bchat_commit_publish');
+    Route::get('/{roomUuid}/commits', [BchatCommitRelayController::class, 'index'])
+        ->middleware('throttle:60,1,bchat_commit_read');
+    Route::post('/{roomUuid}/commits/{commitUuid}/ack', [BchatCommitRelayController::class, 'ack'])
+        ->middleware('throttle:30,1,bchat_commit_ack');
+    Route::post('/{roomUuid}/commits/{commitUuid}/welcome-ack', [BchatCommitRelayController::class, 'welcomeAck'])
+        ->middleware('throttle:30,1,bchat_commit_ack');
 });
 
 // B-CHAT E2EE History Transfer Plane (Tahap 2B) — Manajemen & Pengunduhan

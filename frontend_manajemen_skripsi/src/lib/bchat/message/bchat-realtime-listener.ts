@@ -50,6 +50,16 @@ export interface BchatMessageSentSignal {
   created_at: string;
 }
 
+export interface BchatCommitPublishedSignal {
+  room_uuid: string;
+  commit_uuid: string;
+  from_epoch: string | number;
+  to_epoch: string | number;
+  commit_hash: string;
+  added_device_uuid: string | null;
+  created_at: string;
+}
+
 export type SubscriptionState =
   | 'IDLE'
   | 'CONNECTING'
@@ -153,6 +163,7 @@ export interface BchatRealtimeSubscriberOptions {
   batchLimit?: number;
   onSubscriptionStatusChange?: (status: SubscriptionState, detail?: string) => void;
   onSignalReceived?: (signal: BchatMessageSentSignal, isDuplicate: boolean) => void;
+  onCommitPublished?: (signal: BchatCommitPublishedSignal) => void;
   onMessageDecrypted?: (message: DecryptedMessageItem) => void;
   onReconciled?: (reconciledCount: number, latestSequence: number) => void;
   onRecoveryRequired?: (failedSequence: number, error: string, category?: BchatInboundErrorCategory) => void;
@@ -621,6 +632,14 @@ export class BchatRealtimeSubscriber {
         this.handleSignal(rawPayload);
       });
 
+      // Dengarkan event siaran Commit MLS baru (.bchat.commit.published)
+      channel.listen('.bchat.commit.published', (rawPayload: unknown) => {
+        if (this.subscriptionState === 'UNSUBSCRIBED') return;
+        if (typeof this.options.onCommitPublished === 'function') {
+          this.options.onCommitPublished(rawPayload as BchatCommitPublishedSignal);
+        }
+      });
+
       // Jika library melaporkan channel sudah dalam status subscribed secara eksplisit
       if (channel?.subscription?.subscribed === true) {
         this.hasConfirmedSubscriptionOnce = true;
@@ -872,6 +891,7 @@ export class BchatRealtimeSubscriber {
       try {
         if (typeof this.echoChannel.stopListening === 'function') {
           this.echoChannel.stopListening('.message.sent');
+          this.echoChannel.stopListening('.bchat.commit.published');
         }
       } catch (_err) {
         // noop

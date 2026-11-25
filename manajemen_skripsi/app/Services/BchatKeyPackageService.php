@@ -523,5 +523,65 @@ class BchatKeyPackageService
             'key_package_data'      => $base64Data,
         ];
     }
+
+    /**
+     * Mengambil satu KeyPackage aktif milik perangkat spesifik anggota room (untuk Multi-Device Commit Relay).
+     */
+    public function fetchDeviceKeyPackage(User $user, string $roomUuid, string $deviceUuid): array
+    {
+        $cleanRoomUuid = strtolower(trim($roomUuid));
+        if (!Str::isUuid($cleanRoomUuid)) {
+            throw new BchatKeyPackageException('Format Room UUID tidak valid.', 'INVALID_ROOM_UUID', 422);
+        }
+
+        $cleanDeviceUuid = strtolower(trim($deviceUuid));
+        if (!Str::isUuid($cleanDeviceUuid)) {
+            throw new BchatKeyPackageException('Format Device UUID tidak valid.', 'INVALID_DEVICE_UUID', 422);
+        }
+
+        $room = BchatRoom::where('room_uuid', $cleanRoomUuid)->first();
+        if (!$room) {
+            throw new BchatKeyPackageException('Ruang obrolan tidak ditemukan.', 'ROOM_NOT_FOUND', 404);
+        }
+
+        $isCallerMember = BchatRoomMember::where('room_id', $room->id)
+            ->where('user_id', $user->id)
+            ->where('is_active', true)
+            ->exists();
+        if (!$isCallerMember) {
+            throw new BchatKeyPackageException('Pengguna bukan anggota aktif pada ruang obrolan ini.', 'UNAUTHORIZED_NOT_MEMBER', 403);
+        }
+
+        $targetDevice = BchatUserDevice::where('device_uuid', $cleanDeviceUuid)->first();
+        if (!$targetDevice || $targetDevice->status !== 'ACTIVE' || !$targetDevice->is_trusted) {
+            throw new BchatKeyPackageException('Perangkat target tidak aktif atau belum berstatus tepercaya.', 'DEVICE_NOT_TRUSTED', 403);
+        }
+
+        $isTargetMember = BchatRoomMember::where('room_id', $room->id)
+            ->where('user_id', $targetDevice->user_id)
+            ->where('is_active', true)
+            ->exists();
+        if (!$isTargetMember) {
+            throw new BchatKeyPackageException('Pemilik perangkat target bukan anggota aktif ruang obrolan.', 'TARGET_DEVICE_NOT_ROOM_MEMBER', 403);
+        }
+
+        $kp = BchatKeyPackage::where('device_id', $targetDevice->id)
+            ->where('is_consumed', false)
+            ->orderBy('id', 'asc')
+            ->first();
+
+        if (!$kp) {
+            throw new BchatKeyPackageException('Tidak ada KeyPackage aktif yang tersedia untuk perangkat ini.', 'NO_KEY_PACKAGE_AVAILABLE', 404);
+        }
+
+        $rawBlob = is_resource($kp->key_package_data) ? stream_get_contents($kp->key_package_data) : $kp->key_package_data;
+
+        return [
+            'device_uuid'      => $targetDevice->device_uuid,
+            'user_id'          => (string) $targetDevice->user_id,
+            'key_package_hash' => (string) $kp->key_package_hash,
+            'key_package_data' => base64_encode((string) $rawBlob),
+        ];
+    }
 }
 

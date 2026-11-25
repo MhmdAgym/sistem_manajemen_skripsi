@@ -34,6 +34,7 @@ import {
 import {
   publishWelcomeHandshakeFlow,
   fetchChallengeAndAckHandshakeFlow,
+  checkAndInitiateMultiDeviceCommitRelayFlow,
   type PublishWelcomeResult,
   type FetchChallengeAndAckResult,
 } from '@/lib/bchat/handshake/bchat-handshake-coordinator';
@@ -384,6 +385,7 @@ export default function BchatDeviceTestPage() {
         publishKeyPackagesFlow,
         publishWelcomeHandshakeFlow,
         fetchChallengeAndAckHandshakeFlow,
+        checkAndInitiateMultiDeviceCommitRelayFlow,
         buildWelcomeAckPayload,
         signWelcomeAckWithDeviceIdentity,
         fetchRoomDetail,

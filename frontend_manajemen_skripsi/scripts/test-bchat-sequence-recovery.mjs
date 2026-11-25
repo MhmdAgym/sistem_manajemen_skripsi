@@ -281,6 +281,8 @@ const {
   classifyInboundError,
   sendApplicationMessageFlow,
   isHistoryTombstonePlaintext,
+  BchatMessageSendError,
+  BchatReadOnlyHistoryError,
 } = coordinator;
 const {
   BchatRealtimeSubscriber,
@@ -1506,5 +1508,155 @@ test('15. Pesan teks (content_type = 1) dan lampiran (content_type = 2) tetap da
   assert.equal(parsedManifest.type, 'ATTACHMENT_MANIFEST');
   assert.equal(parsedManifest.attachments[0].attachmentUuid, attUuid);
   assert.equal(dosenSub.getContiguousSequence(), 19);
+});
+
+test('16. Fail-closed perangkat Read-Only History: tidak ada plaintext fallback, tidak ada epoch hardcode, UI disabled, dan inbound gagal decrypt tanpa memajukan cursor', async () => {
+  harness.reset();
+  const initialSentCount = harness.sentPayloads.length;
+
+  // 16A. Worker tanpa MLS GroupState aktif (misal perangkat Edge setelah History Transfer)
+  const readOnlyWorker = {
+    async sendRequest(action) {
+      if (action === 'ENCRYPT_MESSAGE') {
+        throw new Error('State grup belum aktif untuk melakukan enkripsi pesan.');
+      }
+      if (action === 'DECRYPT_MESSAGE') {
+        throw new Error('State grup belum aktif untuk memproses pesan masuk.');
+      }
+      throw new Error(`Unexpected action: ${action}`);
+    },
+  };
+
+  // 16B. Pengiriman pesan GAGAL dengan kode error terstruktur PERANGKAT_READ_ONLY_HISTORY
+  let sendErrorThrown = null;
+  try {
+    await sendApplicationMessageFlow({
+      roomUuid: ROOM_UUID,
+      plaintext: 'Pesan percobaan dari perangkat read-only',
+      deviceUuid: '55555555-5555-4555-8555-555555555555',
+      workerRpc: readOnlyWorker,
+      fencing: FENCING,
+      contentType: 1,
+    });
+  } catch (err) {
+    sendErrorThrown = err;
+  }
+
+  assert.ok(sendErrorThrown, 'Pengiriman pada perangkat tanpa GroupState aktif wajib melempar error');
+  assert.ok(
+    sendErrorThrown instanceof BchatMessageSendError,
+    'Error wajib turunan dari BchatMessageSendError'
+  );
+  assert.equal(
+    sendErrorThrown.errorCode,
+    'PERANGKAT_READ_ONLY_HISTORY',
+    'Error code wajib PERANGKAT_READ_ONLY_HISTORY'
+  );
+
+  // 16C. Verifikasi: Backend TIDAK menerima request pengiriman, ZERO plaintext fallback, ZERO hardcoded epoch
+  assert.equal(
+    harness.sentPayloads.length,
+    initialSentCount,
+    'Backend tidak boleh menerima request pesan dari perangkat Read-Only History'
+  );
+
+  // 16D. Jika workerRpc tidak tersedia (null), pengiriman juga wajib fail-closed dengan PERANGKAT_READ_ONLY_HISTORY
+  let nullWorkerErr = null;
+  try {
+    await sendApplicationMessageFlow({
+      roomUuid: ROOM_UUID,
+      plaintext: 'Pesan tanpa worker',
+      deviceUuid: '55555555-5555-4555-8555-555555555555',
+      workerRpc: null,
+      fencing: FENCING,
+    });
+  } catch (err) {
+    nullWorkerErr = err;
+  }
+  assert.ok(nullWorkerErr);
+  assert.equal(nullWorkerErr.errorCode, 'PERANGKAT_READ_ONLY_HISTORY');
+
+  // 16E. Riwayat lokal yang diimpor dari History Transfer (Seq #1..#17) tetap dapat dibaca dan tidak dirusak
+  harness.historyStore.set(`55555555-5555-4555-8555-555555555555:${ROOM_UUID}:17`, {
+    device_uuid: '55555555-5555-4555-8555-555555555555',
+    room_uuid: ROOM_UUID,
+    sequence_number: 17,
+    message_uuid: 'msg-imported-17',
+    sender_user_id: 4,
+    is_self: false,
+    plaintext: 'Pesan riwayat transfer masa lalu',
+    content_type: 1,
+    client_sent_at: '2026-11-19T10:00:00Z',
+    created_at: '2026-11-19T10:00:00Z',
+  });
+
+  // 16F. Pesan inbound baru (Seq #18) tiba di mock server tapi worker tidak memiliki GroupState
+  harness.serverMessages = [
+    {
+      server_sequence: 18,
+      message_uuid: 'msg-new-18',
+      sender_id: 4,
+      epoch: 1,
+      generation: 0,
+      content_type: 1,
+      ciphertext_payload: Buffer.from('MLS_CIPHERTEXT_18').toString('base64'),
+      payload_hash_sha256: crypto.createHash('sha256').update(Buffer.from('MLS_CIPHERTEXT_18')).digest('hex'),
+      session_uuid: GEN3_SESSION_UUID,
+      client_sent_at: '2026-11-20T10:00:00Z',
+      created_at: '2026-11-20T10:00:00Z',
+    },
+  ];
+
+  const receivedItems = [];
+  const recRes = await reconcileInboundMessages({
+    roomUuid: ROOM_UUID,
+    deviceUuid: '55555555-5555-4555-8555-555555555555',
+    currentUserId: DOSEN_ID,
+    workerRpc: readOnlyWorker,
+    fencing: FENCING,
+    afterSequence: 17,
+    sessionFloor: 17,
+    sessionUuid: GEN3_SESSION_UUID,
+    onMessageDecrypted: (m) => receivedItems.push(m),
+  });
+
+  // Kursor TIDAK boleh maju ke 18
+  assert.equal(recRes.contiguousSequence, 17, 'Cursor kontigu tidak boleh maju melewati pesan yang gagal dekripsi');
+  assert.ok(recRes.hasErrors, 'Reconcile wajib melaporkan hasErrors: true');
+  assert.equal(recRes.failedSequence, 18);
+  assert.equal(recRes.errorCategory, 'MLS_CRYPTO_ERROR');
+
+  // Pesan tidak dianggap berhasil (plaintext adalah [Dekripsi Gagal])
+  assert.equal(receivedItems.length, 1);
+  assert.equal(receivedItems[0].server_sequence, 18);
+  assert.equal(receivedItems[0].plaintext, '[Dekripsi Gagal]');
+
+  // Riwayat lama (Seq #17) tetap utuh dan tidak terhapus/tertimpa
+  const importedHistory = harness.historyStore.get(`55555555-5555-4555-8555-555555555555:${ROOM_UUID}:17`);
+  assert.equal(importedHistory.plaintext, 'Pesan riwayat transfer masa lalu');
+
+  // 16G. Verifikasi source code BchatProposalChat.tsx: UI composer dinonaktifkan saat !hasLocalGroupState
+  const chatSource = fs.readFileSync(
+    path.join(SRC_ROOT, 'components', 'bchat', 'BchatProposalChat.tsx'),
+    'utf8'
+  );
+
+  assert.ok(
+    chatSource.includes('!hasLocalGroupState'),
+    'BchatProposalChat.tsx wajib menggunakan kondisi !hasLocalGroupState'
+  );
+  assert.ok(
+    chatSource.includes('data-bchat-readonly-banner="true"'),
+    'BchatProposalChat.tsx wajib menampilkan data-bchat-readonly-banner saat !hasLocalGroupState'
+  );
+  assert.ok(
+    chatSource.includes('Read-Only History'),
+    'BchatProposalChat.tsx wajib menampilkan teks Read-Only History pada status'
+  );
+  assert.ok(
+    chatSource.includes('PERANGKAT_READ_ONLY_HISTORY') ||
+    chatSource.includes('Perangkat ini berada dalam status Read-Only History'),
+    'BchatProposalChat.tsx wajib memvalidasi Read-Only History pada pengiriman pesan'
+  );
 });
 

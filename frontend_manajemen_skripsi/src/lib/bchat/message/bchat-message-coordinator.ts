@@ -92,6 +92,16 @@ export class BchatMessageSendError extends BchatMessageError {
   }
 }
 
+export class BchatReadOnlyHistoryError extends BchatMessageSendError {
+  constructor(
+    message = 'Perangkat ini berada dalam status Read-Only History dan belum memiliki MLS GroupState aktif untuk mengirim pesan.',
+    cause?: unknown
+  ) {
+    super(message, undefined, 'PERANGKAT_READ_ONLY_HISTORY', cause);
+    this.name = 'BchatReadOnlyHistoryError';
+  }
+}
+
 export class BchatMessageDecryptError extends BchatMessageError {
   constructor(message: string, cause?: unknown) {
     super(message, cause);
@@ -554,6 +564,9 @@ export function classifyInboundError(
     lower.includes('validationerror') ||
     lower.includes('gagal mendekode ciphertext') ||
     lower.includes('state grup belum aktif') ||
+    lower.includes('read-only') ||
+    lower.includes('read_only') ||
+    lower.includes('groupstate') ||
     lower.includes('sesi worker terkunci') ||
     lower.includes('bukan applicationmessage') ||
     lower.includes('cannot process message, epoch too old') ||
@@ -623,7 +636,9 @@ export async function sendApplicationMessageFlow(
     throw new BchatMessageValidationError('deviceUuid wajib berupa string yang valid.');
   }
   if (!workerRpc) {
-    throw new BchatMessageValidationError('workerRpc instance wajib disertakan.');
+    throw new BchatReadOnlyHistoryError(
+      'workerRpc instance wajib disertakan. Perangkat tidak dapat mengirim pesan tanpa MLS GroupState aktif.'
+    );
   }
   if (!fencing || !fencing.ownerToken || !fencing.generation) {
     throw new BchatMessageValidationError('Kredensial fencing wajib disertakan secara lengkap.');
@@ -671,33 +686,45 @@ export async function sendApplicationMessageFlow(
       : 'msg_' + Date.now());
 
   // 1. Enkripsi via MLS Worker (Persist-Before-Adopt dilakukan di dalam Worker)
-  let encResult: EncryptMessageResult | null = null;
-  let wireBytes: Uint8Array;
-  let epochNumber = 1;
+  if (!workerRpc) {
+    throw new BchatReadOnlyHistoryError(
+      'Worker kriptografi MLS tidak tersedia. Perangkat tidak dapat mengirim pesan tanpa MLS GroupState aktif.'
+    );
+  }
 
+  let encResult: EncryptMessageResult;
   try {
-    if (workerRpc) {
-      encResult = await workerRpc.sendRequest<any, EncryptMessageResult>('ENCRYPT_MESSAGE', {
-        plaintext,
-        clientMessageUuid,
-        deviceUuid,
-        roomUuid,
-        fencing,
-      });
+    encResult = await workerRpc.sendRequest<any, EncryptMessageResult>('ENCRYPT_MESSAGE', {
+      plaintext,
+      clientMessageUuid,
+      deviceUuid,
+      roomUuid,
+      fencing,
+    });
+  } catch (encErr: any) {
+    const errMessage = encErr?.message || '';
+    if (
+      errMessage.includes('State grup belum aktif') ||
+      errMessage.includes('GroupState') ||
+      errMessage.includes('NOT_FOUND') ||
+      encErr?.errorCode === 'PERANGKAT_READ_ONLY_HISTORY'
+    ) {
+      throw new BchatReadOnlyHistoryError(
+        'Perangkat ini berada dalam status Read-Only History dan belum memiliki MLS GroupState aktif untuk mengirim pesan.',
+        encErr
+      );
     }
-  } catch (_encErr: any) {
-    // Non-fatal fallback jika state grup belum aktif di worker perangkat tertransfer
+    throw encErr;
   }
 
-  if (encResult && encResult.ciphertextWireBase64) {
-    wireBytes = base64ToBytes(encResult.ciphertextWireBase64);
-    epochNumber = parseInt(encResult.epoch, 10);
-  } else {
-    // Fallback format terstruktur untuk perangkat tertransfer tanpa local MLS ratchet
-    const payloadStr = JSON.stringify({ v: 1, text: plaintext, clientMessageUuid });
-    wireBytes = new TextEncoder().encode(payloadStr);
-    epochNumber = 2; // Active session epoch
+  if (!encResult || !encResult.ciphertextWireBase64) {
+    throw new BchatReadOnlyHistoryError(
+      'Enkripsi pesan MLS gagal: ciphertext tidak dihasilkan. Perangkat tidak dapat mengirim pesan tanpa MLS GroupState aktif.'
+    );
   }
+
+  const wireBytes = base64ToBytes(encResult.ciphertextWireBase64);
+  const epochNumber = parseInt(encResult.epoch, 10);
 
   const payloadBase64 = bytesToBase64(wireBytes);
   const payloadHashSha256 = await computePayloadSha256(wireBytes);
@@ -760,8 +787,8 @@ export async function sendApplicationMessageFlow(
     return {
       messageData: res.data,
       clientMessageUuid,
-      stateRevision: encResult?.stateRevision,
-      epoch: encResult?.epoch || String(epochNumber),
+      stateRevision: encResult.stateRevision,
+      epoch: encResult.epoch || String(epochNumber),
       payloadHashSha256,
       isReplayed,
     };
@@ -865,16 +892,45 @@ export async function processInboundMessageItem(
     }
 
     if (selfPlaintext === '(Pesan terkirim dari sesi Anda)' && item.ciphertext_payload) {
-      try {
-        const decoded = new TextDecoder().decode(base64ToBytes(item.ciphertext_payload));
-        if (decoded.startsWith('{') && decoded.includes('"text":')) {
-          const parsed = JSON.parse(decoded);
-          if (parsed && typeof parsed.text === 'string') {
-            selfPlaintext = parsed.text;
+      // Multi-device: jika pesan dikirim oleh perangkat lain dari akun yang sama,
+      // lakukan dekripsi ciphertext MLS via Worker RPC DECRYPT_MESSAGE
+      if (workerRpc) {
+        try {
+          const decResult = await workerRpc.sendRequest<any, DecryptMessageResult>(
+            'DECRYPT_MESSAGE',
+            {
+              ciphertextWireBase64: item.ciphertext_payload,
+              deviceUuid,
+              roomUuid,
+              fencing,
+              serverSequence: allowCursorAdvance ? seq : undefined,
+            }
+          );
+          if (
+            decResult &&
+            typeof decResult.plaintext === 'string' &&
+            decResult.plaintext.trim() !== ''
+          ) {
+            selfPlaintext = decResult.plaintext;
           }
+        } catch (_decErr) {
+          // Fallback aman: jika pesan berasal dari epoch lampau sebelum perangkat ini bergabung
+          // (RFC 9420 Forward Secrecy), pertahankan placeholder pesan terkirim sesi Anda
         }
-      } catch {
-        // safe ignore
+      }
+
+      if (selfPlaintext === '(Pesan terkirim dari sesi Anda)') {
+        try {
+          const decoded = new TextDecoder().decode(base64ToBytes(item.ciphertext_payload));
+          if (decoded.startsWith('{') && decoded.includes('"text":')) {
+            const parsed = JSON.parse(decoded);
+            if (parsed && typeof parsed.text === 'string') {
+              selfPlaintext = parsed.text;
+            }
+          }
+        } catch {
+          // safe ignore
+        }
       }
     }
 
@@ -1051,6 +1107,10 @@ export async function processInboundMessageItem(
   // Jika allowCursorAdvance=false (sedang ada sequence gap di belakangnya), jangan kirim serverSequence
   // agar Worker tetap mem-persist GroupState ratchet MLS secara atomik TANPA memajukan last_processed_sequence melewati gap.
   try {
+    if (!workerRpc) {
+      throw new Error('Worker MLS tidak tersedia atau perangkat berada dalam mode Read-Only History.');
+    }
+
     const decResult = await workerRpc.sendRequest<any, DecryptMessageResult>(
       'DECRYPT_MESSAGE',
       {
