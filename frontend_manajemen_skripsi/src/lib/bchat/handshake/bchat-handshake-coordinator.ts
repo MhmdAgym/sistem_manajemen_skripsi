@@ -2929,11 +2929,17 @@ export async function processPendingCommitRelayFlow(
       return { processed: false, reason: 'WELCOME_WIRE_MISSING' };
     }
 
+    const keyPackageHash = targetCommit.key_package_hash;
+    if (!keyPackageHash) {
+      return { processed: false, reason: 'KEY_PACKAGE_HASH_MISSING' };
+    }
+
     // Panggil Worker JOIN_WELCOME
     const joinRes = await workerClient.sendRequest<JoinWelcomePayload, JoinWelcomeResult>(
       'JOIN_WELCOME',
       {
         welcomeWireBase64: welcomeWire,
+        keyPackageHash,
         roomUuid: cleanRoomUuid,
         deviceUuid: cleanActiveDevUuid,
         fencing: options?.fencing,
@@ -2962,8 +2968,8 @@ export async function processPendingCommitRelayFlow(
       processed: true,
       commitUuid,
       type: 'WELCOME_ACK',
-      isComplete: ackRes.data.is_complete,
-      status: ackRes.data.status,
+      isComplete: (ackRes as any)?.data?.is_complete ?? (ackRes as any)?.is_complete ?? false,
+      status: (ackRes as any)?.data?.status ?? (ackRes as any)?.status ?? 'ACTIVE',
       newEpoch: toEpoch,
     };
   }
@@ -3011,8 +3017,8 @@ export async function processPendingCommitRelayFlow(
       processed: true,
       commitUuid,
       type: 'COMMIT_ACK',
-      isComplete: ackRes.data.is_complete,
-      status: ackRes.data.status,
+      isComplete: (ackRes as any)?.data?.is_complete ?? (ackRes as any)?.is_complete ?? false,
+      status: (ackRes as any)?.data?.status ?? (ackRes as any)?.status ?? 'ACTIVE',
       newEpoch: toEpoch,
     };
   }

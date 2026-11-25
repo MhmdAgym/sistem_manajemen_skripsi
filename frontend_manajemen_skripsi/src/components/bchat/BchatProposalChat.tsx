@@ -929,7 +929,10 @@ export function BchatProposalChat({ initialRoomUuid, onBack }: BchatProposalChat
             }
           }
         } catch (_relayErr) {
-          // Abaikan jika operasi Welcome belum tersedia
+          console.warn(
+            '[B-CHAT] Pemrosesan Welcome Commit Relay belum dapat diselesaikan:',
+            (_relayErr as Error)?.message || 'Operasi Welcome belum tersedia.'
+          );
         }
 
         // Welcome Recovery: Pemulihan untuk perangkat yang sudah terdaftar tetapi kehilangan GroupState lokal

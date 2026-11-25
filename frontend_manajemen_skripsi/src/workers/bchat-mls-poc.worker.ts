@@ -865,21 +865,9 @@ self.onmessage = async (event: MessageEvent<WorkerRpcRequest>) => {
           keyPkgHash = await computeSha256Hex(publicBytes);
         }
 
-        // Jika keyPkgHash belum disediakan, cari di pending_key_packages lokal
+        // Fail-closed: keyPackageHash wajib disediakan secara tepat tanpa fallback pemilihan acak/pertama
         if (!keyPkgHash) {
-          const pendingList = await listPendingKeyPackages(canonicalDeviceUuid);
-          if (pendingList.length > 0) {
-            const candidate = joinPayload.isRecovery
-              ? pendingList[0]
-              : pendingList.find((p) => p.metadata?.status !== 'consumed') || pendingList[0];
-            if (candidate) {
-              keyPkgHash = candidate.key_package_hash;
-            }
-          }
-        }
-
-        if (!keyPkgHash) {
-          throw new Error('JOIN_WELCOME: keyPackageHash tidak ditemukan pada payload maupun memori lokal.');
+          throw new Error('JOIN_WELCOME: keyPackageHash wajib disertakan pada payload dan tidak ditemukan pada sesi lokal.');
         }
 
         // Verifikasi PrivateKeyPackage DURABLE di IndexedDB (wajib tersimpan durable)

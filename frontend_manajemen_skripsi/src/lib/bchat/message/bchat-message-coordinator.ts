@@ -892,16 +892,45 @@ export async function processInboundMessageItem(
     }
 
     if (selfPlaintext === '(Pesan terkirim dari sesi Anda)' && item.ciphertext_payload) {
-      try {
-        const decoded = new TextDecoder().decode(base64ToBytes(item.ciphertext_payload));
-        if (decoded.startsWith('{') && decoded.includes('"text":')) {
-          const parsed = JSON.parse(decoded);
-          if (parsed && typeof parsed.text === 'string') {
-            selfPlaintext = parsed.text;
+      // Multi-device: jika pesan dikirim oleh perangkat lain dari akun yang sama,
+      // lakukan dekripsi ciphertext MLS via Worker RPC DECRYPT_MESSAGE
+      if (workerRpc) {
+        try {
+          const decResult = await workerRpc.sendRequest<any, DecryptMessageResult>(
+            'DECRYPT_MESSAGE',
+            {
+              ciphertextWireBase64: item.ciphertext_payload,
+              deviceUuid,
+              roomUuid,
+              fencing,
+              serverSequence: allowCursorAdvance ? seq : undefined,
+            }
+          );
+          if (
+            decResult &&
+            typeof decResult.plaintext === 'string' &&
+            decResult.plaintext.trim() !== ''
+          ) {
+            selfPlaintext = decResult.plaintext;
           }
+        } catch (_decErr) {
+          // Fallback aman: jika pesan berasal dari epoch lampau sebelum perangkat ini bergabung
+          // (RFC 9420 Forward Secrecy), pertahankan placeholder pesan terkirim sesi Anda
         }
-      } catch {
-        // safe ignore
+      }
+
+      if (selfPlaintext === '(Pesan terkirim dari sesi Anda)') {
+        try {
+          const decoded = new TextDecoder().decode(base64ToBytes(item.ciphertext_payload));
+          if (decoded.startsWith('{') && decoded.includes('"text":')) {
+            const parsed = JSON.parse(decoded);
+            if (parsed && typeof parsed.text === 'string') {
+              selfPlaintext = parsed.text;
+            }
+          }
+        } catch {
+          // safe ignore
+        }
       }
     }
 
